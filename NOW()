@@ -1,0 +1,1 @@
+            `SELECT * FROM otps WHERE phone = $1 AND otp = $2 AND verified = false AND expires_at  ORDER BY created_at DESC LIMIT 1`,
