@@ -55,6 +55,7 @@ function createAppToken(user) {
   return jwt.sign(
     {
       userId: user.id,
+      id: user.id,
       phone: user.phone,
     },
     process.env.JWT_SECRET,
