@@ -101,7 +101,8 @@ const listAccounts = async (req, res) => {
         a.photo_url,
         a.created_by,
         a.created_at,
-        a.updated_at
+        a.updated_at,
+        am.role
       FROM accounts a
       INNER JOIN account_members am ON am.account_id = a.id
       WHERE am.user_id = $1
