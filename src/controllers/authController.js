@@ -6,20 +6,6 @@ const MSG91_VERIFY_ACCESS_TOKEN_URL =
 
 /**
  * Normalize Indian phone number.
- *
- * Examples:
- *
- * 9876543210
- *     -> 919876543210
- *
- * 09876543210
- *     -> 919876543210
- *
- * +919876543210
- *     -> 919876543210
- *
- * 919876543210
- *     -> 919876543210
  */
 function normalizePhone(phone) {
   if (!phone) {
@@ -46,8 +32,6 @@ function normalizePhone(phone) {
 /**
  * Create our application JWT.
  *
- * IMPORTANT:
- *
  * This JWT belongs to our application.
  * It is different from the MSG91 access token.
  */
@@ -66,10 +50,6 @@ function createAppToken(user) {
 
 /**
  * Extract a verified phone number if MSG91 returns one.
- *
- * We don't require a phone field because the exact
- * Verify Access Token response structure should come
- * from MSG91.
  */
 function extractMsg91Phone(data) {
   if (!data || typeof data !== "object") {
@@ -105,10 +85,7 @@ function extractMsg91Phone(data) {
 
     const normalized = normalizePhone(value);
 
-    if (
-      normalized &&
-      /^91[6-9]\d{9}$/.test(normalized)
-    ) {
+    if (normalized && /^91[6-9]\d{9}$/.test(normalized)) {
       return normalized;
     }
   }
@@ -125,16 +102,6 @@ function extractMsg91Phone(data) {
  *   phone: "9876543210",
  *   accessToken: "MSG91_ACCESS_TOKEN"
  * }
- *
- * Authentication flow:
- *
- * 1. Validate phone/accessToken.
- * 2. Send MSG91 access token to MSG91 server.
- * 3. MSG91 verifies the token.
- * 4. If verification succeeds, continue.
- * 5. Find/create our application user.
- * 6. Generate our application JWT.
- * 7. Return application JWT.
  */
 async function verifyWidgetToken(req, res) {
   try {
@@ -175,36 +142,26 @@ async function verifyWidgetToken(req, res) {
     // =========================================================
 
     if (!process.env.MSG91_AUTHKEY) {
-      console.error(
-        "MSG91_AUTHKEY is missing."
-      );
+      console.error("MSG91_AUTHKEY is missing.");
 
       return res.status(500).json({
         success: false,
-        message:
-          "MSG91 is not configured on the server.",
+        message: "MSG91 is not configured on the server.",
       });
     }
 
     if (!process.env.JWT_SECRET) {
-      console.error(
-        "JWT_SECRET is missing."
-      );
+      console.error("JWT_SECRET is missing.");
 
       return res.status(500).json({
         success: false,
-        message:
-          "JWT is not configured on the server.",
+        message: "JWT is not configured on the server.",
       });
     }
 
     // =========================================================
     // 3. Verify MSG91 access token
     // =========================================================
-
-    console.log(
-      "Verifying MSG91 access token on server..."
-    );
 
     const msg91Response = await fetch(
       MSG91_VERIFY_ACCESS_TOKEN_URL,
@@ -229,52 +186,24 @@ async function verifyWidgetToken(req, res) {
     let msg91Data = null;
 
     try {
-      msg91Data =
-        await msg91Response.json();
+      msg91Data = await msg91Response.json();
     } catch (error) {
-      console.error(
-        "Unable to parse MSG91 response as JSON:",
-        error.message
-      );
-
       msg91Data = null;
     }
 
-    console.log(
-      "MSG91 verify access token HTTP status:",
-      msg91Response.status
-    );
-
-    /**
-     * IMPORTANT:
-     *
-     * Do not print the access token itself.
-     *
-     * The response is safe to inspect because it is
-     * the server response from MSG91.
-     */
-    console.log(
-      "MSG91 verify access token response:",
-      JSON.stringify(
-        msg91Data,
-        null,
-        2
-      )
-    );
-
     // =========================================================
-    // 5. HTTP-level failure
+    // 5. Check MSG91 verification result
     // =========================================================
 
-    if (!msg91Response.ok) {
-      console.error(
-        "MSG91 access token verification failed."
-      );
+    const msg91VerificationFailed =
+      msg91Data?.type === "error" ||
+      msg91Data?.message === "AuthenticationFailure" ||
+      String(msg91Data?.code) === "418";
 
+    if (!msg91Response.ok || msg91VerificationFailed) {
       return res.status(401).json({
         success: false,
-        message:
-          "MSG91 access token verification failed.",
+        message: "MSG91 access token verification failed.",
       });
     }
 
@@ -283,76 +212,48 @@ async function verifyWidgetToken(req, res) {
     // =========================================================
 
     if (!msg91Data) {
-      console.error(
-        "MSG91 returned an empty access-token verification response."
-      );
-
       return res.status(401).json({
         success: false,
-        message:
-          "MSG91 access token verification failed.",
+        message: "MSG91 access token verification failed.",
       });
     }
 
     // =========================================================
-    // 7. Extract verified phone if MSG91 provides it
+    // 7. Verify phone if MSG91 provides it
     // =========================================================
 
     const verifiedMsg91Phone =
       extractMsg91Phone(msg91Data);
 
-    if (verifiedMsg91Phone) {
-      console.log(
-        "MSG91 verified phone:",
-        verifiedMsg91Phone
-      );
-
-      console.log(
-        "Submitted phone:",
-        normalizedPhone
-      );
-
-      /**
-       * Security check:
-       *
-       * The verified MSG91 phone must match the phone
-       * submitted by the application.
-       */
-      if (
-        verifiedMsg91Phone !== normalizedPhone
-      ) {
-        console.error(
-          "MSG91 verified phone does not match submitted phone."
-        );
-
-        return res.status(401).json({
-          success: false,
-          message:
-            "Phone verification mismatch.",
-        });
-      }
+    if (
+      verifiedMsg91Phone &&
+      verifiedMsg91Phone !== normalizedPhone
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Phone verification mismatch.",
+      });
     }
 
     // =========================================================
     // 8. Find existing application user
     // =========================================================
 
-    const userResult =
-      await pool.query(
-        `
-        SELECT
-          id,
-          phone,
-          is_active,
-          last_login_at,
-          created_at,
-          updated_at
-        FROM users
-        WHERE phone = $1
-        LIMIT 1
-        `,
-        [normalizedPhone]
-      );
+    const userResult = await pool.query(
+      `
+      SELECT
+        id,
+        phone,
+        is_active,
+        last_login_at,
+        created_at,
+        updated_at
+      FROM users
+      WHERE phone = $1
+      LIMIT 1
+      `,
+      [normalizedPhone]
+    );
 
     let user;
 
@@ -361,36 +262,30 @@ async function verifyWidgetToken(req, res) {
     // =========================================================
 
     if (userResult.rows.length === 0) {
-      const insertResult =
-        await pool.query(
-          `
-          INSERT INTO users (
-            phone,
-            is_active,
-            last_login_at
-          )
-          VALUES (
-            $1,
-            true,
-            NOW()
-          )
-          RETURNING
-            id,
-            phone,
-            is_active,
-            last_login_at,
-            created_at,
-            updated_at
-          `,
-          [normalizedPhone]
-        );
+      const insertResult = await pool.query(
+        `
+        INSERT INTO users (
+          phone,
+          is_active,
+          last_login_at
+        )
+        VALUES (
+          $1,
+          true,
+          NOW()
+        )
+        RETURNING
+          id,
+          phone,
+          is_active,
+          last_login_at,
+          created_at,
+          updated_at
+        `,
+        [normalizedPhone]
+      );
 
       user = insertResult.rows[0];
-
-      console.log(
-        "New application user created:",
-        user.id
-      );
     } else {
       // =======================================================
       // Existing user
@@ -405,8 +300,7 @@ async function verifyWidgetToken(req, res) {
       if (!user.is_active) {
         return res.status(403).json({
           success: false,
-          message:
-            "This account is inactive.",
+          message: "This account is inactive.",
         });
       }
 
@@ -414,39 +308,32 @@ async function verifyWidgetToken(req, res) {
       // 11. Update last login
       // =======================================================
 
-      const updateResult =
-        await pool.query(
-          `
-          UPDATE users
-          SET
-            last_login_at = NOW(),
-            updated_at = NOW()
-          WHERE id = $1
-          RETURNING
-            id,
-            phone,
-            is_active,
-            last_login_at,
-            created_at,
-            updated_at
-          `,
-          [user.id]
-        );
+      const updateResult = await pool.query(
+        `
+        UPDATE users
+        SET
+          last_login_at = NOW(),
+          updated_at = NOW()
+        WHERE id = $1
+        RETURNING
+          id,
+          phone,
+          is_active,
+          last_login_at,
+          created_at,
+          updated_at
+        `,
+        [user.id]
+      );
 
       user = updateResult.rows[0];
-
-      console.log(
-        "Existing user login:",
-        user.id
-      );
     }
 
     // =========================================================
     // 12. Generate our application JWT
     // =========================================================
 
-    const token =
-      createAppToken(user);
+    const token = createAppToken(user);
 
     // =========================================================
     // 13. Return successful authentication
@@ -454,8 +341,7 @@ async function verifyWidgetToken(req, res) {
 
     return res.status(200).json({
       success: true,
-      message:
-        "Login successful.",
+      message: "Login successful.",
 
       token,
 
@@ -463,20 +349,15 @@ async function verifyWidgetToken(req, res) {
         id: user.id,
         phone: user.phone,
         isActive: user.is_active,
-        lastLoginAt:
-          user.last_login_at,
+        lastLoginAt: user.last_login_at,
       },
     });
   } catch (error) {
-    console.error(
-      "verifyWidgetToken error:",
-      error
-    );
+    console.error("verifyWidgetToken error:", error);
 
     return res.status(500).json({
       success: false,
-      message:
-        "Something went wrong during authentication.",
+      message: "Something went wrong during authentication.",
     });
   }
 }
