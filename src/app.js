@@ -9,16 +9,7 @@ require('dotenv').config();
 // ============================================================
 // ROUTE IMPORTS
 // ============================================================
-const otpRoutes = require('./routes/otpRoutes');
 const authRoutes = require('./routes/authRoutes');
-const accountRoutes = require('./routes/accountRoutes');
-const groupRoutes = require('./routes/groupRoutes');
-const memberRoutes = require('./routes/memberRoutes');
-const accessRoutes = require('./routes/accessRoutes');
-const historyRoutes = require('./routes/historyRoutes');
-const billRoutes = require('./routes/billRoutes');
-const paymentRoutes = require('./routes/paymentRoutes');
-const notificationRoutes = require("./routes/notificationRoutes");
 
 const app = express();
 
@@ -88,26 +79,7 @@ app.get('/health', (req, res) => {
 // ============================================================
 // ROUTES
 // ============================================================
-app.use('/api/otp', otpRoutes);
 app.use('/api/auth', authRoutes);
-app.use('/api/accounts', accountRoutes);
-app.use('/api/accounts/:accountId/groups', groupRoutes);
-app.use('/api/groups/:groupId/members', memberRoutes);
-app.use('/api/members', memberRoutes);
-app.use('/api/accounts/:accountId/access', accessRoutes);
-app.use('/api/access', accessRoutes);
-app.use('/api/accounts/:accountId/history', historyRoutes);
-app.use('/api/accounts/:accountId/bills', billRoutes);
-app.use('/api/bills', billRoutes);
-app.use('/api/accounts/:accountId/payments', paymentRoutes);
-app.use("/api/notifications", notificationRoutes);
-
-// ------------------------------------------------------------
-// Top-level payment mount — REQUIRED by the frontend
-// Frontend calls: POST /api/payment/create-order
-//                 POST /api/payment/verify
-// ------------------------------------------------------------
-app.use('/api/payment', paymentRoutes);
 
 // ============================================================
 // 404 HANDLER
