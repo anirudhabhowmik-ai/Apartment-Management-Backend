@@ -10,6 +10,7 @@ require('dotenv').config();
 // ROUTE IMPORTS
 // ============================================================
 const authRoutes = require('./routes/authRoutes');
+const accountRoutes = require("./routes/accountRoutes");
 
 const app = express();
 
@@ -80,6 +81,7 @@ app.get('/health', (req, res) => {
 // ROUTES
 // ============================================================
 app.use('/api/auth', authRoutes);
+app.use("/api/accounts", accountRoutes);
 
 // ============================================================
 // 404 HANDLER
