@@ -1,20 +1,24 @@
 -- =============================================================================
--- members_staff_expenses.sql
+-- management.sql
 --
--- Three independent tables:
---   • members  — flat residents
---   • staff    — workers hired by the society
---   • expenses — bills the society pays
+-- Everything for member / staff / expense management:
+--   • members                     — flat residents
+--   • staff                       — workers hired by the society
+--   • expenses                    — bills the society pays
+--   • member_monthly_payments     — one row per member per month (paid/due)
+--   • staff_attendance            — one row per staff per month
+--   • staff_monthly_payments      — one row per staff per month (paid/due)
+--   • member_phone_visibility     — per-member phone visibility allow-list
 --
--- Depends on:
---   • users     (auth.sql)
---   • accounts  (account.sql)
---   • account_members (roles.sql)
+-- Depends on (must exist first):
+--   • users            (auth.sql)
+--   • accounts         (account.sql)
+--   • account_members  (roles.sql)
 -- =============================================================================
 
 
 -- -----------------------------------------------------------------------------
--- 1. MEMBERS (flat residents)
+-- 1. MEMBERS
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS members (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -29,14 +33,12 @@ CREATE TABLE IF NOT EXISTS members (
         CHECK (role IN ('owner', 'secretary', 'tenant', 'custom')),
     photo_url TEXT,
 
-    -- Flat details
     wing VARCHAR(50),
     flat_number VARCHAR(50) NOT NULL,
     area_sqft INTEGER,
     parking_available BOOLEAN NOT NULL DEFAULT FALSE,
     maintenance_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
 
-    -- Audit
     created_by UUID NOT NULL
         REFERENCES users(id)
         ON DELETE RESTRICT,
@@ -56,7 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_members_phone
 
 
 -- -----------------------------------------------------------------------------
--- 2. STAFF (sweeper, security, maintenance, …)
+-- 2. STAFF
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS staff (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -74,7 +76,6 @@ CREATE TABLE IF NOT EXISTS staff (
 
     monthly_salary NUMERIC(12,2) NOT NULL DEFAULT 0,
 
-    -- Audit
     created_by UUID NOT NULL
         REFERENCES users(id)
         ON DELETE RESTRICT,
@@ -91,7 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_staff_phone
 
 
 -- -----------------------------------------------------------------------------
--- 3. EXPENSES (bills the society pays)
+-- 3. EXPENSES
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS expenses (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -100,11 +101,8 @@ CREATE TABLE IF NOT EXISTS expenses (
         REFERENCES accounts(id)
         ON DELETE CASCADE,
 
-    -- Category like 'electricity', 'water', 'maintenance', 'other'
     category VARCHAR(60) NOT NULL,
-    -- Human-readable name shown in the UI, e.g. "Water bill – March"
     title VARCHAR(200) NOT NULL,
-
     amount NUMERIC(12,2) NOT NULL,
 
     transaction_type VARCHAR(20) NOT NULL DEFAULT 'expense'
@@ -115,17 +113,13 @@ CREATE TABLE IF NOT EXISTS expenses (
 
     reminder_enabled BOOLEAN NOT NULL DEFAULT FALSE,
 
-    -- Date the expense was incurred / bill date
     expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
-    -- Date the payment is due (only meaningful when status='due')
     due_date DATE,
 
     description TEXT,
 
-    -- Array of { uri, name, mimeType }
     bill_attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
 
-    -- Audit
     created_by UUID NOT NULL
         REFERENCES users(id)
         ON DELETE RESTRICT,
@@ -149,7 +143,6 @@ CREATE INDEX IF NOT EXISTS idx_expenses_expense_date
 
 -- -----------------------------------------------------------------------------
 -- 4. MEMBER MONTHLY PAYMENTS
--- One row per member per month (maintenance paid/due).
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS member_monthly_payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -191,7 +184,6 @@ CREATE INDEX IF NOT EXISTS idx_member_monthly_payments_month
 
 -- -----------------------------------------------------------------------------
 -- 5. STAFF ATTENDANCE
--- One row per staff member per month, statuses map keyed by date.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS staff_attendance (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -222,7 +214,6 @@ CREATE INDEX IF NOT EXISTS idx_staff_attendance_month
 
 -- -----------------------------------------------------------------------------
 -- 6. STAFF MONTHLY PAYMENTS
--- One row per staff per month (salary paid/due).
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS staff_monthly_payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -261,3 +252,38 @@ CREATE INDEX IF NOT EXISTS idx_staff_monthly_payments_staff_id
 
 CREATE INDEX IF NOT EXISTS idx_staff_monthly_payments_month
     ON staff_monthly_payments(month);
+
+
+-- -----------------------------------------------------------------------------
+-- 7. MEMBER PHONE VISIBILITY
+-- Per-member allow-list: which users can see this member's phone.
+-- Owner and admin bypass this list (enforced in the controller).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS member_phone_visibility (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    account_id UUID NOT NULL
+        REFERENCES accounts(id)
+        ON DELETE CASCADE,
+
+    member_id UUID NOT NULL
+        REFERENCES members(id)
+        ON DELETE CASCADE,
+
+    viewer_user_id UUID NOT NULL
+        REFERENCES users(id)
+        ON DELETE CASCADE,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE (member_id, viewer_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_phone_vis_member
+    ON member_phone_visibility(member_id);
+
+CREATE INDEX IF NOT EXISTS idx_phone_vis_viewer
+    ON member_phone_visibility(viewer_user_id);
+
+CREATE INDEX IF NOT EXISTS idx_phone_vis_account
+    ON member_phone_visibility(account_id);

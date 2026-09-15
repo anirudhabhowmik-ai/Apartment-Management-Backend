@@ -24,8 +24,7 @@ const getUserPhone = (req) => {
  *   "owner" | "admin" | "member" | "staff" | null
  */
 async function getRoleForAccount(userId, accountId) {
-  // Account creator is always treated as owner, even if the row
-  // in account_members is missing.
+  // Account creator is always treated as owner.
   const { rows: ownerRows } = await pool.query(
     `SELECT 1 FROM accounts WHERE id = $1 AND created_by = $2`,
     [accountId, userId]
@@ -54,9 +53,11 @@ const fail = (res, status, code, message) =>
 
 // ---------------------------------------------------------------------------
 // GET /management/:accountId/members
-// owner / admin -> all members on the account
-// member        -> only their own row (matched by phone)
-// staff         -> 403
+//
+// owner / admin -> all members, phones always visible
+// member / staff -> all members, but phone is masked unless:
+//                     • the caller is the member themselves, OR
+//                     • the member has added the caller to their allow-list
 // ---------------------------------------------------------------------------
 const listMembers = async (req, res) => {
   try {
@@ -68,37 +69,39 @@ const listMembers = async (req, res) => {
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
+    const { rows } = await pool.query(
+      `SELECT id, account_id, name, phone, role, photo_url,
+              wing, flat_number, area_sqft, parking_available,
+              maintenance_amount, created_by, created_at, updated_at
+         FROM members
+        WHERE account_id = $1
+        ORDER BY flat_number, name`,
+      [accountId]
+    );
+
+    // Owner and admin: no masking.
     if (role === "owner" || role === "admin") {
-      const { rows } = await pool.query(
-        `SELECT id, account_id, name, phone, role, photo_url,
-                wing, flat_number, area_sqft, parking_available,
-                maintenance_amount, created_by, created_at, updated_at
-           FROM members
-          WHERE account_id = $1
-          ORDER BY flat_number, name`,
-        [accountId]
-      );
       return res.json(rows);
     }
 
-    if (role === "member") {
-      const phone = getUserPhone(req);
-      if (!phone) return res.json([]);
+    // Member and staff: mask phones per allow-list.
+    const callerPhone = getUserPhone(req);
 
-      const { rows } = await pool.query(
-        `SELECT id, account_id, name, phone, role, photo_url,
-                wing, flat_number, area_sqft, parking_available,
-                maintenance_amount, created_by, created_at, updated_at
-           FROM members
-          WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $2`,
-        [accountId, phone]
-      );
-      return res.json(rows);
-    }
+    const { rows: allowed } = await pool.query(
+      `SELECT member_id FROM member_phone_visibility
+        WHERE account_id = $1 AND viewer_user_id = $2`,
+      [accountId, userId]
+    );
+    const allowedMemberIds = new Set(allowed.map((r) => r.member_id));
 
-    // staff: no access to member list
-    return fail(res, 403, "forbidden", "You do not have access to members");
+    const masked = rows.map((m) => {
+      const memberPhone = (m.phone || "").replace(/\D/g, "").slice(-10);
+      const isSelf = callerPhone && callerPhone === memberPhone;
+      const canSee = isSelf || allowedMemberIds.has(m.id);
+      return canSee ? m : { ...m, phone: null };
+    });
+
+    return res.json(masked);
   } catch (err) {
     console.error("listMembers error:", err);
     return fail(res, 500, "server_error", "Failed to load members");
@@ -107,6 +110,7 @@ const listMembers = async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // GET /management/:accountId/members/:id
+// Same masking rule as listMembers.
 // ---------------------------------------------------------------------------
 const getMember = async (req, res) => {
   try {
@@ -132,14 +136,20 @@ const getMember = async (req, res) => {
 
     if (role === "owner" || role === "admin") return res.json(member);
 
-    if (role === "member") {
-      const phone = getUserPhone(req);
-      const memberPhone = (member.phone || "").replace(/\D/g, "").slice(-10);
-      if (phone && phone === memberPhone) return res.json(member);
-      return fail(res, 403, "forbidden", "You can only view your own record");
-    }
+    const callerPhone = getUserPhone(req);
+    const memberPhone = (member.phone || "").replace(/\D/g, "").slice(-10);
+    const isSelf = callerPhone && callerPhone === memberPhone;
 
-    return fail(res, 403, "forbidden", "You do not have access to this record");
+    if (isSelf) return res.json(member);
+
+    const { rows: allowed } = await pool.query(
+      `SELECT 1 FROM member_phone_visibility
+        WHERE member_id = $1 AND viewer_user_id = $2 LIMIT 1`,
+      [member.id, userId]
+    );
+
+    if (allowed.length) return res.json(member);
+    return res.json({ ...member, phone: null });
   } catch (err) {
     console.error("getMember error:", err);
     return fail(res, 500, "server_error", "Failed to load member");
@@ -147,8 +157,7 @@ const getMember = async (req, res) => {
 };
 
 // ---------------------------------------------------------------------------
-// POST /management/:accountId/members
-// owner / admin only
+// POST /management/:accountId/members  (owner / admin)
 // ---------------------------------------------------------------------------
 const createMember = async (req, res) => {
   const client = await pool.connect();
@@ -220,8 +229,10 @@ const createMember = async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // PATCH /management/:accountId/members/:id
+//
 // owner / admin -> any field
-// member        -> only { name, phone, photo_url }, on their own row
+// member        -> own row only, only { name, phone, photo_url }
+// staff         -> 403
 // ---------------------------------------------------------------------------
 const updateMember = async (req, res) => {
   const client = await pool.connect();
@@ -234,7 +245,6 @@ const updateMember = async (req, res) => {
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
-    // Fetch the existing member
     const { rows } = await client.query(
       `SELECT * FROM members WHERE id = $1 AND account_id = $2`,
       [id, accountId]
@@ -242,7 +252,6 @@ const updateMember = async (req, res) => {
     if (!rows.length) return fail(res, 404, "not_found", "Member not found");
     const existing = rows[0];
 
-    // Determine which fields the caller may change
     let allowedFields;
     if (role === "owner" || role === "admin") {
       allowedFields = [
@@ -267,7 +276,6 @@ const updateMember = async (req, res) => {
       return fail(res, 403, "forbidden", "You do not have access to this record");
     }
 
-    // Build the SET clause from allowed fields only
     const updates = {};
     for (const key of allowedFields) {
       if (Object.prototype.hasOwnProperty.call(req.body, key)) {
@@ -279,20 +287,9 @@ const updateMember = async (req, res) => {
       return fail(res, 400, "invalid_input", "No permitted fields to update");
     }
 
-    // If a non-owner/admin tries to set `role`, reject
-    if (
-      role !== "owner" &&
-      role !== "admin" &&
-      Object.prototype.hasOwnProperty.call(updates, "role")
-    ) {
-      return fail(res, 403, "forbidden", "You cannot change your role");
-    }
-
     const keys = Object.keys(updates);
     const values = keys.map((k) => updates[k]);
-    const setClause = keys
-      .map((k, i) => `${k} = $${i + 1}`)
-      .join(", ");
+    const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
 
     await client.query("BEGIN");
 
@@ -317,8 +314,7 @@ const updateMember = async (req, res) => {
 };
 
 // ---------------------------------------------------------------------------
-// DELETE /management/:accountId/members/:id
-// owner / admin only
+// DELETE /management/:accountId/members/:id  (owner / admin)
 // ---------------------------------------------------------------------------
 const deleteMember = async (req, res) => {
   try {
@@ -349,9 +345,203 @@ const deleteMember = async (req, res) => {
 };
 
 // ===========================================================================
-// STAFF  (same shape as members)
+// MEMBER PHONE VISIBILITY
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// GET /management/:accountId/members/:id/phone-visibility
+//
+// Returns the full toggle list for a member.
+// Only the member themselves, or an owner/admin, can call this.
+//
+// Response: array of
+//   {
+//     user_id, name, role, person_type, member_id, staff_id,
+//     enabled, locked, note
+//   }
+// ---------------------------------------------------------------------------
+const getPhoneVisibility = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId, id: memberId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+
+    const { rows: memberRows } = await pool.query(
+      `SELECT id, name, phone FROM members WHERE id = $1 AND account_id = $2`,
+      [memberId, accountId]
+    );
+    if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
+
+    const targetMember = memberRows[0];
+    const targetPhone = (targetMember.phone || "").replace(/\D/g, "").slice(-10);
+    const callerPhone = getUserPhone(req);
+    const callerIsTarget = callerPhone && callerPhone === targetPhone;
+
+    if (!callerIsTarget && role !== "owner" && role !== "admin") {
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "You cannot manage this member's phone visibility"
+      );
+    }
+
+    // Every active user on this account except the target member.
+    const { rows: people } = await pool.query(
+      `SELECT
+          u.id            AS user_id,
+          u.phone         AS user_phone,
+          am.role         AS role,
+          COALESCE(m.name, s.name, '') AS name,
+          CASE
+            WHEN m.id IS NOT NULL THEN 'member'
+            WHEN s.id IS NOT NULL THEN 'staff'
+            ELSE 'unknown'
+          END             AS person_type,
+          m.id            AS member_id,
+          s.id            AS staff_id
+         FROM account_members am
+         JOIN users u ON u.id = am.user_id
+         LEFT JOIN members m
+           ON m.account_id = am.account_id
+          AND RIGHT(REGEXP_REPLACE(m.phone,'\\D','','g'),10)
+              = RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10)
+         LEFT JOIN staff s
+           ON s.account_id = am.account_id
+          AND RIGHT(REGEXP_REPLACE(s.phone,'\\D','','g'),10)
+              = RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10)
+        WHERE am.account_id = $1
+          AND am.status = 'active'
+          AND RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10) <> $2
+        ORDER BY
+          CASE am.role
+            WHEN 'owner' THEN 1
+            WHEN 'admin' THEN 2
+            WHEN 'member' THEN 3
+            WHEN 'staff' THEN 4
+            ELSE 5
+          END,
+          COALESCE(m.name, s.name, '')`,
+      [accountId, targetPhone]
+    );
+
+    const { rows: existing } = await pool.query(
+      `SELECT viewer_user_id FROM member_phone_visibility WHERE member_id = $1`,
+      [memberId]
+    );
+    const allowedSet = new Set(existing.map((r) => r.viewer_user_id));
+
+    const result = people.map((p) => {
+      const isOwnerOrAdmin = p.role === "owner" || p.role === "admin";
+      return {
+        user_id: p.user_id,
+        name: p.name || "(unnamed)",
+        role: p.role,
+        person_type: p.person_type,
+        member_id: p.member_id,
+        staff_id: p.staff_id,
+        enabled: isOwnerOrAdmin ? true : allowedSet.has(p.user_id),
+        locked: isOwnerOrAdmin,
+        note: isOwnerOrAdmin
+          ? p.role === "owner"
+            ? "Owner can view by default"
+            : "Admin can view by default"
+          : null,
+      };
+    });
+
+    return res.json(result);
+  } catch (err) {
+    console.error("getPhoneVisibility error:", err);
+    return fail(res, 500, "server_error", "Failed to load phone visibility");
+  }
+};
+
+// ---------------------------------------------------------------------------
+// PUT /management/:accountId/members/:id/phone-visibility
+//
+// Body: { "viewer_user_ids": ["uuid1", "uuid2", ...] }
+// Replaces the entire allow-list for that member.
+// ---------------------------------------------------------------------------
+const updatePhoneVisibility = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id: memberId } = req.params;
+    const { viewer_user_ids } = req.body;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!Array.isArray(viewer_user_ids)) {
+      return fail(res, 400, "invalid_input", "viewer_user_ids must be an array");
+    }
+
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+
+    const { rows: memberRows } = await client.query(
+      `SELECT id, phone FROM members WHERE id = $1 AND account_id = $2`,
+      [memberId, accountId]
+    );
+    if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
+
+    const targetPhone = (memberRows[0].phone || "").replace(/\D/g, "").slice(-10);
+    const callerPhone = getUserPhone(req);
+    const callerIsTarget = callerPhone && callerPhone === targetPhone;
+
+    if (!callerIsTarget && role !== "owner" && role !== "admin") {
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "You cannot manage this member's phone visibility"
+      );
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `DELETE FROM member_phone_visibility WHERE member_id = $1`,
+      [memberId]
+    );
+
+    if (viewer_user_ids.length > 0) {
+      await client.query(
+        `INSERT INTO member_phone_visibility
+             (account_id, member_id, viewer_user_id)
+         SELECT $1, $2, u.id
+           FROM users u
+           JOIN account_members am
+             ON am.user_id = u.id
+            AND am.account_id = $1
+            AND am.status = 'active'
+          WHERE u.id = ANY($3::uuid[])`,
+        [accountId, memberId, viewer_user_ids]
+      );
+    }
+
+    await client.query("COMMIT");
+    return res.json({ success: true });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("updatePhoneVisibility error:", err);
+    return fail(res, 500, "server_error", "Failed to update phone visibility");
+  } finally {
+    client.release();
+  }
+};
+
+// ===========================================================================
+// STAFF
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GET /management/:accountId/staff
+// Everyone on the account can view the full staff list (phones visible).
+// ---------------------------------------------------------------------------
 const listStaff = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -362,34 +552,16 @@ const listStaff = async (req, res) => {
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
-    if (role === "owner" || role === "admin") {
-      const { rows } = await pool.query(
-        `SELECT id, account_id, name, phone, role, photo_url,
-                monthly_salary, created_by, created_at, updated_at
-           FROM staff
-          WHERE account_id = $1
-          ORDER BY name`,
-        [accountId]
-      );
-      return res.json(rows);
-    }
+    const { rows } = await pool.query(
+      `SELECT id, account_id, name, phone, role, photo_url,
+              monthly_salary, created_by, created_at, updated_at
+         FROM staff
+        WHERE account_id = $1
+        ORDER BY name`,
+      [accountId]
+    );
 
-    if (role === "staff") {
-      const phone = getUserPhone(req);
-      if (!phone) return res.json([]);
-
-      const { rows } = await pool.query(
-        `SELECT id, account_id, name, phone, role, photo_url,
-                monthly_salary, created_by, created_at, updated_at
-           FROM staff
-          WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $2`,
-        [accountId, phone]
-      );
-      return res.json(rows);
-    }
-
-    return fail(res, 403, "forbidden", "You do not have access to staff");
+    return res.json(rows);
   } catch (err) {
     console.error("listStaff error:", err);
     return fail(res, 500, "server_error", "Failed to load staff");
@@ -415,18 +587,7 @@ const getStaff = async (req, res) => {
     );
 
     if (!rows.length) return fail(res, 404, "not_found", "Staff not found");
-    const person = rows[0];
-
-    if (role === "owner" || role === "admin") return res.json(person);
-
-    if (role === "staff") {
-      const phone = getUserPhone(req);
-      const staffPhone = (person.phone || "").replace(/\D/g, "").slice(-10);
-      if (phone && phone === staffPhone) return res.json(person);
-      return fail(res, 403, "forbidden", "You can only view your own record");
-    }
-
-    return fail(res, 403, "forbidden", "You do not have access to this record");
+    return res.json(rows[0]);
   } catch (err) {
     console.error("getStaff error:", err);
     return fail(res, 500, "server_error", "Failed to load staff");
@@ -458,7 +619,14 @@ const createStaff = async (req, res) => {
       return fail(res, 400, "invalid_input", "Name and role are required");
     }
 
-    const validRoles = ["sweeper", "security", "maintenance", "gardener", "driver", "custom"];
+    const validRoles = [
+      "sweeper",
+      "security",
+      "maintenance",
+      "gardener",
+      "driver",
+      "custom",
+    ];
     if (!validRoles.includes(staffRole)) {
       return fail(res, 400, "invalid_role", "Invalid staff role");
     }
@@ -582,7 +750,7 @@ const deleteStaff = async (req, res) => {
 };
 
 // ===========================================================================
-// EXPENSES  (owner / admin only)
+// EXPENSES  (view: all roles; write: owner / admin only)
 // ===========================================================================
 
 const listExpenses = async (req, res) => {
@@ -593,9 +761,7 @@ const listExpenses = async (req, res) => {
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
 
     const role = await getRoleForAccount(userId, accountId);
-    if (role !== "owner" && role !== "admin") {
-      return fail(res, 403, "forbidden", "Only owners and admins can view expenses");
-    }
+    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
     const { rows } = await pool.query(
       `SELECT id, account_id, category, title, amount, transaction_type,
@@ -622,9 +788,7 @@ const getExpense = async (req, res) => {
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
 
     const role = await getRoleForAccount(userId, accountId);
-    if (role !== "owner" && role !== "admin") {
-      return fail(res, 403, "forbidden", "Only owners and admins can view expenses");
-    }
+    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
     const { rows } = await pool.query(
       `SELECT id, account_id, category, title, amount, transaction_type,
@@ -747,7 +911,9 @@ const updateExpense = async (req, res) => {
     for (const key of allowedFields) {
       if (Object.prototype.hasOwnProperty.call(req.body, key)) {
         updates[key] =
-          key === "bill_attachments" ? JSON.stringify(req.body[key]) : req.body[key];
+          key === "bill_attachments"
+            ? JSON.stringify(req.body[key])
+            : req.body[key];
       }
     }
 
@@ -823,12 +989,18 @@ module.exports = {
   createMember,
   updateMember,
   deleteMember,
+
+  // phone visibility
+  getPhoneVisibility,
+  updatePhoneVisibility,
+
   // staff
   listStaff,
   getStaff,
   createStaff,
   updateStaff,
   deleteStaff,
+
   // expenses
   listExpenses,
   getExpense,
