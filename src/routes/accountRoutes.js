@@ -2,10 +2,6 @@
 const express = require("express");
 const router = express.Router();
 
-// ----------------------------------------------------------------
-// authMiddleware now exports the function directly, but we
-// also handle the object form for compatibility.
-// ----------------------------------------------------------------
 const authMiddlewareModule = require("../middleware/authMiddleware");
 
 const authMiddleware =
@@ -27,9 +23,17 @@ if (typeof authMiddleware !== "function") {
 const {
   createAccount,
   listAccounts,
+  updateAccount,
+  setLastAccount,
 } = require("../controllers/accountController");
 
 router.post("/", authMiddleware, createAccount);
 router.get("/", authMiddleware, listAccounts);
+
+// Must come BEFORE "/:id" so it doesn't get shadowed.
+router.patch("/me/last-account", authMiddleware, setLastAccount);
+
+// Edit account (name and/or photo)
+router.patch("/:id", authMiddleware, updateAccount);
 
 module.exports = router;

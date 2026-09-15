@@ -11,20 +11,11 @@ const getUserId = (req) =>
 const getUserPhone = (req) => {
   const raw = req.user?.phone ?? null;
   if (!raw) return null;
-  // Normalize to last-10 digits so "919876543210" and "+91 98765 43210"
-  // both match "9876543210" on the members/staff side.
   const digits = String(raw).replace(/\D/g, "");
   return digits.length > 10 ? digits.slice(-10) : digits;
 };
 
-/**
- * Resolve the caller's role on the given account.
- *
- * Returns one of:
- *   "owner" | "admin" | "member" | "staff" | null
- */
 async function getRoleForAccount(userId, accountId) {
-  // Account creator is always treated as owner.
   const { rows: ownerRows } = await pool.query(
     `SELECT 1 FROM accounts WHERE id = $1 AND created_by = $2`,
     [accountId, userId]
@@ -43,7 +34,6 @@ async function getRoleForAccount(userId, accountId) {
   return rows.length ? rows[0].role : null;
 }
 
-/** Simple, consistent error responder. */
 const fail = (res, status, code, message) =>
   res.status(status).json({ code, message });
 
@@ -51,14 +41,6 @@ const fail = (res, status, code, message) =>
 // MEMBERS
 // ===========================================================================
 
-// ---------------------------------------------------------------------------
-// GET /management/:accountId/members
-//
-// owner / admin -> all members, phones always visible
-// member / staff -> all members, but phone is masked unless:
-//                     • the caller is the member themselves, OR
-//                     • the member has added the caller to their allow-list
-// ---------------------------------------------------------------------------
 const listMembers = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -79,12 +61,10 @@ const listMembers = async (req, res) => {
       [accountId]
     );
 
-    // Owner and admin: no masking.
     if (role === "owner" || role === "admin") {
       return res.json(rows);
     }
 
-    // Member and staff: mask phones per allow-list.
     const callerPhone = getUserPhone(req);
 
     const { rows: allowed } = await pool.query(
@@ -108,10 +88,6 @@ const listMembers = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// GET /management/:accountId/members/:id
-// Same masking rule as listMembers.
-// ---------------------------------------------------------------------------
 const getMember = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -156,9 +132,6 @@ const getMember = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// POST /management/:accountId/members  (owner / admin)
-// ---------------------------------------------------------------------------
 const createMember = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -227,13 +200,6 @@ const createMember = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// PATCH /management/:accountId/members/:id
-//
-// owner / admin -> any field
-// member        -> own row only, only { name, phone, photo_url }
-// staff         -> 403
-// ---------------------------------------------------------------------------
 const updateMember = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -313,9 +279,6 @@ const updateMember = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// DELETE /management/:accountId/members/:id  (owner / admin)
-// ---------------------------------------------------------------------------
 const deleteMember = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -348,18 +311,6 @@ const deleteMember = async (req, res) => {
 // MEMBER PHONE VISIBILITY
 // ===========================================================================
 
-// ---------------------------------------------------------------------------
-// GET /management/:accountId/members/:id/phone-visibility
-//
-// Returns the full toggle list for a member.
-// Only the member themselves, or an owner/admin, can call this.
-//
-// Response: array of
-//   {
-//     user_id, name, role, person_type, member_id, staff_id,
-//     enabled, locked, note
-//   }
-// ---------------------------------------------------------------------------
 const getPhoneVisibility = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -390,7 +341,6 @@ const getPhoneVisibility = async (req, res) => {
       );
     }
 
-    // Every active user on this account except the target member.
     const { rows: people } = await pool.query(
       `SELECT
           u.id            AS user_id,
@@ -461,12 +411,6 @@ const getPhoneVisibility = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// PUT /management/:accountId/members/:id/phone-visibility
-//
-// Body: { "viewer_user_ids": ["uuid1", "uuid2", ...] }
-// Replaces the entire allow-list for that member.
-// ---------------------------------------------------------------------------
 const updatePhoneVisibility = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -538,10 +482,6 @@ const updatePhoneVisibility = async (req, res) => {
 // STAFF
 // ===========================================================================
 
-// ---------------------------------------------------------------------------
-// GET /management/:accountId/staff
-// Everyone on the account can view the full staff list (phones visible).
-// ---------------------------------------------------------------------------
 const listStaff = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -750,10 +690,245 @@ const deleteStaff = async (req, res) => {
 };
 
 // ===========================================================================
-// EXPENSES  (view: all roles; write: owner / admin only)
-//
-// due_date has been removed. expense_date is the single date column.
+// PAYMENTS  (monthly payments, one row per member/staff per month)
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
+// PUT /management/:accountId/members/:id/payments/:month
+//
+// Body (all optional except status):
+//   {
+//     status: "paid" | "due",
+//     paidDate?: "YYYY-MM-DD" | null,
+//     baseAmount?: number,           // defaults to member.maintenance_amount
+//     additionalAmount?: number,
+//     additionalNote?: string | null,
+//     deductionAmount?: number,
+//     deductionNote?: string | null,
+//     netAmount?: number             // computed if omitted
+//   }
+// ---------------------------------------------------------------------------
+const upsertMemberPayment = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id: memberId, month } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
+    }
+
+    const role = await getRoleForAccount(userId, accountId);
+    if (role !== "owner" && role !== "admin") {
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "Only owners and admins can update payments"
+      );
+    }
+
+    const { rows: memberRows } = await client.query(
+      `SELECT id, maintenance_amount
+         FROM members
+        WHERE id = $1 AND account_id = $2`,
+      [memberId, accountId]
+    );
+    if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
+
+    const {
+      status,
+      paidDate = null,
+      additionalAmount = 0,
+      additionalNote = null,
+      deductionAmount = 0,
+      deductionNote = null,
+      netAmount = null,
+      baseAmount = null,
+    } = req.body || {};
+
+    if (status !== "paid" && status !== "due") {
+      return fail(res, 400, "invalid_input", "Status must be 'paid' or 'due'");
+    }
+
+    const base =
+      baseAmount != null
+        ? Number(baseAmount)
+        : Number(memberRows[0].maintenance_amount || 0);
+
+    const net =
+      netAmount != null
+        ? Number(netAmount)
+        : base + Number(additionalAmount || 0) - Number(deductionAmount || 0);
+
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `INSERT INTO member_monthly_payments
+         (member_id, month, status, paid_date,
+          base_amount, additional_amount, additional_note,
+          deduction_amount, deduction_note, net_amount)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT (member_id, month) DO UPDATE SET
+         status            = EXCLUDED.status,
+         paid_date         = EXCLUDED.paid_date,
+         base_amount       = EXCLUDED.base_amount,
+         additional_amount = EXCLUDED.additional_amount,
+         additional_note   = EXCLUDED.additional_note,
+         deduction_amount  = EXCLUDED.deduction_amount,
+         deduction_note    = EXCLUDED.deduction_note,
+         net_amount        = EXCLUDED.net_amount,
+         updated_at        = NOW()
+       RETURNING *`,
+      [
+        memberId,
+        month,
+        status,
+        paidDate,
+        base,
+        additionalAmount,
+        additionalNote,
+        deductionAmount,
+        deductionNote,
+        net,
+      ]
+    );
+
+    await client.query("COMMIT");
+    return res.json(rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("upsertMemberPayment error:", err);
+    return fail(res, 500, "server_error", "Failed to save member payment");
+  } finally {
+    client.release();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// PUT /management/:accountId/staff/:id/payments/:month
+//
+// Body (all optional except status):
+//   {
+//     status: "paid" | "due",
+//     paidDate?: "YYYY-MM-DD" | null,
+//     baseAmount?: number,           // defaults to staff.monthly_salary
+//     payableSalary?: number | null, // optional, from attendance
+//     additionalAmount?: number,
+//     additionalNote?: string | null,
+//     deductionAmount?: number,
+//     deductionNote?: string | null,
+//     netAmount?: number             // computed if omitted
+//   }
+// ---------------------------------------------------------------------------
+const upsertStaffPayment = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id: staffId, month } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
+    }
+
+    const role = await getRoleForAccount(userId, accountId);
+    if (role !== "owner" && role !== "admin") {
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "Only owners and admins can update payments"
+      );
+    }
+
+    const { rows: staffRows } = await client.query(
+      `SELECT id, monthly_salary
+         FROM staff
+        WHERE id = $1 AND account_id = $2`,
+      [staffId, accountId]
+    );
+    if (!staffRows.length) return fail(res, 404, "not_found", "Staff not found");
+
+    const {
+      status,
+      paidDate = null,
+      additionalAmount = 0,
+      additionalNote = null,
+      deductionAmount = 0,
+      deductionNote = null,
+      netAmount = null,
+      baseAmount = null,
+      payableSalary = null,
+    } = req.body || {};
+
+    if (status !== "paid" && status !== "due") {
+      return fail(res, 400, "invalid_input", "Status must be 'paid' or 'due'");
+    }
+
+    const base =
+      baseAmount != null
+        ? Number(baseAmount)
+        : Number(staffRows[0].monthly_salary || 0);
+
+    const net =
+      netAmount != null
+        ? Number(netAmount)
+        : base + Number(additionalAmount || 0) - Number(deductionAmount || 0);
+
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `INSERT INTO staff_monthly_payments
+         (staff_id, month, status, paid_date,
+          base_amount, payable_salary,
+          additional_amount, additional_note,
+          deduction_amount, deduction_note, net_amount)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (staff_id, month) DO UPDATE SET
+         status            = EXCLUDED.status,
+         paid_date         = EXCLUDED.paid_date,
+         base_amount       = EXCLUDED.base_amount,
+         payable_salary    = EXCLUDED.payable_salary,
+         additional_amount = EXCLUDED.additional_amount,
+         additional_note   = EXCLUDED.additional_note,
+         deduction_amount  = EXCLUDED.deduction_amount,
+         deduction_note    = EXCLUDED.deduction_note,
+         net_amount        = EXCLUDED.net_amount,
+         updated_at        = NOW()
+       RETURNING *`,
+      [
+        staffId,
+        month,
+        status,
+        paidDate,
+        base,
+        payableSalary,
+        additionalAmount,
+        additionalNote,
+        deductionAmount,
+        deductionNote,
+        net,
+      ]
+    );
+
+    await client.query("COMMIT");
+    return res.json(rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("upsertStaffPayment error:", err);
+    return fail(res, 500, "server_error", "Failed to save staff payment");
+  } finally {
+    client.release();
+  }
+};
+
+// ===========================================================================
+// EXPENSES
+// ===========================================================================
 
 const listExpenses = async (req, res) => {
   try {
@@ -999,6 +1174,10 @@ module.exports = {
   createStaff,
   updateStaff,
   deleteStaff,
+
+  // payments
+  upsertMemberPayment,
+  upsertStaffPayment,
 
   // expenses
   listExpenses,

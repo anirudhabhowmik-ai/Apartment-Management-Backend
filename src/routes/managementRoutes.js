@@ -15,12 +15,24 @@ router.post("/:accountId/members", c.createMember);
 router.patch("/:accountId/members/:id", c.updateMember);
 router.delete("/:accountId/members/:id", c.deleteMember);
 
+// ---------------- Member Payments ----------------
+router.put(
+  "/:accountId/members/:id/payments/:month",
+  c.upsertMemberPayment
+);
+
 // ---------------- Staff ----------------
 router.get("/:accountId/staff", c.listStaff);
 router.get("/:accountId/staff/:id", c.getStaff);
 router.post("/:accountId/staff", c.createStaff);
 router.patch("/:accountId/staff/:id", c.updateStaff);
 router.delete("/:accountId/staff/:id", c.deleteStaff);
+
+// ---------------- Staff Payments ----------------
+router.put(
+  "/:accountId/staff/:id/payments/:month",
+  c.upsertStaffPayment
+);
 
 // ---------------- Expenses ----------------
 router.get("/:accountId/expenses", c.listExpenses);
