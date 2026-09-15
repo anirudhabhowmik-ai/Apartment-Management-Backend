@@ -93,6 +93,7 @@ CREATE INDEX IF NOT EXISTS idx_staff_phone
 
 -- -----------------------------------------------------------------------------
 -- 3. EXPENSES
+-- due_date has been removed. expense_date is the single date column.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS expenses (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -114,7 +115,6 @@ CREATE TABLE IF NOT EXISTS expenses (
     reminder_enabled BOOLEAN NOT NULL DEFAULT FALSE,
 
     expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
-    due_date DATE,
 
     description TEXT,
 

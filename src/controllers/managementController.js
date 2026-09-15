@@ -751,7 +751,9 @@ const deleteStaff = async (req, res) => {
 
 // ===========================================================================
 // EXPENSES  (view: all roles; write: owner / admin only)
-// ===========================================================================
+//
+// due_date has been removed. expense_date is the single date column.
+// ---------------------------------------------------------------------------
 
 const listExpenses = async (req, res) => {
   try {
@@ -765,7 +767,7 @@ const listExpenses = async (req, res) => {
 
     const { rows } = await pool.query(
       `SELECT id, account_id, category, title, amount, transaction_type,
-              status, reminder_enabled, expense_date, due_date,
+              status, reminder_enabled, expense_date,
               description, bill_attachments, created_by, created_at, updated_at
          FROM expenses
         WHERE account_id = $1
@@ -792,7 +794,7 @@ const getExpense = async (req, res) => {
 
     const { rows } = await pool.query(
       `SELECT id, account_id, category, title, amount, transaction_type,
-              status, reminder_enabled, expense_date, due_date,
+              status, reminder_enabled, expense_date,
               description, bill_attachments, created_by, created_at, updated_at
          FROM expenses
         WHERE id = $1 AND account_id = $2`,
@@ -828,7 +830,6 @@ const createExpense = async (req, res) => {
       status = "paid",
       reminder_enabled = false,
       expense_date,
-      due_date = null,
       description = null,
       bill_attachments = [],
     } = req.body;
@@ -850,9 +851,9 @@ const createExpense = async (req, res) => {
     const { rows } = await client.query(
       `INSERT INTO expenses
          (account_id, category, title, amount, transaction_type, status,
-          reminder_enabled, expense_date, due_date, description,
+          reminder_enabled, expense_date, description,
           bill_attachments, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8, CURRENT_DATE),$9,$10,$11,$12)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8, CURRENT_DATE),$9,$10,$11)
        RETURNING *`,
       [
         accountId,
@@ -863,7 +864,6 @@ const createExpense = async (req, res) => {
         status,
         reminder_enabled,
         expense_date || null,
-        due_date,
         description,
         JSON.stringify(bill_attachments),
         userId,
@@ -902,7 +902,6 @@ const updateExpense = async (req, res) => {
       "status",
       "reminder_enabled",
       "expense_date",
-      "due_date",
       "description",
       "bill_attachments",
     ];
