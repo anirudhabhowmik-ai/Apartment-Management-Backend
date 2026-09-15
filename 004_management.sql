@@ -1,0 +1,263 @@
+-- =============================================================================
+-- members_staff_expenses.sql
+--
+-- Three independent tables:
+--   • members  — flat residents
+--   • staff    — workers hired by the society
+--   • expenses — bills the society pays
+--
+-- Depends on:
+--   • users     (auth.sql)
+--   • accounts  (account.sql)
+--   • account_members (roles.sql)
+-- =============================================================================
+
+
+-- -----------------------------------------------------------------------------
+-- 1. MEMBERS (flat residents)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS members (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    account_id UUID NOT NULL
+        REFERENCES accounts(id)
+        ON DELETE CASCADE,
+
+    name VARCHAR(150) NOT NULL,
+    phone VARCHAR(20),
+    role VARCHAR(60) NOT NULL DEFAULT 'owner'
+        CHECK (role IN ('owner', 'secretary', 'tenant', 'custom')),
+    photo_url TEXT,
+
+    -- Flat details
+    wing VARCHAR(50),
+    flat_number VARCHAR(50) NOT NULL,
+    area_sqft INTEGER,
+    parking_available BOOLEAN NOT NULL DEFAULT FALSE,
+    maintenance_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+
+    -- Audit
+    created_by UUID NOT NULL
+        REFERENCES users(id)
+        ON DELETE RESTRICT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_members_account_id
+    ON members(account_id);
+
+CREATE INDEX IF NOT EXISTS idx_members_flat_number
+    ON members(account_id, flat_number);
+
+CREATE INDEX IF NOT EXISTS idx_members_phone
+    ON members(phone);
+
+
+-- -----------------------------------------------------------------------------
+-- 2. STAFF (sweeper, security, maintenance, …)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS staff (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    account_id UUID NOT NULL
+        REFERENCES accounts(id)
+        ON DELETE CASCADE,
+
+    name VARCHAR(150) NOT NULL,
+    phone VARCHAR(20),
+    role VARCHAR(60) NOT NULL
+        CHECK (role IN ('sweeper', 'security', 'maintenance', 'gardener',
+                        'driver', 'custom')),
+    photo_url TEXT,
+
+    monthly_salary NUMERIC(12,2) NOT NULL DEFAULT 0,
+
+    -- Audit
+    created_by UUID NOT NULL
+        REFERENCES users(id)
+        ON DELETE RESTRICT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_staff_account_id
+    ON staff(account_id);
+
+CREATE INDEX IF NOT EXISTS idx_staff_phone
+    ON staff(phone);
+
+
+-- -----------------------------------------------------------------------------
+-- 3. EXPENSES (bills the society pays)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS expenses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    account_id UUID NOT NULL
+        REFERENCES accounts(id)
+        ON DELETE CASCADE,
+
+    -- Category like 'electricity', 'water', 'maintenance', 'other'
+    category VARCHAR(60) NOT NULL,
+    -- Human-readable name shown in the UI, e.g. "Water bill – March"
+    title VARCHAR(200) NOT NULL,
+
+    amount NUMERIC(12,2) NOT NULL,
+
+    transaction_type VARCHAR(20) NOT NULL DEFAULT 'expense'
+        CHECK (transaction_type IN ('expense', 'income')),
+
+    status VARCHAR(20) NOT NULL DEFAULT 'paid'
+        CHECK (status IN ('paid', 'due')),
+
+    reminder_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+
+    -- Date the expense was incurred / bill date
+    expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    -- Date the payment is due (only meaningful when status='due')
+    due_date DATE,
+
+    description TEXT,
+
+    -- Array of { uri, name, mimeType }
+    bill_attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+    -- Audit
+    created_by UUID NOT NULL
+        REFERENCES users(id)
+        ON DELETE RESTRICT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_expenses_account_id
+    ON expenses(account_id);
+
+CREATE INDEX IF NOT EXISTS idx_expenses_category
+    ON expenses(account_id, category);
+
+CREATE INDEX IF NOT EXISTS idx_expenses_status
+    ON expenses(account_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_expenses_expense_date
+    ON expenses(account_id, expense_date DESC);
+
+
+-- -----------------------------------------------------------------------------
+-- 4. MEMBER MONTHLY PAYMENTS
+-- One row per member per month (maintenance paid/due).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS member_monthly_payments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    member_id UUID NOT NULL
+        REFERENCES members(id)
+        ON DELETE CASCADE,
+
+    month CHAR(7) NOT NULL,
+    status VARCHAR(20) NOT NULL
+        CHECK (status IN ('paid', 'due')),
+    paid_date DATE,
+
+    base_amount NUMERIC(12,2) NOT NULL,
+
+    additional_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    additional_note TEXT,
+
+    deduction_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    deduction_note TEXT,
+
+    net_amount NUMERIC(12,2),
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE (member_id, month),
+
+    CONSTRAINT member_monthly_payments_month_format
+        CHECK (month ~ '^\d{4}-\d{2}$')
+);
+
+CREATE INDEX IF NOT EXISTS idx_member_monthly_payments_member_id
+    ON member_monthly_payments(member_id);
+
+CREATE INDEX IF NOT EXISTS idx_member_monthly_payments_month
+    ON member_monthly_payments(month);
+
+
+-- -----------------------------------------------------------------------------
+-- 5. STAFF ATTENDANCE
+-- One row per staff member per month, statuses map keyed by date.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS staff_attendance (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    staff_id UUID NOT NULL
+        REFERENCES staff(id)
+        ON DELETE CASCADE,
+
+    month CHAR(7) NOT NULL,
+    statuses JSONB NOT NULL DEFAULT '{}'::jsonb,
+    payable_salary NUMERIC(12,2),
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE (staff_id, month),
+
+    CONSTRAINT staff_attendance_month_format
+        CHECK (month ~ '^\d{4}-\d{2}$')
+);
+
+CREATE INDEX IF NOT EXISTS idx_staff_attendance_staff_id
+    ON staff_attendance(staff_id);
+
+CREATE INDEX IF NOT EXISTS idx_staff_attendance_month
+    ON staff_attendance(month);
+
+
+-- -----------------------------------------------------------------------------
+-- 6. STAFF MONTHLY PAYMENTS
+-- One row per staff per month (salary paid/due).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS staff_monthly_payments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    staff_id UUID NOT NULL
+        REFERENCES staff(id)
+        ON DELETE CASCADE,
+
+    month CHAR(7) NOT NULL,
+    status VARCHAR(20) NOT NULL
+        CHECK (status IN ('paid', 'due')),
+    paid_date DATE,
+
+    base_amount NUMERIC(12,2) NOT NULL,
+    payable_salary NUMERIC(12,2),
+
+    additional_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    additional_note TEXT,
+
+    deduction_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    deduction_note TEXT,
+
+    net_amount NUMERIC(12,2),
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE (staff_id, month),
+
+    CONSTRAINT staff_monthly_payments_month_format
+        CHECK (month ~ '^\d{4}-\d{2}$')
+);
+
+CREATE INDEX IF NOT EXISTS idx_staff_monthly_payments_staff_id
+    ON staff_monthly_payments(staff_id);
+
+CREATE INDEX IF NOT EXISTS idx_staff_monthly_payments_month
+    ON staff_monthly_payments(month);
