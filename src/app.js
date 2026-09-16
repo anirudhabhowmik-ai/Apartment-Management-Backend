@@ -12,6 +12,7 @@ require('dotenv').config();
 const authRoutes = require('./routes/authRoutes');
 const accountRoutes = require("./routes/accountRoutes");
 const managementRoutes = require("./routes/managementRoutes");
+const openingBalanceRoutes = require("./routes/openingBalanceRoutes");
 
 const app = express();
 
@@ -84,6 +85,7 @@ app.get('/health', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use("/api/accounts", accountRoutes);
 app.use("/api/management", managementRoutes);
+app.use("/api/opening-balance", openingBalanceRoutes);
 
 // ============================================================
 // 404 HANDLER
