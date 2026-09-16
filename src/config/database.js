@@ -1,4 +1,19 @@
-const { Pool } = require("pg");
+const { Pool, types } = require("pg");
+
+// ---------------------------------------------------------------
+// Type parsers
+//
+// pg's default parser converts a Postgres DATE (OID 1082) into a
+// JavaScript Date at LOCAL midnight. When that Date is then sent
+// through res.json(), toISOString() renders it in UTC — which rolls
+// the calendar day back by one for any positive UTC offset (e.g.
+// IST = UTC+05:30). Return the raw string instead so the exact
+// value Postgres stored reaches the client untouched.
+//
+// Must be registered BEFORE the Pool is created.
+// ---------------------------------------------------------------
+types.setTypeParser(1082, (val) => val);   // DATE          → "YYYY-MM-DD"
+types.setTypeParser(1114, (val) => val);   // TIMESTAMP     → "YYYY-MM-DD HH:MM:SS"
 
 // ---------------------------------------------------------------
 // Validate environment configuration
