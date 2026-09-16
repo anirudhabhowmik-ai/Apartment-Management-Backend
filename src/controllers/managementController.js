@@ -15,6 +15,31 @@ const getUserPhone = (req) => {
   return digits.length > 10 ? digits.slice(-10) : digits;
 };
 
+/**
+ * Coerce a value into a positive integer, or null.
+ * null / undefined / "" / 0 / NaN all become null so the DB stores NULL.
+ *
+ *   null / undefined / "" / 0 / "0" / "0.00" / NaN  → null
+ *   500 / "500" / 500.4                              → 500
+ */
+const toNullableAmount = (v) => {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "string" && v.trim() === "") return null;
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const truncated = Math.trunc(n);
+  return truncated > 0 ? truncated : null;
+};
+
+/**
+ * Coerce a value into a trimmed non-empty string, or null.
+ */
+const toNullableNote = (v) => {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return s.length === 0 ? null : s;
+};
+
 async function getRoleForAccount(userId, accountId) {
   const { rows: ownerRows } = await pool.query(
     `SELECT 1 FROM accounts WHERE id = $1 AND created_by = $2`,
@@ -46,10 +71,20 @@ function normalizeMonth(raw) {
   return new Date().toISOString().slice(0, 7);
 }
 
+/**
+ * Base + additions − deductions. Treats null/undefined as 0 so the
+ * computation still works when a payment row has NULL amounts.
+ */
 function computeMemberDue(memberRow, paymentRow) {
   const base = Number(memberRow?.maintenance_amount) || 0;
-  const additional = Number(paymentRow?.additional_amount) || 0;
-  const deduction = Number(paymentRow?.deduction_amount) || 0;
+  const additional =
+    paymentRow?.additional_amount != null
+      ? Number(paymentRow.additional_amount)
+      : 0;
+  const deduction =
+    paymentRow?.deduction_amount != null
+      ? Number(paymentRow.deduction_amount)
+      : 0;
   return Math.max(0, base + additional - deduction);
 }
 
@@ -65,19 +100,31 @@ function computeStaffDue(staffRow, attendanceRow, paymentRow) {
       ? Number(attendanceRow.calculated_salary)
       : monthly;
 
-  const additional = Number(paymentRow?.additional_amount) || 0;
-  const deduction = Number(paymentRow?.deduction_amount) || 0;
+  const additional =
+    paymentRow?.additional_amount != null
+      ? Number(paymentRow.additional_amount)
+      : 0;
+  const deduction =
+    paymentRow?.deduction_amount != null
+      ? Number(paymentRow.deduction_amount)
+      : 0;
 
   return Math.max(0, effectiveBase + additional - deduction);
 }
 
+/**
+ * Preserve null vs number in the API response so the UI can show
+ * the placeholder when the field is empty.
+ */
 function mapMemberPaymentRow(p) {
   return {
     status: p.status,
     paidDate: p.paid_date,
-    additionalAmount: Number(p.additional_amount ?? 0),
+    additionalAmount:
+      p.additional_amount != null ? Number(p.additional_amount) : null,
     additionalNote: p.additional_note,
-    deductionAmount: Number(p.deduction_amount ?? 0),
+    deductionAmount:
+      p.deduction_amount != null ? Number(p.deduction_amount) : null,
     deductionNote: p.deduction_note,
     netAmount: p.net_amount != null ? Number(p.net_amount) : null,
   };
@@ -87,9 +134,11 @@ function mapStaffPaymentRow(p) {
   return {
     status: p.status,
     paidDate: p.paid_date,
-    additionalAmount: Number(p.additional_amount ?? 0),
+    additionalAmount:
+      p.additional_amount != null ? Number(p.additional_amount) : null,
     additionalNote: p.additional_note,
-    deductionAmount: Number(p.deduction_amount ?? 0),
+    deductionAmount:
+      p.deduction_amount != null ? Number(p.deduction_amount) : null,
     deductionNote: p.deduction_note,
     netAmount: p.net_amount != null ? Number(p.net_amount) : null,
   };
@@ -923,11 +972,6 @@ const upsertStaffAttendance = async (req, res) => {
 
     const baseSalary = Number(staffRows[0].monthly_salary) || 0;
 
-    // ---------------------------------------------------------------------
-    // Compute paid_days by iterating over every day of the month.
-    // Days not present in `statuses` fall back to "weekend" for Sat/Sun and
-    // "present" otherwise. Only an explicit "absent" reduces paid_days.
-    // ---------------------------------------------------------------------
     const [y, m] = month.split("-").map(Number);
     const totalDays = new Date(y, m, 0).getDate();
 
@@ -944,7 +988,6 @@ const upsertStaffAttendance = async (req, res) => {
     const autoCalculated =
       totalDays > 0 ? Math.round((baseSalary / totalDays) * paidDays) : 0;
 
-    // Manual override
     let calculatedSalary = autoCalculated;
     if (
       calculatedSalaryOverride !== undefined &&
@@ -1046,23 +1089,11 @@ const upsertMemberPayment = async (req, res) => {
 
     const body = req.body || {};
 
-    const toNumber = (v, fallback = 0) => {
-      if (v === null || v === undefined || v === "") return fallback;
-      const n = typeof v === "number" ? v : Number(v);
-      return Number.isFinite(n) ? n : fallback;
-    };
-
     const toDateOrNull = (v) => {
       if (!v) return null;
       const s = String(v).trim();
       if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
       return s;
-    };
-
-    const toStringOrNull = (v) => {
-      if (v === null || v === undefined) return null;
-      const s = String(v).trim();
-      return s.length === 0 ? null : s;
     };
 
     const status = body.status;
@@ -1072,12 +1103,19 @@ const upsertMemberPayment = async (req, res) => {
 
     const paidDate = toDateOrNull(body.paidDate);
 
-    const baseAmount = toNumber(memberRows[0].maintenance_amount, 0);
-    const additionalAmount = toNumber(body.additionalAmount, 0);
-    const additionalNote = toStringOrNull(body.additionalNote);
-    const deductionAmount = toNumber(body.deductionAmount, 0);
-    const deductionNote = toStringOrNull(body.deductionNote);
-    const netAmount = Math.max(0, baseAmount + additionalAmount - deductionAmount);
+    const baseAmount = Number(memberRows[0].maintenance_amount) || 0;
+
+    const additionalAmount = toNullableAmount(body.additionalAmount);
+    const additionalNote = toNullableNote(body.additionalNote);
+    const deductionAmount = toNullableAmount(body.deductionAmount);
+    const deductionNote = toNullableNote(body.deductionNote);
+
+    const additionalNumber = additionalAmount ?? 0;
+    const deductionNumber = deductionAmount ?? 0;
+    const netAmount = Math.max(
+      0,
+      baseAmount + additionalNumber - deductionNumber,
+    );
 
     await client.query("BEGIN");
 
@@ -1167,23 +1205,11 @@ const upsertStaffPayment = async (req, res) => {
 
     const body = req.body || {};
 
-    const toNumber = (v, fallback = 0) => {
-      if (v === null || v === undefined || v === "") return fallback;
-      const n = typeof v === "number" ? v : Number(v);
-      return Number.isFinite(n) ? n : fallback;
-    };
-
     const toDateOrNull = (v) => {
       if (!v) return null;
       const s = String(v).trim();
       if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
       return s;
-    };
-
-    const toStringOrNull = (v) => {
-      if (v === null || v === undefined) return null;
-      const s = String(v).trim();
-      return s.length === 0 ? null : s;
     };
 
     const status = body.status;
@@ -1212,29 +1238,20 @@ const upsertStaffPayment = async (req, res) => {
     const effectiveBase =
       attendanceBase != null ? attendanceBase : monthlySalary;
 
-    const additionalAmount = toNumber(body.additionalAmount, 0);
-    const additionalNote = toStringOrNull(body.additionalNote);
-    const deductionAmount = toNumber(body.deductionAmount, 0);
-    const deductionNote = toStringOrNull(body.deductionNote);
+    const additionalAmount = toNullableAmount(body.additionalAmount);
+    const additionalNote = toNullableNote(body.additionalNote);
+    const deductionAmount = toNullableAmount(body.deductionAmount);
+    const deductionNote = toNullableNote(body.deductionNote);
+
+    const additionalNumber = additionalAmount ?? 0;
+    const deductionNumber = deductionAmount ?? 0;
 
     const netAmount = Math.max(
       0,
-      effectiveBase + additionalAmount - deductionAmount,
+      effectiveBase + additionalNumber - deductionNumber,
     );
 
     const dueAmount = netAmount;
-
-    console.log("[upsertStaffPayment]", {
-      staffId,
-      month,
-      monthlySalary,
-      attendanceBase,
-      effectiveBase,
-      additionalAmount,
-      deductionAmount,
-      netAmount,
-      dueAmount,
-    });
 
     await client.query("BEGIN");
 
