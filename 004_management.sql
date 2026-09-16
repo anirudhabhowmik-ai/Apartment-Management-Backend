@@ -143,6 +143,13 @@ CREATE INDEX IF NOT EXISTS idx_expenses_expense_date
 
 -- -----------------------------------------------------------------------------
 -- 4. MEMBER MONTHLY PAYMENTS
+--
+-- The base maintenance amount is NOT stored here. It is always read from
+-- members.maintenance_amount, which is the single source of truth.
+--
+-- additional_amount and deduction_amount are NULLABLE with NO DEFAULT so
+-- that an empty field on the client is stored as NULL (not 0). The UI
+-- checks for NULL and shows the placeholder.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS member_monthly_payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -156,12 +163,10 @@ CREATE TABLE IF NOT EXISTS member_monthly_payments (
         CHECK (status IN ('paid', 'due')),
     paid_date DATE,
 
-    base_amount NUMERIC(12,2) NOT NULL,
-
-    additional_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    additional_amount NUMERIC(12,2),
     additional_note TEXT,
 
-    deduction_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    deduction_amount NUMERIC(12,2),
     deduction_note TEXT,
 
     net_amount NUMERIC(12,2),
@@ -234,6 +239,14 @@ CREATE INDEX IF NOT EXISTS idx_staff_attendance_month
 
 -- -----------------------------------------------------------------------------
 -- 6. STAFF MONTHLY PAYMENTS
+--
+-- The base salary is NOT stored here. It is always read from
+-- staff.monthly_salary (or staff_attendance.calculated_salary when
+-- attendance exists for the month), which is the single source of truth.
+--
+-- additional_amount and deduction_amount are NULLABLE with NO DEFAULT so
+-- that an empty field on the client is stored as NULL (not 0). The UI
+-- checks for NULL and shows the placeholder.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS staff_monthly_payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -247,13 +260,10 @@ CREATE TABLE IF NOT EXISTS staff_monthly_payments (
         CHECK (status IN ('paid', 'due')),
     paid_date DATE,
 
-    base_amount NUMERIC(12,2) NOT NULL,
-    payable_salary NUMERIC(12,2),
-
-    additional_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    additional_amount NUMERIC(12,2),
     additional_note TEXT,
 
-    deduction_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    deduction_amount NUMERIC(12,2),
     deduction_note TEXT,
 
     net_amount NUMERIC(12,2),
