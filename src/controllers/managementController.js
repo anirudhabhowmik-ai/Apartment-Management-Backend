@@ -37,6 +37,40 @@ async function getRoleForAccount(userId, accountId) {
 const fail = (res, status, code, message) =>
   res.status(status).json({ code, message });
 
+// ---------------------------------------------------------------------------
+// Due-amount computation
+// ---------------------------------------------------------------------------
+
+function normalizeMonth(raw) {
+  if (typeof raw === "string" && /^\d{4}-\d{2}$/.test(raw)) return raw;
+  return new Date().toISOString().slice(0, 7);
+}
+
+function computeMemberDue(memberRow, paymentRow) {
+  const base = Number(memberRow?.maintenance_amount) || 0;
+  const additional = Number(paymentRow?.additional_amount) || 0;
+  const deduction = Number(paymentRow?.deduction_amount) || 0;
+  return Math.max(0, base + additional - deduction);
+}
+
+/**
+ * Staff due: attendance-adjusted salary (if any) + additions − deductions.
+ * Never trusts the stored net_amount — always recomputes.
+ */
+function computeStaffDue(staffRow, attendanceRow, paymentRow) {
+  const monthly = Number(staffRow?.monthly_salary) || 0;
+
+  const effectiveBase =
+    attendanceRow?.calculated_salary != null
+      ? Number(attendanceRow.calculated_salary)
+      : monthly;
+
+  const additional = Number(paymentRow?.additional_amount) || 0;
+  const deduction = Number(paymentRow?.deduction_amount) || 0;
+
+  return Math.max(0, effectiveBase + additional - deduction);
+}
+
 function mapMemberPaymentRow(p) {
   return {
     status: p.status,
@@ -75,6 +109,8 @@ const listMembers = async (req, res) => {
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
+    const month = normalizeMonth(req.query?.month);
+
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
               wing, flat_number, area_sqft, parking_available,
@@ -85,40 +121,38 @@ const listMembers = async (req, res) => {
       [accountId]
     );
 
-    let paymentsByMember = new Map();
-    try {
-      const { rows: payRows } = await pool.query(
-        `SELECT mmp.member_id, mmp.month, mmp.status, mmp.paid_date,
-                mmp.additional_amount, mmp.additional_note,
-                mmp.deduction_amount, mmp.deduction_note, mmp.net_amount
-           FROM member_monthly_payments mmp
-           JOIN members m ON m.id = mmp.member_id
-          WHERE m.account_id = $1`,
-        [accountId]
-      );
+    const { rows: payRows } = await pool.query(
+      `SELECT mmp.member_id, mmp.month, mmp.status, mmp.paid_date,
+              mmp.additional_amount, mmp.additional_note,
+              mmp.deduction_amount, mmp.deduction_note, mmp.net_amount
+         FROM member_monthly_payments mmp
+         JOIN members m ON m.id = mmp.member_id
+        WHERE m.account_id = $1 AND mmp.month = $2`,
+      [accountId, month]
+    );
 
-      for (const p of payRows) {
-        if (!paymentsByMember.has(p.member_id)) {
-          paymentsByMember.set(p.member_id, {});
-        }
-        paymentsByMember.get(p.member_id)[p.month] = mapMemberPaymentRow(p);
-      }
-    } catch (payErr) {
-      console.error("listMembers payments join error:", payErr);
-      paymentsByMember = new Map();
-    }
+    const paymentByMember = new Map();
+    for (const p of payRows) paymentByMember.set(p.member_id, p);
 
-    const withPayments = rows.map((m) => ({
-      ...m,
-      monthly_payments: paymentsByMember.get(m.id) ?? {},
-    }));
+    const result = rows.map((m) => {
+      const payment = paymentByMember.get(m.id) ?? null;
+      const dueAmount = computeMemberDue(m, payment);
+
+      return {
+        ...m,
+        due_amount: dueAmount,
+        due_month: month,
+        monthly_payments: payment
+          ? { [payment.month]: mapMemberPaymentRow(payment) }
+          : {},
+      };
+    });
 
     if (role === "owner" || role === "admin") {
-      return res.json(withPayments);
+      return res.json(result);
     }
 
     const callerPhone = getUserPhone(req);
-
     const { rows: allowed } = await pool.query(
       `SELECT member_id FROM member_phone_visibility
         WHERE account_id = $1 AND viewer_user_id = $2`,
@@ -126,7 +160,7 @@ const listMembers = async (req, res) => {
     );
     const allowedMemberIds = new Set(allowed.map((r) => r.member_id));
 
-    const masked = withPayments.map((m) => {
+    const masked = result.map((m) => {
       const memberPhone = (m.phone || "").replace(/\D/g, "").slice(-10);
       const isSelf = callerPhone && callerPhone === memberPhone;
       const canSee = isSelf || allowedMemberIds.has(m.id);
@@ -242,7 +276,16 @@ const createMember = async (req, res) => {
     );
 
     await client.query("COMMIT");
-    return res.status(201).json(rows[0]);
+
+    const created = rows[0];
+    const month = normalizeMonth(req.query?.month);
+
+    return res.status(201).json({
+      ...created,
+      due_amount: computeMemberDue(created, null),
+      due_month: month,
+      monthly_payments: {},
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("createMember error:", err);
@@ -544,6 +587,8 @@ const listStaff = async (req, res) => {
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
+    const month = normalizeMonth(req.query?.month);
+
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
               monthly_salary, created_by, created_at, updated_at
@@ -553,33 +598,53 @@ const listStaff = async (req, res) => {
       [accountId]
     );
 
-    let paymentsByStaff = new Map();
-    try {
-      const { rows: payRows } = await pool.query(
-        `SELECT smp.staff_id, smp.month, smp.status, smp.paid_date,
-                smp.additional_amount, smp.additional_note,
-                smp.deduction_amount, smp.deduction_note, smp.net_amount
-           FROM staff_monthly_payments smp
-           JOIN staff s ON s.id = smp.staff_id
-          WHERE s.account_id = $1`,
-        [accountId]
-      );
+    const { rows: payRows } = await pool.query(
+      `SELECT smp.staff_id, smp.month, smp.status, smp.paid_date,
+              smp.additional_amount, smp.additional_note,
+              smp.deduction_amount, smp.deduction_note, smp.net_amount
+         FROM staff_monthly_payments smp
+         JOIN staff s ON s.id = smp.staff_id
+        WHERE s.account_id = $1 AND smp.month = $2`,
+      [accountId, month]
+    );
+    const paymentByStaff = new Map();
+    for (const p of payRows) paymentByStaff.set(p.staff_id, p);
 
-      for (const p of payRows) {
-        if (!paymentsByStaff.has(p.staff_id)) {
-          paymentsByStaff.set(p.staff_id, {});
-        }
-        paymentsByStaff.get(p.staff_id)[p.month] = mapStaffPaymentRow(p);
-      }
-    } catch (payErr) {
-      console.error("listStaff payments join error:", payErr);
-      paymentsByStaff = new Map();
-    }
+    const { rows: attRows } = await pool.query(
+      `SELECT sa.staff_id, sa.month, sa.statuses, sa.paid_days,
+              sa.calculated_salary
+         FROM staff_attendance sa
+         JOIN staff s ON s.id = sa.staff_id
+        WHERE s.account_id = $1 AND sa.month = $2`,
+      [accountId, month]
+    );
+    const attendanceByStaff = new Map();
+    for (const a of attRows) attendanceByStaff.set(a.staff_id, a);
 
-    const result = rows.map((s) => ({
-      ...s,
-      monthly_payments: paymentsByStaff.get(s.id) ?? {},
-    }));
+    const result = rows.map((s) => {
+      const attendance = attendanceByStaff.get(s.id) ?? null;
+      const payment = paymentByStaff.get(s.id) ?? null;
+      const dueAmount = computeStaffDue(s, attendance, payment);
+
+      return {
+        ...s,
+        due_amount: dueAmount,
+        due_month: month,
+        monthly_payments: payment
+          ? { [payment.month]: mapStaffPaymentRow(payment) }
+          : {},
+        attendance_for_month: attendance
+          ? {
+              statuses: attendance.statuses,
+              paidDays: attendance.paid_days,
+              calculatedSalary:
+                attendance.calculated_salary != null
+                  ? Number(attendance.calculated_salary)
+                  : null,
+            }
+          : null,
+      };
+    });
 
     return res.json(result);
   } catch (err) {
@@ -662,7 +727,17 @@ const createStaff = async (req, res) => {
     );
 
     await client.query("COMMIT");
-    return res.status(201).json(rows[0]);
+
+    const created = rows[0];
+    const month = normalizeMonth(req.query?.month);
+
+    return res.status(201).json({
+      ...created,
+      due_amount: computeStaffDue(created, null, null),
+      due_month: month,
+      monthly_payments: {},
+      attendance_for_month: null,
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("createStaff error:", err);
@@ -810,7 +885,8 @@ const upsertStaffAttendance = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId, id: staffId, month } = req.params;
-    const { statuses } = req.body || {};
+    const { statuses, calculated_salary: calculatedSalaryOverride } =
+      req.body || {};
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
 
@@ -847,12 +923,38 @@ const upsertStaffAttendance = async (req, res) => {
 
     const baseSalary = Number(staffRows[0].monthly_salary) || 0;
 
-    const paidDays = Object.values(statuses).filter((s) => s !== "absent").length;
-
+    // ---------------------------------------------------------------------
+    // Compute paid_days by iterating over every day of the month.
+    // Days not present in `statuses` fall back to "weekend" for Sat/Sun and
+    // "present" otherwise. Only an explicit "absent" reduces paid_days.
+    // ---------------------------------------------------------------------
     const [y, m] = month.split("-").map(Number);
     const totalDays = new Date(y, m, 0).getDate();
-    const calculatedSalary =
+
+    let paidDays = 0;
+    for (let day = 1; day <= totalDays; day++) {
+      const key = `${month}-${String(day).padStart(2, "0")}`;
+      const explicit = statuses[key];
+      const status =
+        explicit ??
+        (new Date(y, m - 1, day).getDay() % 6 === 0 ? "weekend" : "present");
+      if (status !== "absent") paidDays++;
+    }
+
+    const autoCalculated =
       totalDays > 0 ? Math.round((baseSalary / totalDays) * paidDays) : 0;
+
+    // Manual override
+    let calculatedSalary = autoCalculated;
+    if (
+      calculatedSalaryOverride !== undefined &&
+      calculatedSalaryOverride !== null
+    ) {
+      const n = Number(calculatedSalaryOverride);
+      if (Number.isFinite(n) && n >= 0) {
+        calculatedSalary = Math.round(n);
+      }
+    }
 
     await client.query("BEGIN");
 
@@ -879,7 +981,28 @@ const upsertStaffAttendance = async (req, res) => {
     );
 
     await client.query("COMMIT");
-    return res.json(rows[0]);
+
+    const attendanceRow = rows[0];
+
+    const { rows: payRows } = await pool.query(
+      `SELECT additional_amount, deduction_amount
+         FROM staff_monthly_payments
+        WHERE staff_id = $1 AND month = $2`,
+      [staffId, month]
+    );
+    const paymentRow = payRows[0] ?? null;
+
+    const dueAmount = computeStaffDue(
+      { monthly_salary: baseSalary },
+      attendanceRow,
+      paymentRow,
+    );
+
+    return res.json({
+      ...attendanceRow,
+      due_amount: dueAmount,
+      due_month: month,
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("upsertStaffAttendance error:", err);
@@ -897,13 +1020,16 @@ const upsertMemberPayment = async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = getUserId(req);
-    const { accountId, id: memberId, month } = req.params;
+    const { accountId, id: memberId } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
-    if (!/^\d{4}-\d{2}$/.test(month)) {
+    const rawMonth =
+      req.params.month ?? req.body?.month ?? new Date().toISOString().slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(rawMonth)) {
       return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
     }
+    const month = rawMonth;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
 
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
@@ -951,7 +1077,7 @@ const upsertMemberPayment = async (req, res) => {
     const additionalNote = toStringOrNull(body.additionalNote);
     const deductionAmount = toNumber(body.deductionAmount, 0);
     const deductionNote = toStringOrNull(body.deductionNote);
-    const netAmount = baseAmount + additionalAmount - deductionAmount;
+    const netAmount = Math.max(0, baseAmount + additionalAmount - deductionAmount);
 
     await client.query("BEGIN");
 
@@ -985,7 +1111,21 @@ const upsertMemberPayment = async (req, res) => {
     );
 
     await client.query("COMMIT");
-    return res.json(rows[0]);
+
+    const paymentRow = rows[0];
+    const dueAmount = computeMemberDue(memberRows[0], paymentRow);
+
+    return res.json({
+      ...paymentRow,
+      due_amount: dueAmount,
+      due_month: month,
+      _debug: {
+        baseAmount,
+        additionalAmount,
+        deductionAmount,
+        netAmount,
+      },
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("upsertMemberPayment error:", err);
@@ -999,13 +1139,16 @@ const upsertStaffPayment = async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = getUserId(req);
-    const { accountId, id: staffId, month } = req.params;
+    const { accountId, id: staffId } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
-    if (!/^\d{4}-\d{2}$/.test(month)) {
+    const rawMonth =
+      req.params.month ?? req.body?.month ?? new Date().toISOString().slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(rawMonth)) {
       return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
     }
+    const month = rawMonth;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
 
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
@@ -1019,6 +1162,8 @@ const upsertStaffPayment = async (req, res) => {
       [staffId, accountId]
     );
     if (!staffRows.length) return fail(res, 404, "not_found", "Staff not found");
+
+    const staffRow = staffRows[0];
 
     const body = req.body || {};
 
@@ -1048,12 +1193,48 @@ const upsertStaffPayment = async (req, res) => {
 
     const paidDate = toDateOrNull(body.paidDate);
 
-    const baseAmount = toNumber(staffRows[0].monthly_salary, 0);
+    const { rows: attendanceRows } = await client.query(
+      `SELECT calculated_salary
+         FROM staff_attendance
+        WHERE staff_id = $1
+          AND account_id = $2
+          AND month = $3`,
+      [staffId, accountId, month]
+    );
+    const attendanceRow = attendanceRows[0] ?? null;
+
+    const monthlySalary = Number(staffRow.monthly_salary) || 0;
+    const attendanceBase =
+      attendanceRow?.calculated_salary != null
+        ? Number(attendanceRow.calculated_salary)
+        : null;
+
+    const effectiveBase =
+      attendanceBase != null ? attendanceBase : monthlySalary;
+
     const additionalAmount = toNumber(body.additionalAmount, 0);
     const additionalNote = toStringOrNull(body.additionalNote);
     const deductionAmount = toNumber(body.deductionAmount, 0);
     const deductionNote = toStringOrNull(body.deductionNote);
-    const netAmount = baseAmount + additionalAmount - deductionAmount;
+
+    const netAmount = Math.max(
+      0,
+      effectiveBase + additionalAmount - deductionAmount,
+    );
+
+    const dueAmount = netAmount;
+
+    console.log("[upsertStaffPayment]", {
+      staffId,
+      month,
+      monthlySalary,
+      attendanceBase,
+      effectiveBase,
+      additionalAmount,
+      deductionAmount,
+      netAmount,
+      dueAmount,
+    });
 
     await client.query("BEGIN");
 
@@ -1087,7 +1268,19 @@ const upsertStaffPayment = async (req, res) => {
     );
 
     await client.query("COMMIT");
-    return res.json(rows[0]);
+
+    return res.json({
+      ...rows[0],
+      due_amount: dueAmount,
+      due_month: month,
+      _debug: {
+        monthlySalary,
+        attendanceBase,
+        effectiveBase,
+        additionalAmount,
+        deductionAmount,
+      },
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("upsertStaffPayment error:", err);
