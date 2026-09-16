@@ -28,6 +28,16 @@ router.post("/:accountId/staff", c.createStaff);
 router.patch("/:accountId/staff/:id", c.updateStaff);
 router.delete("/:accountId/staff/:id", c.deleteStaff);
 
+// ---------------- Staff Attendance ----------------
+router.get(
+  "/:accountId/staff/:id/attendance/:month",
+  c.getStaffAttendance
+);
+router.put(
+  "/:accountId/staff/:id/attendance/:month",
+  c.upsertStaffAttendance
+);
+
 // ---------------- Staff Payments ----------------
 router.put(
   "/:accountId/staff/:id/payments/:month",

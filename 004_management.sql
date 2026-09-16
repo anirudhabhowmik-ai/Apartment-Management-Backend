@@ -6,7 +6,7 @@
 --   • staff                       — workers hired by the society
 --   • expenses                    — bills the society pays
 --   • member_monthly_payments     — one row per member per month (paid/due)
---   • staff_attendance            — one row per staff per month
+--   • staff_attendance            — one row per staff per month (attendance)
 --   • staff_monthly_payments      — one row per staff per month (paid/due)
 --   • member_phone_visibility     — per-member phone visibility allow-list
 --
@@ -184,17 +184,34 @@ CREATE INDEX IF NOT EXISTS idx_member_monthly_payments_month
 
 -- -----------------------------------------------------------------------------
 -- 5. STAFF ATTENDANCE
+-- One row per staff per month.
+--   statuses          — { "YYYY-MM-DD": "present"|"absent"|"holiday"|"weekend" }
+--   paid_days         — count of days that are not "absent"
+--   calculated_salary — round(staff.monthly_salary / daysInMonth * paid_days)
+--                       (base salary is read from staff.monthly_salary)
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS staff_attendance (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    account_id UUID NOT NULL
+        REFERENCES accounts(id)
+        ON DELETE CASCADE,
 
     staff_id UUID NOT NULL
         REFERENCES staff(id)
         ON DELETE CASCADE,
 
     month CHAR(7) NOT NULL,
+
     statuses JSONB NOT NULL DEFAULT '{}'::jsonb,
-    payable_salary NUMERIC(12,2),
+
+    paid_days INTEGER NOT NULL DEFAULT 0,
+
+    calculated_salary NUMERIC(12,2) NOT NULL DEFAULT 0,
+
+    created_by UUID
+        REFERENCES users(id)
+        ON DELETE SET NULL,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -207,6 +224,9 @@ CREATE TABLE IF NOT EXISTS staff_attendance (
 
 CREATE INDEX IF NOT EXISTS idx_staff_attendance_staff_id
     ON staff_attendance(staff_id);
+
+CREATE INDEX IF NOT EXISTS idx_staff_attendance_account_month
+    ON staff_attendance(account_id, month);
 
 CREATE INDEX IF NOT EXISTS idx_staff_attendance_month
     ON staff_attendance(month);

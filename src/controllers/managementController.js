@@ -37,6 +37,30 @@ async function getRoleForAccount(userId, accountId) {
 const fail = (res, status, code, message) =>
   res.status(status).json({ code, message });
 
+function mapMemberPaymentRow(p) {
+  return {
+    status: p.status,
+    paidDate: p.paid_date,
+    additionalAmount: Number(p.additional_amount ?? 0),
+    additionalNote: p.additional_note,
+    deductionAmount: Number(p.deduction_amount ?? 0),
+    deductionNote: p.deduction_note,
+    netAmount: p.net_amount != null ? Number(p.net_amount) : null,
+  };
+}
+
+function mapStaffPaymentRow(p) {
+  return {
+    status: p.status,
+    paidDate: p.paid_date,
+    additionalAmount: Number(p.additional_amount ?? 0),
+    additionalNote: p.additional_note,
+    deductionAmount: Number(p.deduction_amount ?? 0),
+    deductionNote: p.deduction_note,
+    netAmount: p.net_amount != null ? Number(p.net_amount) : null,
+  };
+}
+
 // ===========================================================================
 // MEMBERS
 // ===========================================================================
@@ -61,8 +85,36 @@ const listMembers = async (req, res) => {
       [accountId]
     );
 
+    let paymentsByMember = new Map();
+    try {
+      const { rows: payRows } = await pool.query(
+        `SELECT mmp.member_id, mmp.month, mmp.status, mmp.paid_date,
+                mmp.additional_amount, mmp.additional_note,
+                mmp.deduction_amount, mmp.deduction_note, mmp.net_amount
+           FROM member_monthly_payments mmp
+           JOIN members m ON m.id = mmp.member_id
+          WHERE m.account_id = $1`,
+        [accountId]
+      );
+
+      for (const p of payRows) {
+        if (!paymentsByMember.has(p.member_id)) {
+          paymentsByMember.set(p.member_id, {});
+        }
+        paymentsByMember.get(p.member_id)[p.month] = mapMemberPaymentRow(p);
+      }
+    } catch (payErr) {
+      console.error("listMembers payments join error:", payErr);
+      paymentsByMember = new Map();
+    }
+
+    const withPayments = rows.map((m) => ({
+      ...m,
+      monthly_payments: paymentsByMember.get(m.id) ?? {},
+    }));
+
     if (role === "owner" || role === "admin") {
-      return res.json(rows);
+      return res.json(withPayments);
     }
 
     const callerPhone = getUserPhone(req);
@@ -74,7 +126,7 @@ const listMembers = async (req, res) => {
     );
     const allowedMemberIds = new Set(allowed.map((r) => r.member_id));
 
-    const masked = rows.map((m) => {
+    const masked = withPayments.map((m) => {
       const memberPhone = (m.phone || "").replace(/\D/g, "").slice(-10);
       const isSelf = callerPhone && callerPhone === memberPhone;
       const canSee = isSelf || allowedMemberIds.has(m.id);
@@ -501,7 +553,35 @@ const listStaff = async (req, res) => {
       [accountId]
     );
 
-    return res.json(rows);
+    let paymentsByStaff = new Map();
+    try {
+      const { rows: payRows } = await pool.query(
+        `SELECT smp.staff_id, smp.month, smp.status, smp.paid_date,
+                smp.additional_amount, smp.additional_note,
+                smp.deduction_amount, smp.deduction_note, smp.net_amount
+           FROM staff_monthly_payments smp
+           JOIN staff s ON s.id = smp.staff_id
+          WHERE s.account_id = $1`,
+        [accountId]
+      );
+
+      for (const p of payRows) {
+        if (!paymentsByStaff.has(p.staff_id)) {
+          paymentsByStaff.set(p.staff_id, {});
+        }
+        paymentsByStaff.get(p.staff_id)[p.month] = mapStaffPaymentRow(p);
+      }
+    } catch (payErr) {
+      console.error("listStaff payments join error:", payErr);
+      paymentsByStaff = new Map();
+    }
+
+    const result = rows.map((s) => ({
+      ...s,
+      monthly_payments: paymentsByStaff.get(s.id) ?? {},
+    }));
+
+    return res.json(result);
   } catch (err) {
     console.error("listStaff error:", err);
     return fail(res, 500, "server_error", "Failed to load staff");
@@ -690,24 +770,129 @@ const deleteStaff = async (req, res) => {
 };
 
 // ===========================================================================
-// PAYMENTS  (monthly payments, one row per member/staff per month)
+// STAFF ATTENDANCE
 // ===========================================================================
 
-// ---------------------------------------------------------------------------
-// PUT /management/:accountId/members/:id/payments/:month
-//
-// Body (all optional except status):
-//   {
-//     status: "paid" | "due",
-//     paidDate?: "YYYY-MM-DD" | null,
-//     baseAmount?: number,           // defaults to member.maintenance_amount
-//     additionalAmount?: number,
-//     additionalNote?: string | null,
-//     deductionAmount?: number,
-//     deductionNote?: string | null,
-//     netAmount?: number             // computed if omitted
-//   }
-// ---------------------------------------------------------------------------
+const getStaffAttendance = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId, id: staffId, month } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
+    }
+
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+
+    const { rows } = await pool.query(
+      `SELECT staff_id, month, statuses, paid_days,
+              calculated_salary, updated_at
+         FROM staff_attendance
+        WHERE staff_id = $1
+          AND account_id = $2
+          AND month = $3`,
+      [staffId, accountId, month]
+    );
+
+    if (!rows.length) return res.json(null);
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("getStaffAttendance error:", err);
+    return fail(res, 500, "server_error", "Failed to load attendance");
+  }
+};
+
+const upsertStaffAttendance = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id: staffId, month } = req.params;
+    const { statuses } = req.body || {};
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
+    }
+
+    if (!statuses || typeof statuses !== "object" || Array.isArray(statuses)) {
+      return fail(res, 400, "invalid_input", "statuses object is required");
+    }
+
+    const role = await getRoleForAccount(userId, accountId);
+    if (role !== "owner" && role !== "admin") {
+      return fail(res, 403, "forbidden", "Only owners and admins can save attendance");
+    }
+
+    const validStatuses = new Set(["present", "absent", "holiday", "weekend"]);
+    for (const [day, value] of Object.entries(statuses)) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+        return fail(res, 400, "invalid_input", `Invalid date key: ${day}`);
+      }
+      if (!validStatuses.has(value)) {
+        return fail(res, 400, "invalid_input", `Invalid status: ${value}`);
+      }
+    }
+
+    const { rows: staffRows } = await client.query(
+      `SELECT id, monthly_salary
+         FROM staff
+        WHERE id = $1 AND account_id = $2`,
+      [staffId, accountId]
+    );
+    if (!staffRows.length) return fail(res, 404, "not_found", "Staff not found");
+
+    const baseSalary = Number(staffRows[0].monthly_salary) || 0;
+
+    const paidDays = Object.values(statuses).filter((s) => s !== "absent").length;
+
+    const [y, m] = month.split("-").map(Number);
+    const totalDays = new Date(y, m, 0).getDate();
+    const calculatedSalary =
+      totalDays > 0 ? Math.round((baseSalary / totalDays) * paidDays) : 0;
+
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `INSERT INTO staff_attendance
+         (account_id, staff_id, month, statuses, paid_days,
+          calculated_salary, created_by)
+       VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7)
+       ON CONFLICT (staff_id, month) DO UPDATE SET
+         statuses          = EXCLUDED.statuses,
+         paid_days         = EXCLUDED.paid_days,
+         calculated_salary = EXCLUDED.calculated_salary,
+         updated_at        = NOW()
+       RETURNING *`,
+      [
+        accountId,
+        staffId,
+        month,
+        JSON.stringify(statuses),
+        paidDays,
+        calculatedSalary,
+        userId,
+      ]
+    );
+
+    await client.query("COMMIT");
+    return res.json(rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("upsertStaffAttendance error:", err);
+    return fail(res, 500, "server_error", "Failed to save attendance");
+  } finally {
+    client.release();
+  }
+};
+
+// ===========================================================================
+// PAYMENTS
+// ===========================================================================
+
 const upsertMemberPayment = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -722,12 +907,7 @@ const upsertMemberPayment = async (req, res) => {
 
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
-      return fail(
-        res,
-        403,
-        "forbidden",
-        "Only owners and admins can update payments"
-      );
+      return fail(res, 403, "forbidden", "Only owners and admins can update payments");
     }
 
     const { rows: memberRows } = await client.query(
@@ -738,43 +918,52 @@ const upsertMemberPayment = async (req, res) => {
     );
     if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
 
-    const {
-      status,
-      paidDate = null,
-      additionalAmount = 0,
-      additionalNote = null,
-      deductionAmount = 0,
-      deductionNote = null,
-      netAmount = null,
-      baseAmount = null,
-    } = req.body || {};
+    const body = req.body || {};
 
+    const toNumber = (v, fallback = 0) => {
+      if (v === null || v === undefined || v === "") return fallback;
+      const n = typeof v === "number" ? v : Number(v);
+      return Number.isFinite(n) ? n : fallback;
+    };
+
+    const toDateOrNull = (v) => {
+      if (!v) return null;
+      const s = String(v).trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+      return s;
+    };
+
+    const toStringOrNull = (v) => {
+      if (v === null || v === undefined) return null;
+      const s = String(v).trim();
+      return s.length === 0 ? null : s;
+    };
+
+    const status = body.status;
     if (status !== "paid" && status !== "due") {
       return fail(res, 400, "invalid_input", "Status must be 'paid' or 'due'");
     }
 
-    const base =
-      baseAmount != null
-        ? Number(baseAmount)
-        : Number(memberRows[0].maintenance_amount || 0);
+    const paidDate = toDateOrNull(body.paidDate);
 
-    const net =
-      netAmount != null
-        ? Number(netAmount)
-        : base + Number(additionalAmount || 0) - Number(deductionAmount || 0);
+    const baseAmount = toNumber(memberRows[0].maintenance_amount, 0);
+    const additionalAmount = toNumber(body.additionalAmount, 0);
+    const additionalNote = toStringOrNull(body.additionalNote);
+    const deductionAmount = toNumber(body.deductionAmount, 0);
+    const deductionNote = toStringOrNull(body.deductionNote);
+    const netAmount = baseAmount + additionalAmount - deductionAmount;
 
     await client.query("BEGIN");
 
     const { rows } = await client.query(
       `INSERT INTO member_monthly_payments
          (member_id, month, status, paid_date,
-          base_amount, additional_amount, additional_note,
+          additional_amount, additional_note,
           deduction_amount, deduction_note, net_amount)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        ON CONFLICT (member_id, month) DO UPDATE SET
          status            = EXCLUDED.status,
          paid_date         = EXCLUDED.paid_date,
-         base_amount       = EXCLUDED.base_amount,
          additional_amount = EXCLUDED.additional_amount,
          additional_note   = EXCLUDED.additional_note,
          deduction_amount  = EXCLUDED.deduction_amount,
@@ -787,12 +976,11 @@ const upsertMemberPayment = async (req, res) => {
         month,
         status,
         paidDate,
-        base,
         additionalAmount,
         additionalNote,
         deductionAmount,
         deductionNote,
-        net,
+        netAmount,
       ]
     );
 
@@ -807,22 +995,6 @@ const upsertMemberPayment = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// PUT /management/:accountId/staff/:id/payments/:month
-//
-// Body (all optional except status):
-//   {
-//     status: "paid" | "due",
-//     paidDate?: "YYYY-MM-DD" | null,
-//     baseAmount?: number,           // defaults to staff.monthly_salary
-//     payableSalary?: number | null, // optional, from attendance
-//     additionalAmount?: number,
-//     additionalNote?: string | null,
-//     deductionAmount?: number,
-//     deductionNote?: string | null,
-//     netAmount?: number             // computed if omitted
-//   }
-// ---------------------------------------------------------------------------
 const upsertStaffPayment = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -837,12 +1009,7 @@ const upsertStaffPayment = async (req, res) => {
 
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
-      return fail(
-        res,
-        403,
-        "forbidden",
-        "Only owners and admins can update payments"
-      );
+      return fail(res, 403, "forbidden", "Only owners and admins can update payments");
     }
 
     const { rows: staffRows } = await client.query(
@@ -853,46 +1020,52 @@ const upsertStaffPayment = async (req, res) => {
     );
     if (!staffRows.length) return fail(res, 404, "not_found", "Staff not found");
 
-    const {
-      status,
-      paidDate = null,
-      additionalAmount = 0,
-      additionalNote = null,
-      deductionAmount = 0,
-      deductionNote = null,
-      netAmount = null,
-      baseAmount = null,
-      payableSalary = null,
-    } = req.body || {};
+    const body = req.body || {};
 
+    const toNumber = (v, fallback = 0) => {
+      if (v === null || v === undefined || v === "") return fallback;
+      const n = typeof v === "number" ? v : Number(v);
+      return Number.isFinite(n) ? n : fallback;
+    };
+
+    const toDateOrNull = (v) => {
+      if (!v) return null;
+      const s = String(v).trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+      return s;
+    };
+
+    const toStringOrNull = (v) => {
+      if (v === null || v === undefined) return null;
+      const s = String(v).trim();
+      return s.length === 0 ? null : s;
+    };
+
+    const status = body.status;
     if (status !== "paid" && status !== "due") {
       return fail(res, 400, "invalid_input", "Status must be 'paid' or 'due'");
     }
 
-    const base =
-      baseAmount != null
-        ? Number(baseAmount)
-        : Number(staffRows[0].monthly_salary || 0);
+    const paidDate = toDateOrNull(body.paidDate);
 
-    const net =
-      netAmount != null
-        ? Number(netAmount)
-        : base + Number(additionalAmount || 0) - Number(deductionAmount || 0);
+    const baseAmount = toNumber(staffRows[0].monthly_salary, 0);
+    const additionalAmount = toNumber(body.additionalAmount, 0);
+    const additionalNote = toStringOrNull(body.additionalNote);
+    const deductionAmount = toNumber(body.deductionAmount, 0);
+    const deductionNote = toStringOrNull(body.deductionNote);
+    const netAmount = baseAmount + additionalAmount - deductionAmount;
 
     await client.query("BEGIN");
 
     const { rows } = await client.query(
       `INSERT INTO staff_monthly_payments
          (staff_id, month, status, paid_date,
-          base_amount, payable_salary,
           additional_amount, additional_note,
           deduction_amount, deduction_note, net_amount)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        ON CONFLICT (staff_id, month) DO UPDATE SET
          status            = EXCLUDED.status,
          paid_date         = EXCLUDED.paid_date,
-         base_amount       = EXCLUDED.base_amount,
-         payable_salary    = EXCLUDED.payable_salary,
          additional_amount = EXCLUDED.additional_amount,
          additional_note   = EXCLUDED.additional_note,
          deduction_amount  = EXCLUDED.deduction_amount,
@@ -905,13 +1078,11 @@ const upsertStaffPayment = async (req, res) => {
         month,
         status,
         paidDate,
-        base,
-        payableSalary,
         additionalAmount,
         additionalNote,
         deductionAmount,
         deductionNote,
-        net,
+        netAmount,
       ]
     );
 
@@ -1157,29 +1328,27 @@ const deleteExpense = async (req, res) => {
 // ===========================================================================
 
 module.exports = {
-  // members
   listMembers,
   getMember,
   createMember,
   updateMember,
   deleteMember,
 
-  // phone visibility
   getPhoneVisibility,
   updatePhoneVisibility,
 
-  // staff
   listStaff,
   getStaff,
   createStaff,
   updateStaff,
   deleteStaff,
 
-  // payments
+  getStaffAttendance,
+  upsertStaffAttendance,
+
   upsertMemberPayment,
   upsertStaffPayment,
 
-  // expenses
   listExpenses,
   getExpense,
   createExpense,
