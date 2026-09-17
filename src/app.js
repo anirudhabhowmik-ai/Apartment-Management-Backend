@@ -1,3 +1,4 @@
+// app.js
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -10,6 +11,7 @@ require('dotenv').config();
 // ROUTE IMPORTS
 // ============================================================
 const authRoutes = require('./routes/authRoutes');
+const invitationRoutes = require("./routes/invitationRoutes");
 const accountRoutes = require("./routes/accountRoutes");
 const managementRoutes = require("./routes/managementRoutes");
 const openingBalanceRoutes = require("./routes/openingBalanceRoutes");
@@ -85,11 +87,12 @@ app.get('/health', (req, res) => {
 // ROUTES
 // ============================================================
 app.use('/api/auth', authRoutes);
+app.use('/api', invitationRoutes);
+app.use("/api", manageAccountProfileRoutes);
 app.use("/api/accounts", accountRoutes);
 app.use("/api/management", managementRoutes);
 app.use("/api/opening-balance", openingBalanceRoutes);
 app.use("/api", calendarRoutes);
-app.use("/api", manageAccountProfileRoutes);
 
 // ============================================================
 // 404 HANDLER

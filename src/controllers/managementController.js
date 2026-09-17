@@ -15,13 +15,6 @@ const getUserPhone = (req) => {
   return digits.length > 10 ? digits.slice(-10) : digits;
 };
 
-/**
- * Coerce a value into a positive integer, or null.
- * null / undefined / "" / 0 / NaN all become null so the DB stores NULL.
- *
- *   null / undefined / "" / 0 / "0" / "0.00" / NaN  → null
- *   500 / "500" / 500.4                              → 500
- */
 const toNullableAmount = (v) => {
   if (v === null || v === undefined) return null;
   if (typeof v === "string" && v.trim() === "") return null;
@@ -31,9 +24,6 @@ const toNullableAmount = (v) => {
   return truncated > 0 ? truncated : null;
 };
 
-/**
- * Coerce a value into a trimmed non-empty string, or null.
- */
 const toNullableNote = (v) => {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
@@ -71,10 +61,6 @@ function normalizeMonth(raw) {
   return new Date().toISOString().slice(0, 7);
 }
 
-/**
- * Base + additions − deductions. Treats null/undefined as 0 so the
- * computation still works when a payment row has NULL amounts.
- */
 function computeMemberDue(memberRow, paymentRow) {
   const base = Number(memberRow?.maintenance_amount) || 0;
   const additional =
@@ -88,18 +74,12 @@ function computeMemberDue(memberRow, paymentRow) {
   return Math.max(0, base + additional - deduction);
 }
 
-/**
- * Staff due: attendance-adjusted salary (if any) + additions − deductions.
- * Never trusts the stored net_amount — always recomputes.
- */
 function computeStaffDue(staffRow, attendanceRow, paymentRow) {
   const monthly = Number(staffRow?.monthly_salary) || 0;
-
   const effectiveBase =
     attendanceRow?.calculated_salary != null
       ? Number(attendanceRow.calculated_salary)
       : monthly;
-
   const additional =
     paymentRow?.additional_amount != null
       ? Number(paymentRow.additional_amount)
@@ -108,14 +88,9 @@ function computeStaffDue(staffRow, attendanceRow, paymentRow) {
     paymentRow?.deduction_amount != null
       ? Number(paymentRow.deduction_amount)
       : 0;
-
   return Math.max(0, effectiveBase + additional - deduction);
 }
 
-/**
- * Preserve null vs number in the API response so the UI can show
- * the placeholder when the field is empty.
- */
 function mapMemberPaymentRow(p) {
   return {
     status: p.status,
@@ -154,7 +129,6 @@ const listMembers = async (req, res) => {
     const { accountId } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
@@ -163,9 +137,10 @@ const listMembers = async (req, res) => {
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
               wing, flat_number, area_sqft, parking_available,
-              maintenance_amount, created_by, created_at, updated_at
+              maintenance_amount, status, created_by, created_at, updated_at
          FROM members
         WHERE account_id = $1
+          AND status = 'active'
         ORDER BY flat_number, name`,
       [accountId]
     );
@@ -176,7 +151,9 @@ const listMembers = async (req, res) => {
               mmp.deduction_amount, mmp.deduction_note, mmp.net_amount
          FROM member_monthly_payments mmp
          JOIN members m ON m.id = mmp.member_id
-        WHERE m.account_id = $1 AND mmp.month = $2`,
+        WHERE m.account_id = $1
+          AND m.status = 'active'
+          AND mmp.month = $2`,
       [accountId, month]
     );
 
@@ -186,7 +163,6 @@ const listMembers = async (req, res) => {
     const result = rows.map((m) => {
       const payment = paymentByMember.get(m.id) ?? null;
       const dueAmount = computeMemberDue(m, payment);
-
       return {
         ...m,
         due_amount: dueAmount,
@@ -197,9 +173,7 @@ const listMembers = async (req, res) => {
       };
     });
 
-    if (role === "owner" || role === "admin") {
-      return res.json(result);
-    }
+    if (role === "owner" || role === "admin") return res.json(result);
 
     const callerPhone = getUserPhone(req);
     const { rows: allowed } = await pool.query(
@@ -229,16 +203,17 @@ const getMember = async (req, res) => {
     const { accountId, id } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
               wing, flat_number, area_sqft, parking_available,
-              maintenance_amount, created_by, created_at, updated_at
+              maintenance_amount, status, created_by, created_at, updated_at
          FROM members
-        WHERE id = $1 AND account_id = $2`,
+        WHERE id = $1
+          AND account_id = $2
+          AND status = 'active'`,
       [id, accountId]
     );
 
@@ -250,7 +225,6 @@ const getMember = async (req, res) => {
     const callerPhone = getUserPhone(req);
     const memberPhone = (member.phone || "").replace(/\D/g, "").slice(-10);
     const isSelf = callerPhone && callerPhone === memberPhone;
-
     if (isSelf) return res.json(member);
 
     const { rows: allowed } = await pool.query(
@@ -274,7 +248,6 @@ const createMember = async (req, res) => {
     const { accountId } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can add members");
@@ -306,8 +279,8 @@ const createMember = async (req, res) => {
     const { rows } = await client.query(
       `INSERT INTO members
          (account_id, name, phone, role, photo_url, wing, flat_number,
-          area_sqft, parking_available, maintenance_amount, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          area_sqft, parking_available, maintenance_amount, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',$11)
        RETURNING *`,
       [
         accountId,
@@ -351,12 +324,12 @@ const updateMember = async (req, res) => {
     const { accountId, id } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
     const { rows } = await client.query(
-      `SELECT * FROM members WHERE id = $1 AND account_id = $2`,
+      `SELECT * FROM members
+        WHERE id = $1 AND account_id = $2 AND status = 'active'`,
       [id, accountId]
     );
     if (!rows.length) return fail(res, 404, "not_found", "Member not found");
@@ -365,15 +338,8 @@ const updateMember = async (req, res) => {
     let allowedFields;
     if (role === "owner" || role === "admin") {
       allowedFields = [
-        "name",
-        "phone",
-        "role",
-        "photo_url",
-        "wing",
-        "flat_number",
-        "area_sqft",
-        "parking_available",
-        "maintenance_amount",
+        "name","phone","role","photo_url","wing","flat_number",
+        "area_sqft","parking_available","maintenance_amount",
       ];
     } else if (role === "member") {
       const phone = getUserPhone(req);
@@ -392,7 +358,6 @@ const updateMember = async (req, res) => {
         updates[key] = req.body[key];
       }
     }
-
     if (Object.keys(updates).length === 0) {
       return fail(res, 400, "invalid_input", "No permitted fields to update");
     }
@@ -423,20 +388,24 @@ const updateMember = async (req, res) => {
   }
 };
 
+// ── SOFT DELETE ──
 const deleteMember = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can delete members");
     }
 
     const result = await pool.query(
-      `DELETE FROM members WHERE id = $1 AND account_id = $2`,
+      `UPDATE members
+          SET status = 'inactive', updated_at = NOW()
+        WHERE id = $1
+          AND account_id = $2
+          AND status = 'active'`,
       [id, accountId]
     );
 
@@ -461,12 +430,12 @@ const getPhoneVisibility = async (req, res) => {
     const { accountId, id: memberId } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
     const { rows: memberRows } = await pool.query(
-      `SELECT id, name, phone FROM members WHERE id = $1 AND account_id = $2`,
+      `SELECT id, name, phone FROM members
+        WHERE id = $1 AND account_id = $2 AND status = 'active'`,
       [memberId, accountId]
     );
     if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
@@ -477,12 +446,7 @@ const getPhoneVisibility = async (req, res) => {
     const callerIsTarget = callerPhone && callerPhone === targetPhone;
 
     if (!callerIsTarget && role !== "owner" && role !== "admin") {
-      return fail(
-        res,
-        403,
-        "forbidden",
-        "You cannot manage this member's phone visibility"
-      );
+      return fail(res, 403, "forbidden", "You cannot manage this member's phone visibility");
     }
 
     const { rows: people } = await pool.query(
@@ -502,10 +466,12 @@ const getPhoneVisibility = async (req, res) => {
          JOIN users u ON u.id = am.user_id
          LEFT JOIN members m
            ON m.account_id = am.account_id
+          AND m.status = 'active'
           AND RIGHT(REGEXP_REPLACE(m.phone,'\\D','','g'),10)
               = RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10)
          LEFT JOIN staff s
            ON s.account_id = am.account_id
+          AND s.status = 'active'
           AND RIGHT(REGEXP_REPLACE(s.phone,'\\D','','g'),10)
               = RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10)
         WHERE am.account_id = $1
@@ -571,7 +537,8 @@ const updatePhoneVisibility = async (req, res) => {
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
     const { rows: memberRows } = await client.query(
-      `SELECT id, phone FROM members WHERE id = $1 AND account_id = $2`,
+      `SELECT id, phone FROM members
+        WHERE id = $1 AND account_id = $2 AND status = 'active'`,
       [memberId, accountId]
     );
     if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
@@ -581,12 +548,7 @@ const updatePhoneVisibility = async (req, res) => {
     const callerIsTarget = callerPhone && callerPhone === targetPhone;
 
     if (!callerIsTarget && role !== "owner" && role !== "admin") {
-      return fail(
-        res,
-        403,
-        "forbidden",
-        "You cannot manage this member's phone visibility"
-      );
+      return fail(res, 403, "forbidden", "You cannot manage this member's phone visibility");
     }
 
     await client.query("BEGIN");
@@ -632,7 +594,6 @@ const listStaff = async (req, res) => {
     const { accountId } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
@@ -640,9 +601,10 @@ const listStaff = async (req, res) => {
 
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
-              monthly_salary, created_by, created_at, updated_at
+              monthly_salary, status, created_by, created_at, updated_at
          FROM staff
         WHERE account_id = $1
+          AND status = 'active'
         ORDER BY name`,
       [accountId]
     );
@@ -653,7 +615,9 @@ const listStaff = async (req, res) => {
               smp.deduction_amount, smp.deduction_note, smp.net_amount
          FROM staff_monthly_payments smp
          JOIN staff s ON s.id = smp.staff_id
-        WHERE s.account_id = $1 AND smp.month = $2`,
+        WHERE s.account_id = $1
+          AND s.status = 'active'
+          AND smp.month = $2`,
       [accountId, month]
     );
     const paymentByStaff = new Map();
@@ -664,7 +628,9 @@ const listStaff = async (req, res) => {
               sa.calculated_salary
          FROM staff_attendance sa
          JOIN staff s ON s.id = sa.staff_id
-        WHERE s.account_id = $1 AND sa.month = $2`,
+        WHERE s.account_id = $1
+          AND s.status = 'active'
+          AND sa.month = $2`,
       [accountId, month]
     );
     const attendanceByStaff = new Map();
@@ -708,15 +674,16 @@ const getStaff = async (req, res) => {
     const { accountId, id } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
-              monthly_salary, created_by, created_at, updated_at
+              monthly_salary, status, created_by, created_at, updated_at
          FROM staff
-        WHERE id = $1 AND account_id = $2`,
+        WHERE id = $1
+          AND account_id = $2
+          AND status = 'active'`,
       [id, accountId]
     );
 
@@ -735,7 +702,6 @@ const createStaff = async (req, res) => {
     const { accountId } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can add staff");
@@ -754,12 +720,7 @@ const createStaff = async (req, res) => {
     }
 
     const validRoles = [
-      "sweeper",
-      "security",
-      "maintenance",
-      "gardener",
-      "driver",
-      "custom",
+      "sweeper","security","maintenance","gardener","driver","custom",
     ];
     if (!validRoles.includes(staffRole)) {
       return fail(res, 400, "invalid_role", "Invalid staff role");
@@ -769,8 +730,8 @@ const createStaff = async (req, res) => {
 
     const { rows } = await client.query(
       `INSERT INTO staff
-         (account_id, name, phone, role, photo_url, monthly_salary, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
+         (account_id, name, phone, role, photo_url, monthly_salary, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,'active',$7)
        RETURNING *`,
       [accountId, name.trim(), phone, staffRole, photo_url, monthly_salary, userId]
     );
@@ -803,12 +764,12 @@ const updateStaff = async (req, res) => {
     const { accountId, id } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
     const { rows } = await client.query(
-      `SELECT * FROM staff WHERE id = $1 AND account_id = $2`,
+      `SELECT * FROM staff
+        WHERE id = $1 AND account_id = $2 AND status = 'active'`,
       [id, accountId]
     );
     if (!rows.length) return fail(res, 404, "not_found", "Staff not found");
@@ -834,7 +795,6 @@ const updateStaff = async (req, res) => {
         updates[key] = req.body[key];
       }
     }
-
     if (Object.keys(updates).length === 0) {
       return fail(res, 400, "invalid_input", "No permitted fields to update");
     }
@@ -865,20 +825,24 @@ const updateStaff = async (req, res) => {
   }
 };
 
+// ── SOFT DELETE ──
 const deleteStaff = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can delete staff");
     }
 
     const result = await pool.query(
-      `DELETE FROM staff WHERE id = $1 AND account_id = $2`,
+      `UPDATE staff
+          SET status = 'inactive', updated_at = NOW()
+        WHERE id = $1
+          AND account_id = $2
+          AND status = 'active'`,
       [id, accountId]
     );
 
@@ -903,11 +867,9 @@ const getStaffAttendance = async (req, res) => {
     const { accountId, id: staffId, month } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
     }
-
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
@@ -934,15 +896,12 @@ const upsertStaffAttendance = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId, id: staffId, month } = req.params;
-    const { statuses, calculated_salary: calculatedSalaryOverride } =
-      req.body || {};
+    const { statuses, calculated_salary: calculatedSalaryOverride } = req.body || {};
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
     }
-
     if (!statuses || typeof statuses !== "object" || Array.isArray(statuses)) {
       return fail(res, 400, "invalid_input", "statuses object is required");
     }
@@ -963,9 +922,8 @@ const upsertStaffAttendance = async (req, res) => {
     }
 
     const { rows: staffRows } = await client.query(
-      `SELECT id, monthly_salary
-         FROM staff
-        WHERE id = $1 AND account_id = $2`,
+      `SELECT id, monthly_salary FROM staff
+        WHERE id = $1 AND account_id = $2 AND status = 'active'`,
       [staffId, accountId]
     );
     if (!staffRows.length) return fail(res, 404, "not_found", "Staff not found");
@@ -989,22 +947,16 @@ const upsertStaffAttendance = async (req, res) => {
       totalDays > 0 ? Math.round((baseSalary / totalDays) * paidDays) : 0;
 
     let calculatedSalary = autoCalculated;
-    if (
-      calculatedSalaryOverride !== undefined &&
-      calculatedSalaryOverride !== null
-    ) {
+    if (calculatedSalaryOverride !== undefined && calculatedSalaryOverride !== null) {
       const n = Number(calculatedSalaryOverride);
-      if (Number.isFinite(n) && n >= 0) {
-        calculatedSalary = Math.round(n);
-      }
+      if (Number.isFinite(n) && n >= 0) calculatedSalary = Math.round(n);
     }
 
     await client.query("BEGIN");
 
     const { rows } = await client.query(
       `INSERT INTO staff_attendance
-         (account_id, staff_id, month, statuses, paid_days,
-          calculated_salary, created_by)
+         (account_id, staff_id, month, statuses, paid_days, calculated_salary, created_by)
        VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7)
        ON CONFLICT (staff_id, month) DO UPDATE SET
          statuses          = EXCLUDED.statuses,
@@ -1012,15 +964,7 @@ const upsertStaffAttendance = async (req, res) => {
          calculated_salary = EXCLUDED.calculated_salary,
          updated_at        = NOW()
        RETURNING *`,
-      [
-        accountId,
-        staffId,
-        month,
-        JSON.stringify(statuses),
-        paidDays,
-        calculatedSalary,
-        userId,
-      ]
+      [accountId, staffId, month, JSON.stringify(statuses), paidDays, calculatedSalary, userId]
     );
 
     await client.query("COMMIT");
@@ -1038,14 +982,10 @@ const upsertStaffAttendance = async (req, res) => {
     const dueAmount = computeStaffDue(
       { monthly_salary: baseSalary },
       attendanceRow,
-      paymentRow,
+      paymentRow
     );
 
-    return res.json({
-      ...attendanceRow,
-      due_amount: dueAmount,
-      due_month: month,
-    });
+    return res.json({ ...attendanceRow, due_amount: dueAmount, due_month: month });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("upsertStaffAttendance error:", err);
@@ -1073,16 +1013,14 @@ const upsertMemberPayment = async (req, res) => {
     const month = rawMonth;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can update payments");
     }
 
     const { rows: memberRows } = await client.query(
-      `SELECT id, maintenance_amount
-         FROM members
-        WHERE id = $1 AND account_id = $2`,
+      `SELECT id, maintenance_amount FROM members
+        WHERE id = $1 AND account_id = $2 AND status = 'active'`,
       [memberId, accountId]
     );
     if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
@@ -1102,7 +1040,6 @@ const upsertMemberPayment = async (req, res) => {
     }
 
     const paidDate = toDateOrNull(body.paidDate);
-
     const baseAmount = Number(memberRows[0].maintenance_amount) || 0;
 
     const additionalAmount = toNullableAmount(body.additionalAmount);
@@ -1112,10 +1049,7 @@ const upsertMemberPayment = async (req, res) => {
 
     const additionalNumber = additionalAmount ?? 0;
     const deductionNumber = deductionAmount ?? 0;
-    const netAmount = Math.max(
-      0,
-      baseAmount + additionalNumber - deductionNumber,
-    );
+    const netAmount = Math.max(0, baseAmount + additionalNumber - deductionNumber);
 
     await client.query("BEGIN");
 
@@ -1135,17 +1069,7 @@ const upsertMemberPayment = async (req, res) => {
          net_amount        = EXCLUDED.net_amount,
          updated_at        = NOW()
        RETURNING *`,
-      [
-        memberId,
-        month,
-        status,
-        paidDate,
-        additionalAmount,
-        additionalNote,
-        deductionAmount,
-        deductionNote,
-        netAmount,
-      ]
+      [memberId, month, status, paidDate, additionalAmount, additionalNote, deductionAmount, deductionNote, netAmount]
     );
 
     await client.query("COMMIT");
@@ -1153,17 +1077,7 @@ const upsertMemberPayment = async (req, res) => {
     const paymentRow = rows[0];
     const dueAmount = computeMemberDue(memberRows[0], paymentRow);
 
-    return res.json({
-      ...paymentRow,
-      due_amount: dueAmount,
-      due_month: month,
-      _debug: {
-        baseAmount,
-        additionalAmount,
-        deductionAmount,
-        netAmount,
-      },
-    });
+    return res.json({ ...paymentRow, due_amount: dueAmount, due_month: month });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("upsertMemberPayment error:", err);
@@ -1187,22 +1101,19 @@ const upsertStaffPayment = async (req, res) => {
     const month = rawMonth;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can update payments");
     }
 
     const { rows: staffRows } = await client.query(
-      `SELECT id, monthly_salary
-         FROM staff
-        WHERE id = $1 AND account_id = $2`,
+      `SELECT id, monthly_salary FROM staff
+        WHERE id = $1 AND account_id = $2 AND status = 'active'`,
       [staffId, accountId]
     );
     if (!staffRows.length) return fail(res, 404, "not_found", "Staff not found");
 
     const staffRow = staffRows[0];
-
     const body = req.body || {};
 
     const toDateOrNull = (v) => {
@@ -1220,11 +1131,8 @@ const upsertStaffPayment = async (req, res) => {
     const paidDate = toDateOrNull(body.paidDate);
 
     const { rows: attendanceRows } = await client.query(
-      `SELECT calculated_salary
-         FROM staff_attendance
-        WHERE staff_id = $1
-          AND account_id = $2
-          AND month = $3`,
+      `SELECT calculated_salary FROM staff_attendance
+        WHERE staff_id = $1 AND account_id = $2 AND month = $3`,
       [staffId, accountId, month]
     );
     const attendanceRow = attendanceRows[0] ?? null;
@@ -1235,8 +1143,7 @@ const upsertStaffPayment = async (req, res) => {
         ? Number(attendanceRow.calculated_salary)
         : null;
 
-    const effectiveBase =
-      attendanceBase != null ? attendanceBase : monthlySalary;
+    const effectiveBase = attendanceBase != null ? attendanceBase : monthlySalary;
 
     const additionalAmount = toNullableAmount(body.additionalAmount);
     const additionalNote = toNullableNote(body.additionalNote);
@@ -1246,12 +1153,7 @@ const upsertStaffPayment = async (req, res) => {
     const additionalNumber = additionalAmount ?? 0;
     const deductionNumber = deductionAmount ?? 0;
 
-    const netAmount = Math.max(
-      0,
-      effectiveBase + additionalNumber - deductionNumber,
-    );
-
-    const dueAmount = netAmount;
+    const netAmount = Math.max(0, effectiveBase + additionalNumber - deductionNumber);
 
     await client.query("BEGIN");
 
@@ -1271,32 +1173,15 @@ const upsertStaffPayment = async (req, res) => {
          net_amount        = EXCLUDED.net_amount,
          updated_at        = NOW()
        RETURNING *`,
-      [
-        staffId,
-        month,
-        status,
-        paidDate,
-        additionalAmount,
-        additionalNote,
-        deductionAmount,
-        deductionNote,
-        netAmount,
-      ]
+      [staffId, month, status, paidDate, additionalAmount, additionalNote, deductionAmount, deductionNote, netAmount]
     );
 
     await client.query("COMMIT");
 
     return res.json({
       ...rows[0],
-      due_amount: dueAmount,
+      due_amount: netAmount,
       due_month: month,
-      _debug: {
-        monthlySalary,
-        attendanceBase,
-        effectiveBase,
-        additionalAmount,
-        deductionAmount,
-      },
     });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -1317,7 +1202,6 @@ const listExpenses = async (req, res) => {
     const { accountId } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
@@ -1344,7 +1228,6 @@ const getExpense = async (req, res) => {
     const { accountId, id } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
 
@@ -1372,16 +1255,13 @@ const createExpense = async (req, res) => {
     const { accountId } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can add expenses");
     }
 
     const {
-      category,
-      title,
-      amount,
+      category, title, amount,
       transaction_type = "expense",
       status = "paid",
       reminder_enabled = false,
@@ -1397,7 +1277,6 @@ const createExpense = async (req, res) => {
     if (!["expense", "income"].includes(transaction_type)) {
       return fail(res, 400, "invalid_type", "Invalid transaction type");
     }
-
     if (!["paid", "due"].includes(status)) {
       return fail(res, 400, "invalid_status", "Invalid status");
     }
@@ -1407,22 +1286,14 @@ const createExpense = async (req, res) => {
     const { rows } = await client.query(
       `INSERT INTO expenses
          (account_id, category, title, amount, transaction_type, status,
-          reminder_enabled, expense_date, description,
-          bill_attachments, created_by)
+          reminder_enabled, expense_date, description, bill_attachments, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8, CURRENT_DATE),$9,$10,$11)
        RETURNING *`,
       [
-        accountId,
-        category,
-        title.trim(),
-        amount,
-        transaction_type,
-        status,
-        reminder_enabled,
-        expense_date || null,
-        description,
-        JSON.stringify(bill_attachments),
-        userId,
+        accountId, category, title.trim(), amount,
+        transaction_type, status, reminder_enabled,
+        expense_date || null, description,
+        JSON.stringify(bill_attachments), userId,
       ]
     );
 
@@ -1444,22 +1315,14 @@ const updateExpense = async (req, res) => {
     const { accountId, id } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can update expenses");
     }
 
     const allowedFields = [
-      "category",
-      "title",
-      "amount",
-      "transaction_type",
-      "status",
-      "reminder_enabled",
-      "expense_date",
-      "description",
-      "bill_attachments",
+      "category","title","amount","transaction_type","status",
+      "reminder_enabled","expense_date","description","bill_attachments",
     ];
 
     const updates = {};
@@ -1513,7 +1376,6 @@ const deleteExpense = async (req, res) => {
     const { accountId, id } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
-
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can delete expenses");

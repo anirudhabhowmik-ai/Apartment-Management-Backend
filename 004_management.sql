@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS members (
     parking_available BOOLEAN NOT NULL DEFAULT FALSE,
     maintenance_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
 
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'inactive')),
+
     created_by UUID NOT NULL
         REFERENCES users(id)
         ON DELETE RESTRICT,
@@ -55,6 +58,9 @@ CREATE INDEX IF NOT EXISTS idx_members_flat_number
 
 CREATE INDEX IF NOT EXISTS idx_members_phone
     ON members(phone);
+
+CREATE INDEX IF NOT EXISTS idx_members_account_status
+    ON members(account_id, status);
 
 
 -- -----------------------------------------------------------------------------
@@ -76,6 +82,9 @@ CREATE TABLE IF NOT EXISTS staff (
 
     monthly_salary NUMERIC(12,2) NOT NULL DEFAULT 0,
 
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'inactive')),
+
     created_by UUID NOT NULL
         REFERENCES users(id)
         ON DELETE RESTRICT,
@@ -89,6 +98,9 @@ CREATE INDEX IF NOT EXISTS idx_staff_account_id
 
 CREATE INDEX IF NOT EXISTS idx_staff_phone
     ON staff(phone);
+
+CREATE INDEX IF NOT EXISTS idx_staff_account_status
+    ON staff(account_id, status);
 
 
 -- -----------------------------------------------------------------------------
@@ -143,13 +155,6 @@ CREATE INDEX IF NOT EXISTS idx_expenses_expense_date
 
 -- -----------------------------------------------------------------------------
 -- 4. MEMBER MONTHLY PAYMENTS
---
--- The base maintenance amount is NOT stored here. It is always read from
--- members.maintenance_amount, which is the single source of truth.
---
--- additional_amount and deduction_amount are NULLABLE with NO DEFAULT so
--- that an empty field on the client is stored as NULL (not 0). The UI
--- checks for NULL and shows the placeholder.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS member_monthly_payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -189,11 +194,6 @@ CREATE INDEX IF NOT EXISTS idx_member_monthly_payments_month
 
 -- -----------------------------------------------------------------------------
 -- 5. STAFF ATTENDANCE
--- One row per staff per month.
---   statuses          — { "YYYY-MM-DD": "present"|"absent"|"holiday"|"weekend" }
---   paid_days         — count of days that are not "absent"
---   calculated_salary — round(staff.monthly_salary / daysInMonth * paid_days)
---                       (base salary is read from staff.monthly_salary)
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS staff_attendance (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -239,14 +239,6 @@ CREATE INDEX IF NOT EXISTS idx_staff_attendance_month
 
 -- -----------------------------------------------------------------------------
 -- 6. STAFF MONTHLY PAYMENTS
---
--- The base salary is NOT stored here. It is always read from
--- staff.monthly_salary (or staff_attendance.calculated_salary when
--- attendance exists for the month), which is the single source of truth.
---
--- additional_amount and deduction_amount are NULLABLE with NO DEFAULT so
--- that an empty field on the client is stored as NULL (not 0). The UI
--- checks for NULL and shows the placeholder.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS staff_monthly_payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -286,8 +278,6 @@ CREATE INDEX IF NOT EXISTS idx_staff_monthly_payments_month
 
 -- -----------------------------------------------------------------------------
 -- 7. MEMBER PHONE VISIBILITY
--- Per-member allow-list: which users can see this member's phone.
--- Owner and admin bypass this list (enforced in the controller).
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS member_phone_visibility (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

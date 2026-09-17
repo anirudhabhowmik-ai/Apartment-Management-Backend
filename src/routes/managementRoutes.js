@@ -5,7 +5,6 @@ const router = express.Router();
 const authenticate = require("../middleware/authMiddleware");
 const c = require("../controllers/managementController");
 
-// Every route in this file requires a valid JWT.
 router.use(authenticate);
 
 // ---------------- Members ----------------
@@ -16,10 +15,7 @@ router.patch("/:accountId/members/:id", c.updateMember);
 router.delete("/:accountId/members/:id", c.deleteMember);
 
 // ---------------- Member Payments ----------------
-router.put(
-  "/:accountId/members/:id/payments/:month",
-  c.upsertMemberPayment
-);
+router.put("/:accountId/members/:id/payments/:month", c.upsertMemberPayment);
 
 // ---------------- Staff ----------------
 router.get("/:accountId/staff", c.listStaff);
@@ -29,20 +25,11 @@ router.patch("/:accountId/staff/:id", c.updateStaff);
 router.delete("/:accountId/staff/:id", c.deleteStaff);
 
 // ---------------- Staff Attendance ----------------
-router.get(
-  "/:accountId/staff/:id/attendance/:month",
-  c.getStaffAttendance
-);
-router.put(
-  "/:accountId/staff/:id/attendance/:month",
-  c.upsertStaffAttendance
-);
+router.get("/:accountId/staff/:id/attendance/:month", c.getStaffAttendance);
+router.put("/:accountId/staff/:id/attendance/:month", c.upsertStaffAttendance);
 
 // ---------------- Staff Payments ----------------
-router.put(
-  "/:accountId/staff/:id/payments/:month",
-  c.upsertStaffPayment
-);
+router.put("/:accountId/staff/:id/payments/:month", c.upsertStaffPayment);
 
 // ---------------- Expenses ----------------
 router.get("/:accountId/expenses", c.listExpenses);
