@@ -14,6 +14,7 @@ const accountRoutes = require("./routes/accountRoutes");
 const managementRoutes = require("./routes/managementRoutes");
 const openingBalanceRoutes = require("./routes/openingBalanceRoutes");
 const calendarRoutes = require("./routes/calendarRoutes");
+const manageAccountProfileRoutes = require("./routes/manageAccountProfileRoutes");
 
 const app = express();
 
@@ -88,6 +89,7 @@ app.use("/api/accounts", accountRoutes);
 app.use("/api/management", managementRoutes);
 app.use("/api/opening-balance", openingBalanceRoutes);
 app.use("/api", calendarRoutes);
+app.use("/api", manageAccountProfileRoutes);
 
 // ============================================================
 // 404 HANDLER
