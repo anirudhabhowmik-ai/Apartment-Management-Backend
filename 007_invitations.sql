@@ -14,7 +14,6 @@ CREATE TABLE IF NOT EXISTS invitations (
   target_member_id  UUID REFERENCES members(id) ON DELETE SET NULL,
   target_staff_id   UUID REFERENCES staff(id)   ON DELETE SET NULL,
   accepted_by       UUID REFERENCES users(id),
-  message           TEXT,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   responded_at      TIMESTAMPTZ,
   dismissed_at      TIMESTAMPTZ

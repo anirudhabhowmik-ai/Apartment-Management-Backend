@@ -15,8 +15,8 @@ const normalizePhone = (raw) => {
   return ten.length === 10 ? ten : null;
 };
 
-const fail = (res, status, code, message) =>
-  res.status(status).json({ code, message });
+const fail = (res, status, code) =>
+  res.status(status).json({ code });
 
 async function getRoleForAccount(userId, accountId) {
   const { rows: ownerRows } = await pool.query(
@@ -57,19 +57,19 @@ const preflight = async (req, res) => {
     const { accountId } = req.params;
     const { phone: rawPhone, role } = req.query;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId) return fail(res, 401, "unauthenticated");
 
     const requesterRole = await getRoleForAccount(userId, accountId);
     if (!isOwnerOrAdmin(requesterRole)) {
-      return fail(res, 403, "forbidden", "Only owner or admin can invite");
+      return fail(res, 403, "forbidden");
     }
 
     if (!["admin", "member_visibility", "staff_visibility"].includes(role)) {
-      return fail(res, 400, "invalid_input", "Invalid role");
+      return fail(res, 400, "invalid_input");
     }
 
     const phone = normalizePhone(rawPhone);
-    if (!phone) return fail(res, 400, "invalid_input", "Invalid phone");
+    if (!phone) return fail(res, 400, "invalid_input");
 
     // 1. Is it the owner's own number?
     const { rows: ownerRows } = await pool.query(
@@ -83,10 +83,7 @@ const preflight = async (req, res) => {
       ownerRows.length &&
       normalizePhone(ownerRows[0].phone) === phone
     ) {
-      return res.json({
-        kind: "self",
-        message: "This number belongs to the owner who already has access.",
-      });
+      return res.json({ kind: "self" });
     }
 
     // 2. Does the phone already have the requested role (or a superseding one)?
@@ -113,22 +110,13 @@ const preflight = async (req, res) => {
       if (existing.length) {
         const r = existing[0].role;
         if (r === "admin") {
-          return res.json({
-            kind: "already_admin",
-            message: "This person already has admin access.",
-          });
+          return res.json({ kind: "already_admin" });
         }
         if (r === "member_visibility" && role === "member_visibility") {
-          return res.json({
-            kind: "already_member",
-            message: "This person is already a member with visibility access.",
-          });
+          return res.json({ kind: "already_member" });
         }
         if (r === "staff_visibility") {
-          return res.json({
-            kind: "already_staff",
-            message: "This person already has staff visibility access.",
-          });
+          return res.json({ kind: "already_staff" });
         }
       }
     }
@@ -144,10 +132,7 @@ const preflight = async (req, res) => {
       [accountId, phone, role]
     );
     if (pendingRows.length) {
-      return res.json({
-        kind: "pending",
-        message: "An invitation is already pending for this number.",
-      });
+      return res.json({ kind: "pending" });
     }
 
     // 4. Is this a staff member being invited as member_visibility?
@@ -160,10 +145,7 @@ const preflight = async (req, res) => {
         [accountId, phone]
       );
       if (staffRows.length) {
-        return res.json({
-          kind: "staff_number",
-          message: "This number belongs to staff and staff cannot access property.",
-        });
+        return res.json({ kind: "staff_number" });
       }
     }
 
@@ -181,7 +163,6 @@ const preflight = async (req, res) => {
           kind: "member_to_admin",
           memberId: memberRows[0].id,
           memberName: memberRows[0].name,
-          message: `${memberRows[0].name} is a member. They can also be an admin.`,
         });
       }
     }
@@ -189,7 +170,7 @@ const preflight = async (req, res) => {
     return res.json({ kind: "ok" });
   } catch (err) {
     console.error("invitation preflight error:", err);
-    return fail(res, 500, "server_error", "Preflight failed");
+    return fail(res, 500, "server_error");
   }
 };
 
@@ -205,19 +186,19 @@ const createInvitation = async (req, res) => {
     const { phone: rawPhone, name, role, targetMemberId, targetStaffId } =
       req.body || {};
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId) return fail(res, 401, "unauthenticated");
 
     const requesterRole = await getRoleForAccount(userId, accountId);
     if (!isOwnerOrAdmin(requesterRole)) {
-      return fail(res, 403, "forbidden", "Only owner or admin can invite");
+      return fail(res, 403, "forbidden");
     }
 
     if (!["admin", "member_visibility", "staff_visibility"].includes(role)) {
-      return fail(res, 400, "invalid_input", "Invalid role");
+      return fail(res, 400, "invalid_input");
     }
 
     const phone = normalizePhone(rawPhone);
-    if (!phone) return fail(res, 400, "invalid_input", "Enter a valid 10-digit phone");
+    if (!phone) return fail(res, 400, "invalid_input");
 
     // Prevent owner inviting themselves
     const { rows: ownerRows } = await pool.query(
@@ -225,7 +206,7 @@ const createInvitation = async (req, res) => {
       [accountId]
     );
     if (ownerRows.length && normalizePhone(ownerRows[0].phone) === phone) {
-      return fail(res, 400, "invalid_input", "That's the owner's own number");
+      return fail(res, 400, "invalid_input");
     }
 
     try {
@@ -248,13 +229,13 @@ const createInvitation = async (req, res) => {
       return res.status(201).json(rows[0]);
     } catch (e) {
       if (e.code === "23505") {
-        return fail(res, 409, "conflict", "An invitation is already pending for this number and role");
+        return fail(res, 409, "conflict");
       }
       throw e;
     }
   } catch (err) {
     console.error("createInvitation error:", err);
-    return fail(res, 500, "server_error", "Failed to create invitation");
+    return fail(res, 500, "server_error");
   }
 };
 
@@ -269,7 +250,7 @@ const listInvitations = async (req, res) => {
     const { status } = req.query; // optional filter
 
     const requesterRole = await getRoleForAccount(userId, accountId);
-    if (!requesterRole) return fail(res, 403, "forbidden", "No access");
+    if (!requesterRole) return fail(res, 403, "forbidden");
 
     const params = [accountId];
     let where = `WHERE i.account_id = $1`;
@@ -299,7 +280,7 @@ const listInvitations = async (req, res) => {
     return res.json({ invitations: rows });
   } catch (err) {
     console.error("listInvitations error:", err);
-    return fail(res, 500, "server_error", "Failed to load invitations");
+    return fail(res, 500, "server_error");
   }
 };
 
@@ -314,19 +295,19 @@ const deleteInvitation = async (req, res) => {
 
     const requesterRole = await getRoleForAccount(userId, accountId);
     if (!isOwnerOrAdmin(requesterRole)) {
-      return fail(res, 403, "forbidden", "Only owner or admin can delete");
+      return fail(res, 403, "forbidden");
     }
 
     const { rowCount } = await pool.query(
       `DELETE FROM invitations WHERE id = $1 AND account_id = $2`,
       [id, accountId]
     );
-    if (!rowCount) return fail(res, 404, "not_found", "Invitation not found");
+    if (!rowCount) return fail(res, 404, "not_found");
 
     return res.json({ success: true });
   } catch (err) {
     console.error("deleteInvitation error:", err);
-    return fail(res, 500, "server_error", "Failed to delete invitation");
+    return fail(res, 500, "server_error");
   }
 };
 
@@ -342,7 +323,7 @@ const dismissInvitation = async (req, res) => {
     const { accountId, id } = req.params;
 
     const requesterRole = await getRoleForAccount(userId, accountId);
-    if (!requesterRole) return fail(res, 403, "forbidden", "No access");
+    if (!requesterRole) return fail(res, 403, "forbidden");
 
     const { rowCount } = await pool.query(
       `UPDATE invitations
@@ -350,12 +331,12 @@ const dismissInvitation = async (req, res) => {
         WHERE id = $1 AND account_id = $2`,
       [id, accountId]
     );
-    if (!rowCount) return fail(res, 404, "not_found", "Invitation not found");
+    if (!rowCount) return fail(res, 404, "not_found");
 
     return res.json({ success: true });
   } catch (err) {
     console.error("dismissInvitation error:", err);
-    return fail(res, 500, "server_error", "Failed to dismiss");
+    return fail(res, 500, "server_error");
   }
 };
 
@@ -368,13 +349,13 @@ const dismissInvitation = async (req, res) => {
 const listMyInvitations = async (req, res) => {
   try {
     const userId = getUserId(req);
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId) return fail(res, 401, "unauthenticated");
 
     const { rows: userRows } = await pool.query(
       `SELECT phone FROM users WHERE id = $1`,
       [userId]
     );
-    if (!userRows.length) return fail(res, 404, "not_found", "User not found");
+    if (!userRows.length) return fail(res, 404, "not_found");
 
     const phone = normalizePhone(userRows[0].phone);
 
@@ -397,7 +378,7 @@ const listMyInvitations = async (req, res) => {
     return res.json({ invitations: rows });
   } catch (err) {
     console.error("listMyInvitations error:", err);
-    return fail(res, 500, "server_error", "Failed to load invitations");
+    return fail(res, 500, "server_error");
   }
 };
 
@@ -411,27 +392,27 @@ const acceptInvitation = async (req, res) => {
     const userId = getUserId(req);
     const { id } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId) return fail(res, 401, "unauthenticated");
 
     const { rows: userRows } = await client.query(
       `SELECT id, phone FROM users WHERE id = $1`,
       [userId]
     );
-    if (!userRows.length) return fail(res, 404, "not_found", "User not found");
+    if (!userRows.length) return fail(res, 404, "not_found");
     const myPhone = normalizePhone(userRows[0].phone);
 
     const { rows: invRows } = await client.query(
       `SELECT * FROM invitations WHERE id = $1 FOR UPDATE`,
       [id]
     );
-    if (!invRows.length) return fail(res, 404, "not_found", "Invitation not found");
+    if (!invRows.length) return fail(res, 404, "not_found");
 
     const inv = invRows[0];
     if (inv.status !== "pending") {
-      return fail(res, 409, "conflict", "Invitation is no longer pending");
+      return fail(res, 409, "conflict");
     }
     if (inv.invited_phone !== myPhone) {
-      return fail(res, 403, "forbidden", "This invitation is not for you");
+      return fail(res, 403, "forbidden");
     }
 
     await client.query("BEGIN");
@@ -464,7 +445,7 @@ const acceptInvitation = async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("acceptInvitation error:", err);
-    return fail(res, 500, "server_error", "Failed to accept invitation");
+    return fail(res, 500, "server_error");
   } finally {
     client.release();
   }
@@ -483,21 +464,21 @@ const rejectInvitation = async (req, res) => {
       `SELECT phone FROM users WHERE id = $1`,
       [userId]
     );
-    if (!userRows.length) return fail(res, 404, "not_found", "User not found");
+    if (!userRows.length) return fail(res, 404, "not_found");
     const myPhone = normalizePhone(userRows[0].phone);
 
     const { rows } = await pool.query(
       `SELECT * FROM invitations WHERE id = $1`,
       [id]
     );
-    if (!rows.length) return fail(res, 404, "not_found", "Invitation not found");
+    if (!rows.length) return fail(res, 404, "not_found");
 
     const inv = rows[0];
     if (inv.invited_phone !== myPhone) {
-      return fail(res, 403, "forbidden", "This invitation is not for you");
+      return fail(res, 403, "forbidden");
     }
     if (inv.status !== "pending") {
-      return fail(res, 409, "conflict", "Invitation is no longer pending");
+      return fail(res, 409, "conflict");
     }
 
     await pool.query(
@@ -510,7 +491,7 @@ const rejectInvitation = async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error("rejectInvitation error:", err);
-    return fail(res, 500, "server_error", "Failed to reject invitation");
+    return fail(res, 500, "server_error");
   }
 };
 
@@ -525,7 +506,7 @@ const revokeAccess = async (req, res) => {
 
     const requesterRole = await getRoleForAccount(requesterId, accountId);
     if (!isOwnerOrAdmin(requesterRole)) {
-      return fail(res, 403, "forbidden", "Only owner or admin can revoke");
+      return fail(res, 403, "forbidden");
     }
 
     // Can't revoke owner
@@ -534,7 +515,7 @@ const revokeAccess = async (req, res) => {
       [accountId]
     );
     if (ownerRows.length && ownerRows[0].created_by === targetUserId) {
-      return fail(res, 400, "invalid_input", "Cannot revoke the owner");
+      return fail(res, 400, "invalid_input");
     }
 
     const { rowCount } = await pool.query(
@@ -543,7 +524,7 @@ const revokeAccess = async (req, res) => {
         WHERE account_id = $1 AND user_id = $2`,
       [accountId, targetUserId]
     );
-    if (!rowCount) return fail(res, 404, "not_found", "Access record not found");
+    if (!rowCount) return fail(res, 404, "not_found");
 
     // Mark the corresponding invitation as revoked
     await pool.query(
@@ -558,7 +539,7 @@ const revokeAccess = async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error("revokeAccess error:", err);
-    return fail(res, 500, "server_error", "Failed to revoke access");
+    return fail(res, 500, "server_error");
   }
 };
 
