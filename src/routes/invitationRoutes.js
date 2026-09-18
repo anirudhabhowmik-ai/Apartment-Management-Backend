@@ -5,6 +5,7 @@ const router = express.Router();
 const requireAuth = require("../middleware/authMiddleware");
 const invitationController = require("../controllers/invitationController");
 
+// Every route in this file requires a valid JWT.
 router.use(requireAuth);
 
 // ── Account-scoped (owner/admin) ─────────────────────────────
@@ -34,17 +35,8 @@ router.delete(
 );
 
 // ── Recipient-scoped (any logged-in user) ────────────────────
-router.get(
-  "/me/invitations",
-  invitationController.listMyInvitations
-);
-router.post(
-  "/invitations/:id/accept",
-  invitationController.acceptInvitation
-);
-router.post(
-  "/invitations/:id/reject",
-  invitationController.rejectInvitation
-);
+router.get("/me/invitations", invitationController.listMyInvitations);
+router.post("/invitations/:id/accept", invitationController.acceptInvitation);
+router.post("/invitations/:id/reject", invitationController.rejectInvitation);
 
 module.exports = router;
