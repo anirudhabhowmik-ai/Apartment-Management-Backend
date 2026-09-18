@@ -5,10 +5,9 @@ const router = express.Router();
 const requireAuth = require("../middleware/authMiddleware");
 const invitationController = require("../controllers/invitationController");
 
-// Every route in this file requires a valid JWT.
 router.use(requireAuth);
 
-// ── Account-scoped (owner/admin) ─────────────────────────────
+// ── Account-scoped (owner/admin unless noted) ────────────────
 router.get(
   "/accounts/:accountId/invitations/preflight",
   invitationController.preflight
@@ -29,9 +28,15 @@ router.post(
   "/accounts/:accountId/invitations/:id/dismiss",
   invitationController.dismissInvitation
 );
+
+// Owner-only inside the controller
 router.delete(
   "/accounts/:accountId/access/:userId",
   invitationController.revokeAccess
+);
+router.get(
+  "/accounts/:accountId/invitations/:invitationId/admin-linked",
+  invitationController.getAdminLinkedProfiles
 );
 
 // ── Recipient-scoped (any logged-in user) ────────────────────

@@ -2,7 +2,19 @@
 const { pool } = require("../config/database");
 
 // ---------------------------------------------------------------------------
+// Helper — resolve the caller's user id from the request.
+// ---------------------------------------------------------------------------
+const getUserId = (req) =>
+  req.user?.userId ?? req.user?.id ?? req.userId ?? null;
+
+const fail = (res, status, code) => res.status(status).json({ code });
+
+// ---------------------------------------------------------------------------
 // POST /accounts
+//
+// Creates an account and inserts the owner into account_members with the
+// role `admin`. Ownership itself is derived from accounts.created_by, never
+// stored on account_members.
 // ---------------------------------------------------------------------------
 const createAccount = async (req, res) => {
   const client = await pool.connect();
@@ -11,27 +23,14 @@ const createAccount = async (req, res) => {
     const { name, type } = req.body;
     const photo_url = req.body.photo_url ?? req.body.photoUrl ?? null;
 
-    if (!name || !type) {
-      return res.status(400).json({
-        code: "invalid_input",
-        message: "Account name and type are required",
-      });
-    }
+    if (!name || !type) return fail(res, 400, "invalid_input");
 
     if (!["apartment", "home"].includes(type)) {
-      return res.status(400).json({
-        code: "invalid_type",
-        message: "Invalid account type",
-      });
+      return fail(res, 400, "invalid_type");
     }
 
-    const userId = req.user?.userId ?? req.user?.id ?? req.userId;
-    if (!userId) {
-      return res.status(401).json({
-        code: "unauthenticated",
-        message: "Authentication required",
-      });
-    }
+    const userId = getUserId(req);
+    if (!userId) return fail(res, 401, "unauthenticated");
 
     await client.query("BEGIN");
 
@@ -46,15 +45,16 @@ const createAccount = async (req, res) => {
 
     const account = accountResult.rows[0];
 
+    // Owner is an admin on their own account. `owner` is never stored as a
+    // role value — it's derived from accounts.created_by at read time.
     await client.query(
       `
       INSERT INTO account_members (account_id, user_id, role, status)
-      VALUES ($1, $2, 'owner', 'active')
+      VALUES ($1, $2, 'admin', 'active')
       `,
       [account.id, userId],
     );
 
-    // Remember this as the user's last-selected account.
     await client.query(
       `UPDATE users SET last_account_id = $1, updated_at = NOW() WHERE id = $2`,
       [account.id, userId],
@@ -62,22 +62,18 @@ const createAccount = async (req, res) => {
 
     await client.query("COMMIT");
 
-    return res.status(201).json(account);
+    // Return the account with the derived owner role so the frontend
+    // renders the Owner badge immediately.
+    return res.status(201).json({ ...account, role: "owner" });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error("Create account error:", error);
 
     if (error.code === "23505") {
-      return res.status(409).json({
-        code: "duplicate",
-        message: "You already have an account with this name",
-      });
+      return fail(res, 409, "duplicate");
     }
 
-    return res.status(500).json({
-      code: "server_error",
-      message: "Failed to create account",
-    });
+    return fail(res, 500, "server_error");
   } finally {
     client.release();
   }
@@ -89,13 +85,8 @@ const createAccount = async (req, res) => {
 // ---------------------------------------------------------------------------
 const listAccounts = async (req, res) => {
   try {
-    const userId = req.user?.userId ?? req.user?.id ?? req.userId;
-    if (!userId) {
-      return res.status(401).json({
-        code: "unauthenticated",
-        message: "Authentication required",
-      });
-    }
+    const userId = getUserId(req);
+    if (!userId) return fail(res, 401, "unauthenticated");
 
     const result = await pool.query(
       `
@@ -128,58 +119,38 @@ const listAccounts = async (req, res) => {
     });
   } catch (error) {
     console.error("List accounts error:", error);
-    return res.status(500).json({
-      code: "server_error",
-      message: "Failed to load accounts",
-    });
+    return fail(res, 500, "server_error");
   }
 };
 
 // ---------------------------------------------------------------------------
 // PATCH /accounts/:id
-// Body: { name?: string, photo_url?: string | null }
-// Only owner/admin on that account can edit.
+// Body: { name?, photo_url? }
+// Owner or admin only.
 // ---------------------------------------------------------------------------
 const updateAccount = async (req, res) => {
   try {
-    const userId = req.user?.userId ?? req.user?.id ?? req.userId;
+    const userId = getUserId(req);
     const { id } = req.params;
 
-    if (!userId) {
-      return res.status(401).json({
-        code: "unauthenticated",
-        message: "Authentication required",
-      });
-    }
+    if (!userId) return fail(res, 401, "unauthenticated");
 
-    // Verify the caller has permission (owner/admin on the account).
     const { rows: permRows } = await pool.query(
       `SELECT am.role, a.created_by
          FROM account_members am
          JOIN accounts a ON a.id = am.account_id
-        WHERE am.account_id = $1 AND am.user_id = $2 AND am.status = 'active'
+        WHERE am.account_id = $1
+          AND am.user_id = $2
+          AND am.status = 'active'
         LIMIT 1`,
       [id, userId],
     );
 
-    if (!permRows.length) {
-      return res.status(403).json({
-        code: "forbidden",
-        message: "You do not have access to this account",
-      });
-    }
+    if (!permRows.length) return fail(res, 403, "forbidden");
 
-    const isOwnerOrAdmin =
-      permRows[0].created_by === userId ||
-      permRows[0].role === "owner" ||
-      permRows[0].role === "admin";
-
-    if (!isOwnerOrAdmin) {
-      return res.status(403).json({
-        code: "forbidden",
-        message: "Only owners and admins can edit the account",
-      });
-    }
+    const isOwner = permRows[0].created_by === userId;
+    const isAdmin = permRows[0].role === "admin";
+    if (!isOwner && !isAdmin) return fail(res, 403, "forbidden");
 
     const allowed = ["name", "photo_url"];
     const updates = {};
@@ -190,10 +161,7 @@ const updateAccount = async (req, res) => {
     }
 
     if (Object.keys(updates).length === 0) {
-      return res.status(400).json({
-        code: "invalid_input",
-        message: "No permitted fields to update",
-      });
+      return fail(res, 400, "invalid_input");
     }
 
     const keys = Object.keys(updates);
@@ -208,44 +176,139 @@ const updateAccount = async (req, res) => {
       [...values, id],
     );
 
-    if (updated.rowCount === 0) {
-      return res.status(404).json({
-        code: "not_found",
-        message: "Account not found",
-      });
-    }
+    if (updated.rowCount === 0) return fail(res, 404, "not_found");
 
     return res.status(200).json(updated.rows[0]);
   } catch (error) {
     console.error("Update account error:", error);
-    return res.status(500).json({
-      code: "server_error",
-      message: "Failed to update account",
-    });
+    return fail(res, 500, "server_error");
+  }
+};
+
+// ---------------------------------------------------------------------------
+// DELETE /accounts/:id
+// Owner only. Cascades to account_members, invitations, members, staff.
+// ---------------------------------------------------------------------------
+const deleteAccount = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated");
+
+    const { rows } = await pool.query(
+      `SELECT created_by FROM accounts WHERE id = $1`,
+      [id],
+    );
+    if (!rows.length) return fail(res, 404, "not_found");
+    if (rows[0].created_by !== userId) {
+      return fail(res, 403, "owner_required");
+    }
+
+    await pool.query(`DELETE FROM accounts WHERE id = $1`, [id]);
+
+    // If the user's last_account_id pointed at the deleted account, clear it.
+    await pool.query(
+      `UPDATE users SET last_account_id = NULL
+        WHERE id = $1 AND last_account_id = $2`,
+      [userId, id],
+    );
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Delete account error:", error);
+    return fail(res, 500, "server_error");
+  }
+};
+
+// ---------------------------------------------------------------------------
+// POST /accounts/:id/transfer-ownership
+// Body: { newOwnerUserId: string }
+// Owner only. Atomically moves `created_by`, keeps the old owner as admin,
+// ensures the new owner has an admin row.
+// ---------------------------------------------------------------------------
+const transferOwnership = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { id } = req.params;
+    const { newOwnerUserId } = req.body || {};
+
+    if (!userId) return fail(res, 401, "unauthenticated");
+    if (!newOwnerUserId) return fail(res, 400, "invalid_input");
+
+    const { rows: accRows } = await pool.query(
+      `SELECT created_by FROM accounts WHERE id = $1`,
+      [id],
+    );
+    if (!accRows.length) return fail(res, 404, "not_found");
+    if (accRows[0].created_by !== userId) {
+      return fail(res, 403, "owner_required");
+    }
+    if (newOwnerUserId === userId) {
+      return fail(res, 400, "invalid_input");
+    }
+
+    // The new owner must already have some active row on this account.
+    const { rows: newOwnerRows } = await pool.query(
+      `SELECT 1 FROM account_members
+        WHERE account_id = $1 AND user_id = $2 AND status = 'active'
+        LIMIT 1`,
+      [id, newOwnerUserId],
+    );
+    if (!newOwnerRows.length) {
+      return fail(res, 400, "invalid_input");
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE accounts SET created_by = $1, updated_at = NOW() WHERE id = $2`,
+      [newOwnerUserId, id],
+    );
+
+    // Old owner keeps admin.
+    await client.query(
+      `INSERT INTO account_members (account_id, user_id, role, status)
+       VALUES ($1, $2, 'admin', 'active')
+       ON CONFLICT (account_id, user_id, role)
+       DO UPDATE SET status = 'active', updated_at = NOW()`,
+      [id, userId],
+    );
+
+    // New owner must have admin too.
+    await client.query(
+      `INSERT INTO account_members (account_id, user_id, role, status)
+       VALUES ($1, $2, 'admin', 'active')
+       ON CONFLICT (account_id, user_id, role)
+       DO UPDATE SET status = 'active', updated_at = NOW()`,
+      [id, newOwnerUserId],
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({ success: true, newOwnerUserId });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Transfer ownership error:", error);
+    return fail(res, 500, "server_error");
+  } finally {
+    client.release();
   }
 };
 
 // ---------------------------------------------------------------------------
 // PATCH /accounts/me/last-account
-// Body: { accountId: string | null }
 // ---------------------------------------------------------------------------
 const setLastAccount = async (req, res) => {
   try {
-    const userId = req.user?.userId ?? req.user?.id ?? req.userId;
+    const userId = getUserId(req);
     const { accountId } = req.body;
 
-    if (!userId) {
-      return res.status(401).json({
-        code: "unauthenticated",
-        message: "Authentication required",
-      });
-    }
+    if (!userId) return fail(res, 401, "unauthenticated");
 
     if (accountId !== null && typeof accountId !== "string") {
-      return res.status(400).json({
-        code: "invalid_input",
-        message: "accountId must be a string or null",
-      });
+      return fail(res, 400, "invalid_input");
     }
 
     if (accountId) {
@@ -264,12 +327,7 @@ const setLastAccount = async (req, res) => {
           [accountId, userId],
         );
 
-        if (!ownerRows.length) {
-          return res.status(403).json({
-            code: "forbidden",
-            message: "You do not have access to that account",
-          });
-        }
+        if (!ownerRows.length) return fail(res, 403, "forbidden");
       }
     }
 
@@ -284,10 +342,7 @@ const setLastAccount = async (req, res) => {
     });
   } catch (error) {
     console.error("setLastAccount error:", error);
-    return res.status(500).json({
-      code: "server_error",
-      message: "Failed to save last account",
-    });
+    return fail(res, 500, "server_error");
   }
 };
 
@@ -295,5 +350,7 @@ module.exports = {
   createAccount,
   listAccounts,
   updateAccount,
+  deleteAccount,
+  transferOwnership,
   setLastAccount,
 };

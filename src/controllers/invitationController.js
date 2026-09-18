@@ -15,40 +15,36 @@ const normalizePhone = (raw) => {
   return ten.length === 10 ? ten : null;
 };
 
-const fail = (res, status, code) =>
-  res.status(status).json({ code });
+const fail = (res, status, code) => res.status(status).json({ code });
 
-async function getRoleForAccount(userId, accountId) {
+const VALID_ROLES = ["admin", "member_visibility", "staff_visibility"];
+
+// Returns an array of roles the user has on the account.
+// "owner" is a special sentinel for the account creator.
+async function getRolesForAccount(userId, accountId) {
   const { rows: ownerRows } = await pool.query(
     `SELECT 1 FROM accounts WHERE id = $1 AND created_by = $2`,
     [accountId, userId]
   );
-  if (ownerRows.length) return "owner";
+  if (ownerRows.length) return ["owner"];
 
   const { rows } = await pool.query(
     `SELECT role FROM account_members
        WHERE account_id = $1
          AND user_id = $2
-         AND status = 'active'
-       LIMIT 1`,
+         AND status = 'active'`,
     [accountId, userId]
   );
-  return rows.length ? rows[0].role : null;
+  return rows.map((r) => r.role);
 }
 
-const isOwnerOrAdmin = (role) => role === "owner" || role === "admin";
+const hasOwnerOrAdmin = (roles) =>
+  roles.includes("owner") || roles.includes("admin");
 
-// role → map of what to check for "already has this access"
-const ROLE_ALREADY = {
-  admin:              ["admin"],
-  member_visibility:  ["admin", "member_visibility"],
-  staff_visibility:   ["staff_visibility"],
-};
+const isOwner = (roles) => roles.includes("owner");
 
 // ===========================================================================
-// PREFLIGHT — GET /accounts/:accountId/invitations/preflight?phone=&role=
-//
-// Tells the frontend what will happen BEFORE the user taps "send invite".
+// PREFLIGHT
 // ===========================================================================
 
 const preflight = async (req, res) => {
@@ -59,19 +55,15 @@ const preflight = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated");
 
-    const requesterRole = await getRoleForAccount(userId, accountId);
-    if (!isOwnerOrAdmin(requesterRole)) {
-      return fail(res, 403, "forbidden");
-    }
+    const requesterRoles = await getRolesForAccount(userId, accountId);
+    if (!hasOwnerOrAdmin(requesterRoles)) return fail(res, 403, "forbidden");
 
-    if (!["admin", "member_visibility", "staff_visibility"].includes(role)) {
-      return fail(res, 400, "invalid_input");
-    }
+    if (!VALID_ROLES.includes(role)) return fail(res, 400, "invalid_input");
 
     const phone = normalizePhone(rawPhone);
     if (!phone) return fail(res, 400, "invalid_input");
 
-    // 1. Is it the owner's own number?
+    // 1. Owner's own number?
     const { rows: ownerRows } = await pool.query(
       `SELECT u.phone
          FROM accounts a
@@ -79,14 +71,11 @@ const preflight = async (req, res) => {
         WHERE a.id = $1`,
       [accountId]
     );
-    if (
-      ownerRows.length &&
-      normalizePhone(ownerRows[0].phone) === phone
-    ) {
+    if (ownerRows.length && normalizePhone(ownerRows[0].phone) === phone) {
       return res.json({ kind: "self" });
     }
 
-    // 2. Does the phone already have the requested role (or a superseding one)?
+    // 2. Existing roles for this phone (from account_members)?
     const { rows: userRows } = await pool.query(
       `SELECT id FROM users
         WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
@@ -96,73 +85,68 @@ const preflight = async (req, res) => {
 
     if (userRows.length) {
       const targetUserId = userRows[0].id;
-      const checkRoles = ROLE_ALREADY[role];
-
       const { rows: existing } = await pool.query(
         `SELECT role FROM account_members
           WHERE account_id = $1
             AND user_id = $2
-            AND status = 'active'
-            AND role = ANY($3::text[])`,
-        [accountId, targetUserId, checkRoles]
+            AND status = 'active'`,
+        [accountId, targetUserId]
       );
+      const targetRoles = existing.map((r) => r.role);
 
-      if (existing.length) {
-        const r = existing[0].role;
-        if (r === "admin") {
-          return res.json({ kind: "already_admin" });
-        }
-        if (r === "member_visibility" && role === "member_visibility") {
-          return res.json({ kind: "already_member" });
-        }
-        if (r === "staff_visibility") {
-          return res.json({ kind: "already_staff" });
-        }
+      if (targetRoles.includes("admin")) {
+        return res.json({ kind: "already_admin" });
+      }
+
+      if (
+        role === "member_visibility" &&
+        targetRoles.includes("member_visibility")
+      ) {
+        return res.json({ kind: "already_member" });
+      }
+      if (
+        role === "staff_visibility" &&
+        targetRoles.includes("staff_visibility")
+      ) {
+        return res.json({ kind: "already_staff" });
       }
     }
 
-    // 3. Pending invite already?
+    // 3. Pending invite for this exact (phone, role)?
     const { rows: pendingRows } = await pool.query(
-      `SELECT id FROM invitations
+      `SELECT id, role FROM invitations
         WHERE account_id = $1
           AND invited_phone = $2
-          AND role = $3
-          AND status = 'pending'
-        LIMIT 1`,
-      [accountId, phone, role]
+          AND status = 'pending'`,
+      [accountId, phone]
     );
-    if (pendingRows.length) {
+    if (pendingRows.find((r) => r.role === role)) {
       return res.json({ kind: "pending" });
     }
 
-    // 4. Is this a staff member being invited as member_visibility?
-    if (role === "member_visibility") {
-      const { rows: staffRows } = await pool.query(
-        `SELECT id FROM staff
-          WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-          LIMIT 1`,
-        [accountId, phone]
-      );
-      if (staffRows.length) {
-        return res.json({ kind: "staff_number" });
-      }
-    }
-
-    // 5. Is this an existing member being invited as admin?
+    // 4. Requesting admin — does this phone have an ACCEPTED member or
+    // staff invitation on this account? If yes, granting admin is an
+    // "add alongside" and the UI confirms. If no, it's a fresh grant.
+    //
+    // Read from `invitations`, not from members/staff: being listed in the
+    // directory is not the same as having app access.
     if (role === "admin") {
-      const { rows: memberRows } = await pool.query(
-        `SELECT id, name FROM members
+      const { rows: acceptedLowerRoles } = await pool.query(
+        `SELECT role, invited_name
+           FROM invitations
           WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
+            AND invited_phone = $2
+            AND role IN ('member_visibility', 'staff_visibility')
+            AND status = 'accepted'
+          ORDER BY responded_at DESC NULLS LAST
           LIMIT 1`,
         [accountId, phone]
       );
-      if (memberRows.length) {
+
+      if (acceptedLowerRoles.length) {
         return res.json({
           kind: "member_to_admin",
-          memberId: memberRows[0].id,
-          memberName: memberRows[0].name,
+          memberName: acceptedLowerRoles[0].invited_name ?? null,
         });
       }
     }
@@ -175,11 +159,13 @@ const preflight = async (req, res) => {
 };
 
 // ===========================================================================
-// CREATE — POST /accounts/:accountId/invitations
-// Body: { phone, name?, role, targetMemberId?, targetStaffId? }
+// CREATE
+//
+// Owner-only for admin invitations. Admins can send member/staff.
 // ===========================================================================
 
 const createInvitation = async (req, res) => {
+  const client = await pool.connect();
   try {
     const userId = getUserId(req);
     const { accountId } = req.params;
@@ -188,19 +174,19 @@ const createInvitation = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated");
 
-    const requesterRole = await getRoleForAccount(userId, accountId);
-    if (!isOwnerOrAdmin(requesterRole)) {
-      return fail(res, 403, "forbidden");
-    }
+    const requesterRoles = await getRolesForAccount(userId, accountId);
+    if (!hasOwnerOrAdmin(requesterRoles)) return fail(res, 403, "forbidden");
 
-    if (!["admin", "member_visibility", "staff_visibility"].includes(role)) {
-      return fail(res, 400, "invalid_input");
+    if (!VALID_ROLES.includes(role)) return fail(res, 400, "invalid_input");
+
+    // Owner-only: only the account creator may grant admin.
+    if (role === "admin" && !isOwner(requesterRoles)) {
+      return fail(res, 403, "owner_required");
     }
 
     const phone = normalizePhone(rawPhone);
     if (!phone) return fail(res, 400, "invalid_input");
 
-    // Prevent owner inviting themselves
     const { rows: ownerRows } = await pool.query(
       `SELECT u.phone FROM accounts a JOIN users u ON u.id = a.created_by WHERE a.id = $1`,
       [accountId]
@@ -209,8 +195,24 @@ const createInvitation = async (req, res) => {
       return fail(res, 400, "invalid_input");
     }
 
+    await client.query("BEGIN");
+
+    if (role === "admin") {
+      // Admin supersedes pending member/staff invites — cancel them.
+      await client.query(
+        `UPDATE invitations
+            SET status = 'cancelled',
+                responded_at = COALESCE(responded_at, NOW())
+          WHERE account_id = $1
+            AND invited_phone = $2
+            AND role IN ('member_visibility', 'staff_visibility')
+            AND status = 'pending'`,
+        [accountId, phone]
+      );
+    }
+
     try {
-      const { rows } = await pool.query(
+      const { rows } = await client.query(
         `INSERT INTO invitations
            (account_id, invited_by, invited_phone, invited_name, role,
             target_member_id, target_staff_id)
@@ -226,31 +228,36 @@ const createInvitation = async (req, res) => {
           targetStaffId || null,
         ]
       );
+      await client.query("COMMIT");
       return res.status(201).json(rows[0]);
     } catch (e) {
-      if (e.code === "23505") {
-        return fail(res, 409, "conflict");
-      }
+      await client.query("ROLLBACK");
+      if (e.code === "23505") return fail(res, 409, "conflict");
       throw e;
     }
   } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
     console.error("createInvitation error:", err);
     return fail(res, 500, "server_error");
+  } finally {
+    client.release();
   }
 };
 
 // ===========================================================================
-// LIST — GET /accounts/:accountId/invitations
+// LIST
 // ===========================================================================
 
 const listInvitations = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId } = req.params;
-    const { status } = req.query; // optional filter
+    const { status } = req.query;
 
-    const requesterRole = await getRoleForAccount(userId, accountId);
-    if (!requesterRole) return fail(res, 403, "forbidden");
+    const requesterRoles = await getRolesForAccount(userId, accountId);
+    if (requesterRoles.length === 0) return fail(res, 403, "forbidden");
 
     const params = [accountId];
     let where = `WHERE i.account_id = $1`;
@@ -261,31 +268,46 @@ const listInvitations = async (req, res) => {
 
     const { rows } = await pool.query(
       `SELECT
-         i.id, i.account_id,
-         i.invited_phone, i.invited_name,
-         i.role, i.status,
-         i.target_member_id, i.target_staff_id,
-         i.created_at, i.responded_at, i.dismissed_at,
-         u.phone AS invited_by_phone,
-         a.name  AS account_name,
+         i.id,
+         i.account_id,
+         i.invited_phone,
+         i.invited_name,
+         i.role,
+         i.status,
+         i.target_member_id,
+         i.target_staff_id,
+         i.created_at,
+         i.responded_at,
+         i.dismissed_at,
+         i.accepted_by,
+         u.phone     AS invited_by_phone,
+         a.name      AS account_name,
          a.photo_url AS account_photo_url
        FROM invitations i
-       JOIN users u    ON u.id = i.invited_by
-       JOIN accounts a ON a.id = i.account_id
+       LEFT JOIN users    u ON u.id = i.invited_by
+       LEFT JOIN accounts a ON a.id = i.account_id
        ${where}
        ORDER BY i.created_at DESC`,
       params
     );
 
-    return res.json({ invitations: rows });
+    return res.json({
+      success: true,
+      count: rows.length,
+      invitations: rows,
+    });
   } catch (err) {
     console.error("listInvitations error:", err);
-    return fail(res, 500, "server_error");
+    return res.status(500).json({
+      success: false,
+      code: "server_error",
+      detail: err.message,
+    });
   }
 };
 
 // ===========================================================================
-// DELETE — DELETE /accounts/:accountId/invitations/:id
+// DELETE
 // ===========================================================================
 
 const deleteInvitation = async (req, res) => {
@@ -293,10 +315,8 @@ const deleteInvitation = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    const requesterRole = await getRoleForAccount(userId, accountId);
-    if (!isOwnerOrAdmin(requesterRole)) {
-      return fail(res, 403, "forbidden");
-    }
+    const requesterRoles = await getRolesForAccount(userId, accountId);
+    if (!hasOwnerOrAdmin(requesterRoles)) return fail(res, 403, "forbidden");
 
     const { rowCount } = await pool.query(
       `DELETE FROM invitations WHERE id = $1 AND account_id = $2`,
@@ -312,9 +332,7 @@ const deleteInvitation = async (req, res) => {
 };
 
 // ===========================================================================
-// DISMISS — POST /accounts/:accountId/invitations/:id/dismiss
-//
-// Soft "close icon" hide for accepted cards on owner profile.
+// DISMISS
 // ===========================================================================
 
 const dismissInvitation = async (req, res) => {
@@ -322,8 +340,8 @@ const dismissInvitation = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    const requesterRole = await getRoleForAccount(userId, accountId);
-    if (!requesterRole) return fail(res, 403, "forbidden");
+    const requesterRoles = await getRolesForAccount(userId, accountId);
+    if (requesterRoles.length === 0) return fail(res, 403, "forbidden");
 
     const { rowCount } = await pool.query(
       `UPDATE invitations
@@ -341,9 +359,7 @@ const dismissInvitation = async (req, res) => {
 };
 
 // ===========================================================================
-// MY INVITATIONS — GET /me/invitations
-//
-// For the member's home banner.
+// MY INVITATIONS
 // ===========================================================================
 
 const listMyInvitations = async (req, res) => {
@@ -383,7 +399,7 @@ const listMyInvitations = async (req, res) => {
 };
 
 // ===========================================================================
-// ACCEPT — POST /invitations/:id/accept
+// ACCEPT
 // ===========================================================================
 
 const acceptInvitation = async (req, res) => {
@@ -408,22 +424,16 @@ const acceptInvitation = async (req, res) => {
     if (!invRows.length) return fail(res, 404, "not_found");
 
     const inv = invRows[0];
-    if (inv.status !== "pending") {
-      return fail(res, 409, "conflict");
-    }
-    if (inv.invited_phone !== myPhone) {
-      return fail(res, 403, "forbidden");
-    }
+    if (inv.status !== "pending") return fail(res, 409, "conflict");
+    if (inv.invited_phone !== myPhone) return fail(res, 403, "forbidden");
 
     await client.query("BEGIN");
 
-    // Upsert account_members with the invitation's role.
-    // Single-role-per-account model: this replaces any existing role.
     await client.query(
       `INSERT INTO account_members (account_id, user_id, role, status)
        VALUES ($1, $2, $3, 'active')
-       ON CONFLICT (account_id, user_id)
-       DO UPDATE SET role = EXCLUDED.role, status = 'active', updated_at = NOW()`,
+       ON CONFLICT (account_id, user_id, role)
+       DO UPDATE SET status = 'active', updated_at = NOW()`,
       [inv.account_id, userId, inv.role]
     );
 
@@ -433,6 +443,20 @@ const acceptInvitation = async (req, res) => {
         WHERE id = $2`,
       [userId, id]
     );
+
+    if (inv.role === "admin") {
+      await client.query(
+        `UPDATE invitations
+            SET status = 'cancelled',
+                responded_at = COALESCE(responded_at, NOW())
+          WHERE account_id = $1
+            AND invited_phone = $2
+            AND role IN ('member_visibility', 'staff_visibility')
+            AND status = 'pending'
+            AND id <> $3`,
+        [inv.account_id, myPhone, id]
+      );
+    }
 
     await client.query("COMMIT");
 
@@ -452,7 +476,7 @@ const acceptInvitation = async (req, res) => {
 };
 
 // ===========================================================================
-// REJECT — POST /invitations/:id/reject
+// REJECT
 // ===========================================================================
 
 const rejectInvitation = async (req, res) => {
@@ -474,12 +498,8 @@ const rejectInvitation = async (req, res) => {
     if (!rows.length) return fail(res, 404, "not_found");
 
     const inv = rows[0];
-    if (inv.invited_phone !== myPhone) {
-      return fail(res, 403, "forbidden");
-    }
-    if (inv.status !== "pending") {
-      return fail(res, 409, "conflict");
-    }
+    if (inv.invited_phone !== myPhone) return fail(res, 403, "forbidden");
+    if (inv.status !== "pending") return fail(res, 409, "conflict");
 
     await pool.query(
       `UPDATE invitations
@@ -496,20 +516,98 @@ const rejectInvitation = async (req, res) => {
 };
 
 // ===========================================================================
-// REVOKE — DELETE /accounts/:accountId/access/:userId
+// ADMIN LINKED PROFILES
+// ===========================================================================
+
+const getAdminLinkedProfiles = async (req, res) => {
+  try {
+    const requesterId = getUserId(req);
+    const { accountId, invitationId } = req.params;
+
+    const requesterRoles = await getRolesForAccount(requesterId, accountId);
+    if (!hasOwnerOrAdmin(requesterRoles)) return fail(res, 403, "forbidden");
+
+    const { rows: invRows } = await pool.query(
+      `SELECT id, invited_phone, accepted_by, invited_name, role, status
+         FROM invitations
+        WHERE id = $1 AND account_id = $2`,
+      [invitationId, accountId]
+    );
+    if (!invRows.length) return fail(res, 404, "not_found");
+
+    const inv = invRows[0];
+    if (inv.role !== "admin") return fail(res, 400, "invalid_input");
+    if (inv.status !== "accepted") return fail(res, 409, "conflict");
+
+    const phone = normalizePhone(inv.invited_phone);
+
+    let memberId = null;
+    let memberName = null;
+    let staffId = null;
+    let staffName = null;
+
+    if (phone) {
+      const { rows: m } = await pool.query(
+        `SELECT id, name FROM members
+          WHERE account_id = $1
+            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
+          LIMIT 1`,
+        [accountId, phone]
+      );
+      if (m.length) {
+        memberId = m[0].id;
+        memberName = m[0].name;
+      }
+
+      const { rows: s } = await pool.query(
+        `SELECT id, name FROM staff
+          WHERE account_id = $1
+            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
+          LIMIT 1`,
+        [accountId, phone]
+      );
+      if (s.length) {
+        staffId = s[0].id;
+        staffName = s[0].name;
+      }
+    }
+
+    return res.json({
+      invitationId: inv.id,
+      userId: inv.accepted_by,
+      invitedName: inv.invited_name,
+      hasMember: !!memberId,
+      memberId,
+      memberName,
+      hasStaff: !!staffId,
+      staffId,
+      staffName,
+    });
+  } catch (err) {
+    console.error("getAdminLinkedProfiles error:", err);
+    return fail(res, 500, "server_error");
+  }
+};
+
+// ===========================================================================
+// REVOKE
+//
+// Owner-only. Revoking does not delete the account_members row; it sets
+// status='inactive' so the user's access history is preserved.
 // ===========================================================================
 
 const revokeAccess = async (req, res) => {
+  const client = await pool.connect();
   try {
     const requesterId = getUserId(req);
     const { accountId, userId: targetUserId } = req.params;
+    const { role: rawRole } = req.query;
 
-    const requesterRole = await getRoleForAccount(requesterId, accountId);
-    if (!isOwnerOrAdmin(requesterRole)) {
-      return fail(res, 403, "forbidden");
-    }
+    const requesterRoles = await getRolesForAccount(requesterId, accountId);
 
-    // Can't revoke owner
+    // Owner-only. No admin fallback.
+    if (!isOwner(requesterRoles)) return fail(res, 403, "owner_required");
+
     const { rows: ownerRows } = await pool.query(
       `SELECT created_by FROM accounts WHERE id = $1`,
       [accountId]
@@ -518,32 +616,54 @@ const revokeAccess = async (req, res) => {
       return fail(res, 400, "invalid_input");
     }
 
-    const { rowCount } = await pool.query(
+    const roleToRemove =
+      rawRole && VALID_ROLES.includes(rawRole) ? rawRole : "admin";
+
+    await client.query("BEGIN");
+
+    const { rowCount } = await client.query(
       `UPDATE account_members
           SET status = 'inactive', updated_at = NOW()
-        WHERE account_id = $1 AND user_id = $2`,
-      [accountId, targetUserId]
+        WHERE account_id = $1 AND user_id = $2 AND role = $3 AND status = 'active'`,
+      [accountId, targetUserId, roleToRemove]
     );
-    if (!rowCount) return fail(res, 404, "not_found");
 
-    // Mark the corresponding invitation as revoked
-    await pool.query(
+    if (!rowCount) {
+      await client.query("ROLLBACK");
+      return fail(res, 404, "not_found");
+    }
+
+    await client.query(
       `UPDATE invitations
           SET status = 'revoked', responded_at = NOW()
         WHERE account_id = $1
           AND accepted_by = $2
+          AND role = $3
           AND status = 'accepted'`,
+      [accountId, targetUserId, roleToRemove]
+    );
+
+    await client.query("COMMIT");
+
+    const { rows: remaining } = await pool.query(
+      `SELECT role FROM account_members
+        WHERE account_id = $1 AND user_id = $2 AND status = 'active'`,
       [accountId, targetUserId]
     );
 
-    return res.json({ success: true });
+    return res.json({
+      success: true,
+      removed: roleToRemove,
+      remainingRoles: remaining.map((r) => r.role),
+    });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("revokeAccess error:", err);
     return fail(res, 500, "server_error");
+  } finally {
+    client.release();
   }
 };
-
-// ===========================================================================
 
 module.exports = {
   preflight,
@@ -554,5 +674,6 @@ module.exports = {
   listMyInvitations,
   acceptInvitation,
   rejectInvitation,
+  getAdminLinkedProfiles,
   revokeAccess,
 };

@@ -24,6 +24,8 @@ const {
   createAccount,
   listAccounts,
   updateAccount,
+  deleteAccount,
+  transferOwnership,
   setLastAccount,
 } = require("../controllers/accountController");
 
@@ -35,5 +37,9 @@ router.patch("/me/last-account", authMiddleware, setLastAccount);
 
 // Edit account (name and/or photo)
 router.patch("/:id", authMiddleware, updateAccount);
+
+// Owner-only actions
+router.delete("/:id", authMiddleware, deleteAccount);
+router.post("/:id/transfer-ownership", authMiddleware, transferOwnership);
 
 module.exports = router;
