@@ -15,6 +15,13 @@ const getUserPhone = (req) => {
   return digits.length > 10 ? digits.slice(-10) : digits;
 };
 
+const normalizePhone = (raw) => {
+  if (!raw) return null;
+  const digits = String(raw).replace(/\D/g, "");
+  const ten = digits.length > 10 ? digits.slice(-10) : digits;
+  return ten.length === 10 ? ten : null;
+};
+
 const toNullableAmount = (v) => {
   if (v === null || v === undefined) return null;
   if (typeof v === "string" && v.trim() === "") return null;
@@ -51,6 +58,79 @@ async function getRoleForAccount(userId, accountId) {
 
 const fail = (res, status, code, message) =>
   res.status(status).json({ code, message });
+
+// ---------------------------------------------------------------------------
+// Access sync helpers
+//
+// These keep `account_members` in sync with the underlying members/staff
+// tables. Admin rows are never touched by these helpers — admin is
+// independent of member/staff identity.
+// ---------------------------------------------------------------------------
+
+// Find a user id by phone, or null if no user has that phone.
+async function findUserIdByPhone(client, phone) {
+  const ten = normalizePhone(phone);
+  if (!ten) return null;
+  const { rows } = await client.query(
+    `SELECT id FROM users
+       WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
+       LIMIT 1`,
+    [ten]
+  );
+  return rows.length ? rows[0].id : null;
+}
+
+// Insert or reactivate the account_members row for the given role.
+async function activateAccessRole(client, accountId, userId, role) {
+  if (!userId) return;
+  await client.query(
+    `INSERT INTO account_members (account_id, user_id, role, status)
+     VALUES ($1, $2, $3, 'active')
+     ON CONFLICT (account_id, user_id, role)
+     DO UPDATE SET status = 'active', updated_at = NOW()`,
+    [accountId, userId, role]
+  );
+}
+
+// Mark the account_members row inactive and revoke the matching accepted
+// invitation. Does nothing if the row does not exist.
+async function deactivateAccessRole(client, accountId, userId, role) {
+  if (!userId) return;
+  await client.query(
+    `UPDATE account_members
+        SET status = 'inactive', updated_at = NOW()
+      WHERE account_id = $1
+        AND user_id = $2
+        AND role = $3`,
+    [accountId, userId, role]
+  );
+  await client.query(
+    `UPDATE invitations
+        SET status = 'revoked', responded_at = NOW()
+      WHERE account_id = $1
+        AND accepted_by = $2
+        AND role = $3
+        AND status = 'accepted'`,
+    [accountId, userId, role]
+  );
+}
+
+// After a member row was created or reactivated, ensure the user's
+// member_visibility access is active.
+async function syncMemberAccessOnCreate(client, accountId, member) {
+  if (!member?.phone) return;
+  const userId = await findUserIdByPhone(client, member.phone);
+  if (!userId) return;
+  await activateAccessRole(client, accountId, userId, "member_visibility");
+}
+
+// After a staff row was created or reactivated.
+async function syncStaffAccessOnCreate(client, accountId, staff) {
+  if (!staff?.phone) return;
+  const userId = await findUserIdByPhone(client, staff.phone);
+  if (!userId) return;
+  await activateAccessRole(client, accountId, userId, "staff_visibility");
+}
 
 // ---------------------------------------------------------------------------
 // Due-amount computation
@@ -134,9 +214,6 @@ const listMembers = async (req, res) => {
 
     const month = normalizeMonth(req.query?.month);
 
-    // NOTE: no `status = 'active'` filter here. Inactive (soft-deleted)
-    // rows must reach the client so the Finance tab can badge them for
-    // their deletion month. The People tab filters them client-side.
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
               wing, flat_number, area_sqft, parking_available,
@@ -298,9 +375,15 @@ const createMember = async (req, res) => {
       ]
     );
 
+    const created = rows[0];
+
+    // If a user with that phone exists, make sure they have
+    // member_visibility access. If no user exists, they'll get access
+    // when they sign up and accept the invitation (normal flow).
+    await syncMemberAccessOnCreate(client, accountId, created);
+
     await client.query("COMMIT");
 
-    const created = rows[0];
     const month = normalizeMonth(req.query?.month);
 
     return res.status(201).json({
@@ -378,6 +461,12 @@ const updateMember = async (req, res) => {
       [...values, id, accountId]
     );
 
+    // If the phone changed, the linked user's member_visibility access
+    // may need to be re-synced. Reactivate for the new phone.
+    if (Object.prototype.hasOwnProperty.call(updates, "phone")) {
+      await syncMemberAccessOnCreate(client, accountId, updated.rows[0]);
+    }
+
     await client.query("COMMIT");
     return res.json(updated.rows[0]);
   } catch (err) {
@@ -390,7 +479,10 @@ const updateMember = async (req, res) => {
 };
 
 // ── SOFT DELETE ──
+// Marks the member row inactive and cascades to account_members
+// (member_visibility) and to invitations.
 const deleteMember = async (req, res) => {
+  const client = await pool.connect();
   try {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
@@ -401,23 +493,42 @@ const deleteMember = async (req, res) => {
       return fail(res, 403, "forbidden", "Only owners and admins can delete members");
     }
 
-    const result = await pool.query(
+    await client.query("BEGIN");
+
+    const updated = await client.query(
       `UPDATE members
           SET status = 'inactive', updated_at = NOW()
         WHERE id = $1
           AND account_id = $2
-          AND status = 'active'`,
+          AND status = 'active'
+        RETURNING phone`,
       [id, accountId]
     );
 
-    if (result.rowCount === 0) {
+    if (updated.rowCount === 0) {
+      await client.query("ROLLBACK");
       return fail(res, 404, "not_found", "Member not found");
     }
 
+    const phone = updated.rows[0]?.phone;
+    const targetUserId = await findUserIdByPhone(client, phone);
+    if (targetUserId) {
+      await deactivateAccessRole(
+        client,
+        accountId,
+        targetUserId,
+        "member_visibility"
+      );
+    }
+
+    await client.query("COMMIT");
     return res.json({ success: true });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("deleteMember error:", err);
     return fail(res, 500, "server_error", "Failed to delete member");
+  } finally {
+    client.release();
   }
 };
 
@@ -600,8 +711,6 @@ const listStaff = async (req, res) => {
 
     const month = normalizeMonth(req.query?.month);
 
-    // NOTE: no `status = 'active'` filter here — see comment in
-    // listMembers above.
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
               monthly_salary, status, created_by, created_at, updated_at
@@ -736,9 +845,14 @@ const createStaff = async (req, res) => {
       [accountId, name.trim(), phone, staffRole, photo_url, monthly_salary, userId]
     );
 
+    const created = rows[0];
+
+    // If a user with that phone exists, make sure they have
+    // staff_visibility access.
+    await syncStaffAccessOnCreate(client, accountId, created);
+
     await client.query("COMMIT");
 
-    const created = rows[0];
     const month = normalizeMonth(req.query?.month);
 
     return res.status(201).json({
@@ -814,6 +928,10 @@ const updateStaff = async (req, res) => {
       [...values, id, accountId]
     );
 
+    if (Object.prototype.hasOwnProperty.call(updates, "phone")) {
+      await syncStaffAccessOnCreate(client, accountId, updated.rows[0]);
+    }
+
     await client.query("COMMIT");
     return res.json(updated.rows[0]);
   } catch (err) {
@@ -826,7 +944,10 @@ const updateStaff = async (req, res) => {
 };
 
 // ── SOFT DELETE ──
+// Marks the staff row inactive and cascades to account_members
+// (staff_visibility) and to invitations.
 const deleteStaff = async (req, res) => {
+  const client = await pool.connect();
   try {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
@@ -837,23 +958,42 @@ const deleteStaff = async (req, res) => {
       return fail(res, 403, "forbidden", "Only owners and admins can delete staff");
     }
 
-    const result = await pool.query(
+    await client.query("BEGIN");
+
+    const updated = await client.query(
       `UPDATE staff
           SET status = 'inactive', updated_at = NOW()
         WHERE id = $1
           AND account_id = $2
-          AND status = 'active'`,
+          AND status = 'active'
+        RETURNING phone`,
       [id, accountId]
     );
 
-    if (result.rowCount === 0) {
+    if (updated.rowCount === 0) {
+      await client.query("ROLLBACK");
       return fail(res, 404, "not_found", "Staff not found");
     }
 
+    const phone = updated.rows[0]?.phone;
+    const targetUserId = await findUserIdByPhone(client, phone);
+    if (targetUserId) {
+      await deactivateAccessRole(
+        client,
+        accountId,
+        targetUserId,
+        "staff_visibility"
+      );
+    }
+
+    await client.query("COMMIT");
     return res.json({ success: true });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("deleteStaff error:", err);
     return fail(res, 500, "server_error", "Failed to delete staff");
+  } finally {
+    client.release();
   }
 };
 

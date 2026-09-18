@@ -13,8 +13,7 @@ const fail = (res, status, code) => res.status(status).json({ code });
 // POST /accounts
 //
 // Creates an account and inserts the owner into account_members with the
-// role `admin`. Ownership itself is derived from accounts.created_by, never
-// stored on account_members.
+// role `admin`. Ownership itself is derived from accounts.created_by.
 // ---------------------------------------------------------------------------
 const createAccount = async (req, res) => {
   const client = await pool.connect();
@@ -45,8 +44,8 @@ const createAccount = async (req, res) => {
 
     const account = accountResult.rows[0];
 
-    // Owner is an admin on their own account. `owner` is never stored as a
-    // role value — it's derived from accounts.created_by at read time.
+    // Owner is admin on their own account. `owner` is never stored on
+    // account_members — it is derived from accounts.created_by.
     await client.query(
       `
       INSERT INTO account_members (account_id, user_id, role, status)
@@ -62,8 +61,6 @@ const createAccount = async (req, res) => {
 
     await client.query("COMMIT");
 
-    // Return the account with the derived owner role so the frontend
-    // renders the Owner badge immediately.
     return res.status(201).json({ ...account, role: "owner" });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -81,16 +78,36 @@ const createAccount = async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // GET /accounts
-// Returns { accounts, lastAccountId }
+//
+// Returns the accounts the caller can currently access.
+//
+//   - owner: accounts.created_by = me
+//   - admin: account_members row with role='admin', status='active'
+//   - member_visibility: account_members row with role='member_visibility',
+//     status='active', AND a matching active row in `members` with my phone
+//   - staff_visibility: same, with the `staff` table
+//
+// If a members/staff row has been deactivated, the account no longer
+// appears here even if the account_members row is still active. This
+// prevents ghost accounts.
 // ---------------------------------------------------------------------------
 const listAccounts = async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return fail(res, 401, "unauthenticated");
 
-    const result = await pool.query(
+    // Fetch the caller's phone once so we can join members/staff by phone.
+    const { rows: userRows } = await pool.query(
+      `SELECT phone FROM users WHERE id = $1`,
+      [userId],
+    );
+    const rawPhone = userRows.length ? userRows[0].phone : null;
+    const digits = rawPhone ? String(rawPhone).replace(/\D/g, "") : "";
+    const phone = digits.length > 10 ? digits.slice(-10) : digits;
+
+    const { rows } = await pool.query(
       `
-      SELECT
+      SELECT DISTINCT
         a.id,
         a.name,
         a.type,
@@ -100,22 +117,53 @@ const listAccounts = async (req, res) => {
         a.updated_at,
         am.role
       FROM accounts a
-      INNER JOIN account_members am ON am.account_id = a.id
-      WHERE am.user_id = $1
-        AND am.status = 'active'
+      LEFT JOIN account_members am
+        ON am.account_id = a.id
+       AND am.user_id = $1
+       AND am.status = 'active'
+      WHERE
+        -- Owner always sees their own account.
+        a.created_by = $1
+
+        -- Active admin row (no underlying row required).
+        OR (am.role = 'admin')
+
+        -- member_visibility: needs an active members row matching my phone.
+        OR (
+          am.role = 'member_visibility'
+          AND $2 <> ''
+          AND EXISTS (
+            SELECT 1 FROM members m
+             WHERE m.account_id = a.id
+               AND m.status = 'active'
+               AND RIGHT(REGEXP_REPLACE(m.phone,'\\D','','g'),10) = $2
+          )
+        )
+
+        -- staff_visibility: needs an active staff row matching my phone.
+        OR (
+          am.role = 'staff_visibility'
+          AND $2 <> ''
+          AND EXISTS (
+            SELECT 1 FROM staff s
+             WHERE s.account_id = a.id
+               AND s.status = 'active'
+               AND RIGHT(REGEXP_REPLACE(s.phone,'\\D','','g'),10) = $2
+          )
+        )
       ORDER BY a.created_at DESC
       `,
-      [userId],
+      [userId, phone],
     );
 
-    const { rows: userRows } = await pool.query(
+    const { rows: userRowsForLast } = await pool.query(
       `SELECT last_account_id FROM users WHERE id = $1`,
       [userId],
     );
 
     return res.status(200).json({
-      accounts: result.rows,
-      lastAccountId: userRows[0]?.last_account_id ?? null,
+      accounts: rows,
+      lastAccountId: userRowsForLast[0]?.last_account_id ?? null,
     });
   } catch (error) {
     console.error("List accounts error:", error);
@@ -224,8 +272,7 @@ const deleteAccount = async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /accounts/:id/transfer-ownership
 // Body: { newOwnerUserId: string }
-// Owner only. Atomically moves `created_by`, keeps the old owner as admin,
-// ensures the new owner has an admin row.
+// Owner only.
 // ---------------------------------------------------------------------------
 const transferOwnership = async (req, res) => {
   const client = await pool.connect();
@@ -249,7 +296,6 @@ const transferOwnership = async (req, res) => {
       return fail(res, 400, "invalid_input");
     }
 
-    // The new owner must already have some active row on this account.
     const { rows: newOwnerRows } = await pool.query(
       `SELECT 1 FROM account_members
         WHERE account_id = $1 AND user_id = $2 AND status = 'active'
@@ -267,7 +313,6 @@ const transferOwnership = async (req, res) => {
       [newOwnerUserId, id],
     );
 
-    // Old owner keeps admin.
     await client.query(
       `INSERT INTO account_members (account_id, user_id, role, status)
        VALUES ($1, $2, 'admin', 'active')
@@ -276,7 +321,6 @@ const transferOwnership = async (req, res) => {
       [id, userId],
     );
 
-    // New owner must have admin too.
     await client.query(
       `INSERT INTO account_members (account_id, user_id, role, status)
        VALUES ($1, $2, 'admin', 'active')
