@@ -8,20 +8,9 @@ const { pool } = require("../config/database");
 const getUserId = (req) =>
   req.user?.userId ?? req.user?.id ?? req.userId ?? null;
 
-/**
- * Normalize any phone input to the 10-digit Indian form.
- * Accepts:
- *   "9876543210"          → "9876543210"
- *   "09876543210"         → "9876543210"
- *   "+919876543210"       → "9876543210"
- *   "919876543210"        → "9876543210"
- *   "91 98765 43210"      → "9876543210"
- *   null / "" / junk      → null
- */
 const normalizePhone = (raw) => {
   if (!raw) return null;
   const digits = String(raw).replace(/\D/g, "");
-  if (!digits) return null;
   const ten = digits.length > 10 ? digits.slice(-10) : digits;
   return ten.length === 10 ? ten : null;
 };
@@ -30,15 +19,8 @@ const fail = (res, status, code) => res.status(status).json({ code });
 
 const VALID_ROLES = ["admin", "member_visibility", "staff_visibility"];
 
-// ---------------------------------------------------------------------------
-// getRolesForAccount
-//
-// Returns the roles the user *effectively* holds on the account.
-//   - "owner"              — accounts.created_by
-//   - "admin"              — active account_members row
-//   - "member_visibility"  — active account_members row AND active members row
-//   - "staff_visibility"   — active account_members row AND active staff row
-// ---------------------------------------------------------------------------
+// Returns an array of roles the user has on the account.
+// "owner" is a special sentinel for the account creator.
 async function getRolesForAccount(userId, accountId) {
   const { rows: ownerRows } = await pool.query(
     `SELECT 1 FROM accounts WHERE id = $1 AND created_by = $2`,
@@ -46,50 +28,14 @@ async function getRolesForAccount(userId, accountId) {
   );
   if (ownerRows.length) return ["owner"];
 
-  const { rows: userRows } = await pool.query(
-    `SELECT phone FROM users WHERE id = $1`,
-    [userId]
-  );
-  const phone = userRows.length ? normalizePhone(userRows[0].phone) : null;
-
-  const { rows: amRows } = await pool.query(
+  const { rows } = await pool.query(
     `SELECT role FROM account_members
        WHERE account_id = $1
          AND user_id = $2
          AND status = 'active'`,
     [accountId, userId]
   );
-
-  const granted = amRows.map((r) => r.role);
-  const valid = [];
-
-  if (granted.includes("admin")) valid.push("admin");
-
-  if (granted.includes("member_visibility") && phone) {
-    const { rows: m } = await pool.query(
-      `SELECT 1 FROM members
-         WHERE account_id = $1
-           AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-           AND status = 'active'
-         LIMIT 1`,
-      [accountId, phone]
-    );
-    if (m.length) valid.push("member_visibility");
-  }
-
-  if (granted.includes("staff_visibility") && phone) {
-    const { rows: s } = await pool.query(
-      `SELECT 1 FROM staff
-         WHERE account_id = $1
-           AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-           AND status = 'active'
-         LIMIT 1`,
-      [accountId, phone]
-    );
-    if (s.length) valid.push("staff_visibility");
-  }
-
-  return valid;
+  return rows.map((r) => r.role);
 }
 
 const hasOwnerOrAdmin = (roles) =>
@@ -170,7 +116,7 @@ const preflight = async (req, res) => {
     const { rows: pendingRows } = await pool.query(
       `SELECT id, role FROM invitations
         WHERE account_id = $1
-          AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
+          AND invited_phone = $2
           AND status = 'pending'`,
       [accountId, phone]
     );
@@ -185,7 +131,7 @@ const preflight = async (req, res) => {
         `SELECT role, invited_name
            FROM invitations
           WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
+            AND invited_phone = $2
             AND role IN ('member_visibility', 'staff_visibility')
             AND status = 'accepted'
           ORDER BY responded_at DESC NULLS LAST
@@ -250,7 +196,7 @@ const createInvitation = async (req, res) => {
             SET status = 'cancelled',
                 responded_at = COALESCE(responded_at, NOW())
           WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
+            AND invited_phone = $2
             AND role IN ('member_visibility', 'staff_visibility')
             AND status = 'pending'`,
         [accountId, phone]
@@ -407,11 +353,6 @@ const dismissInvitation = async (req, res) => {
 
 // ===========================================================================
 // MY INVITATIONS
-//
-// The endpoint the recipient calls to see invitations addressed to their
-// phone number. Fix: normalize BOTH sides of the phone comparison so that
-// "919876543210" stored in users.phone matches "9876543210" stored in
-// invitations.invited_phone.
 // ===========================================================================
 
 const listMyInvitations = async (req, res) => {
@@ -426,10 +367,6 @@ const listMyInvitations = async (req, res) => {
     if (!userRows.length) return fail(res, 404, "not_found");
 
     const phone = normalizePhone(userRows[0].phone);
-    if (!phone) {
-      // User's own phone is malformed — no invite could match anyway.
-      return res.json({ invitations: [] });
-    }
 
     const { rows } = await pool.query(
       `SELECT
@@ -441,7 +378,7 @@ const listMyInvitations = async (req, res) => {
        FROM invitations i
        JOIN accounts a ON a.id = i.account_id
        JOIN users u    ON u.id = i.invited_by
-       WHERE RIGHT(REGEXP_REPLACE(i.invited_phone,'\\D','','g'),10) = $1
+       WHERE i.invited_phone = $1
          AND i.status = 'pending'
        ORDER BY i.created_at DESC`,
       [phone]
@@ -481,11 +418,7 @@ const acceptInvitation = async (req, res) => {
 
     const inv = invRows[0];
     if (inv.status !== "pending") return fail(res, 409, "conflict");
-
-    const invPhone = normalizePhone(inv.invited_phone);
-    if (!invPhone || !myPhone || invPhone !== myPhone) {
-      return fail(res, 403, "forbidden");
-    }
+    if (inv.invited_phone !== myPhone) return fail(res, 403, "forbidden");
 
     await client.query("BEGIN");
 
@@ -510,7 +443,7 @@ const acceptInvitation = async (req, res) => {
             SET status = 'cancelled',
                 responded_at = COALESCE(responded_at, NOW())
           WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
+            AND invited_phone = $2
             AND role IN ('member_visibility', 'staff_visibility')
             AND status = 'pending'
             AND id <> $3`,
@@ -558,10 +491,7 @@ const rejectInvitation = async (req, res) => {
     if (!rows.length) return fail(res, 404, "not_found");
 
     const inv = rows[0];
-    const invPhone = normalizePhone(inv.invited_phone);
-    if (!invPhone || !myPhone || invPhone !== myPhone) {
-      return fail(res, 403, "forbidden");
-    }
+    if (inv.invited_phone !== myPhone) return fail(res, 403, "forbidden");
     if (inv.status !== "pending") return fail(res, 409, "conflict");
 
     await pool.query(
@@ -614,7 +544,6 @@ const getAdminLinkedProfiles = async (req, res) => {
         `SELECT id, name FROM members
           WHERE account_id = $1
             AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-            AND status = 'active'
           LIMIT 1`,
         [accountId, phone]
       );
@@ -627,7 +556,6 @@ const getAdminLinkedProfiles = async (req, res) => {
         `SELECT id, name FROM staff
           WHERE account_id = $1
             AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-            AND status = 'active'
           LIMIT 1`,
         [accountId, phone]
       );
@@ -657,9 +585,8 @@ const getAdminLinkedProfiles = async (req, res) => {
 // ===========================================================================
 // REVOKE — admin only.
 //
-// When admin is revoked, the user keeps any member/staff roles they still
-// qualify for. If their members/staff row is still active on this account,
-// we ensure an active member_visibility / staff_visibility row exists.
+// Member and staff access cannot be revoked by the owner. Only the user
+// themselves can give it up by deleting their own account.
 // ===========================================================================
 
 const revokeAccess = async (req, res) => {
@@ -672,6 +599,7 @@ const revokeAccess = async (req, res) => {
     const requesterRoles = await getRolesForAccount(requesterId, accountId);
     if (!isOwner(requesterRoles)) return fail(res, 403, "owner_required");
 
+    // Only admin is revocable. Refuse any other role.
     if (rawRole && rawRole !== "admin") {
       return fail(res, 403, "forbidden");
     }
@@ -682,38 +610,6 @@ const revokeAccess = async (req, res) => {
     );
     if (ownerRows.length && ownerRows[0].created_by === targetUserId) {
       return fail(res, 400, "invalid_input");
-    }
-
-    const { rows: userRows } = await client.query(
-      `SELECT phone, name FROM users WHERE id = $1`,
-      [targetUserId]
-    );
-    const phone = userRows.length ? normalizePhone(userRows[0].phone) : null;
-    const name = userRows.length ? userRows[0].name : null;
-
-    let memberId = null;
-    let staffId = null;
-
-    if (phone) {
-      const { rows: m } = await client.query(
-        `SELECT id FROM members
-          WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-            AND status = 'active'
-          LIMIT 1`,
-        [accountId, phone]
-      );
-      if (m.length) memberId = m[0].id;
-
-      const { rows: s } = await client.query(
-        `SELECT id FROM staff
-          WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-            AND status = 'active'
-          LIMIT 1`,
-        [accountId, phone]
-      );
-      if (s.length) staffId = s[0].id;
     }
 
     await client.query("BEGIN");
@@ -733,72 +629,6 @@ const revokeAccess = async (req, res) => {
       return fail(res, 404, "not_found");
     }
 
-    const kept = [];
-
-    if (memberId) {
-      await client.query(
-        `INSERT INTO account_members (account_id, user_id, role, status)
-         VALUES ($1, $2, 'member_visibility', 'active')
-         ON CONFLICT (account_id, user_id, role)
-         DO UPDATE SET status = 'active', updated_at = NOW()`,
-        [accountId, targetUserId]
-      );
-      kept.push("member_visibility");
-
-      if (phone) {
-        const { rows: existing } = await client.query(
-          `SELECT id FROM invitations
-            WHERE account_id = $1
-              AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
-              AND role = 'member_visibility'
-              AND status = 'accepted'
-            LIMIT 1`,
-          [accountId, phone]
-        );
-        if (!existing.length) {
-          await client.query(
-            `INSERT INTO invitations
-               (account_id, invited_by, invited_phone, invited_name,
-                role, status, accepted_by, responded_at, target_member_id)
-             VALUES ($1, $2, $3, $4, 'member_visibility', 'accepted', $5, NOW(), $6)`,
-            [accountId, requesterId, phone, name, targetUserId, memberId]
-          );
-        }
-      }
-    }
-
-    if (staffId) {
-      await client.query(
-        `INSERT INTO account_members (account_id, user_id, role, status)
-         VALUES ($1, $2, 'staff_visibility', 'active')
-         ON CONFLICT (account_id, user_id, role)
-         DO UPDATE SET status = 'active', updated_at = NOW()`,
-        [accountId, targetUserId]
-      );
-      kept.push("staff_visibility");
-
-      if (phone) {
-        const { rows: existing } = await client.query(
-          `SELECT id FROM invitations
-            WHERE account_id = $1
-              AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
-              AND role = 'staff_visibility'
-              AND status = 'accepted'
-            LIMIT 1`,
-          [accountId, phone]
-        );
-        if (!existing.length) {
-          await client.query(
-            `INSERT INTO invitations
-               (account_id, invited_by, invited_phone, invited_name,
-                role, status, accepted_by, responded_at, target_staff_id)
-             VALUES ($1, $2, $3, $4, 'staff_visibility', 'accepted', $5, NOW(), $6)`,
-            [accountId, requesterId, phone, name, targetUserId, staffId]
-          );
-        }
-      }
-    }
-
     await client.query(
       `UPDATE invitations
           SET status = 'revoked', responded_at = NOW()
@@ -814,7 +644,6 @@ const revokeAccess = async (req, res) => {
     return res.json({
       success: true,
       removed: "admin",
-      kept,
     });
   } catch (err) {
     await client.query("ROLLBACK");
