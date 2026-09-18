@@ -134,13 +134,15 @@ const listMembers = async (req, res) => {
 
     const month = normalizeMonth(req.query?.month);
 
+    // NOTE: no `status = 'active'` filter here. Inactive (soft-deleted)
+    // rows must reach the client so the Finance tab can badge them for
+    // their deletion month. The People tab filters them client-side.
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
               wing, flat_number, area_sqft, parking_available,
               maintenance_amount, status, created_by, created_at, updated_at
          FROM members
         WHERE account_id = $1
-          AND status = 'active'
         ORDER BY flat_number, name`,
       [accountId]
     );
@@ -152,7 +154,6 @@ const listMembers = async (req, res) => {
          FROM member_monthly_payments mmp
          JOIN members m ON m.id = mmp.member_id
         WHERE m.account_id = $1
-          AND m.status = 'active'
           AND mmp.month = $2`,
       [accountId, month]
     );
@@ -599,12 +600,13 @@ const listStaff = async (req, res) => {
 
     const month = normalizeMonth(req.query?.month);
 
+    // NOTE: no `status = 'active'` filter here — see comment in
+    // listMembers above.
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
               monthly_salary, status, created_by, created_at, updated_at
          FROM staff
         WHERE account_id = $1
-          AND status = 'active'
         ORDER BY name`,
       [accountId]
     );
@@ -616,7 +618,6 @@ const listStaff = async (req, res) => {
          FROM staff_monthly_payments smp
          JOIN staff s ON s.id = smp.staff_id
         WHERE s.account_id = $1
-          AND s.status = 'active'
           AND smp.month = $2`,
       [accountId, month]
     );
@@ -629,7 +630,6 @@ const listStaff = async (req, res) => {
          FROM staff_attendance sa
          JOIN staff s ON s.id = sa.staff_id
         WHERE s.account_id = $1
-          AND s.status = 'active'
           AND sa.month = $2`,
       [accountId, month]
     );
