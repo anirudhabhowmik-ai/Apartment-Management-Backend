@@ -1,3 +1,4 @@
+// @ts-nocheck
 // src/controllers/invitationController.js
 const { pool } = require("../config/database");
 const {
@@ -275,6 +276,10 @@ const createInvitation = async (req, res) => {
 // LIST
 // ===========================================================================
 
+// ===========================================================================
+// LIST
+// ===========================================================================
+
 const listInvitations = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -316,10 +321,39 @@ const listInvitations = async (req, res) => {
       params
     );
 
+    // Phones that must not appear in any grant-access picker:
+    //   - the account owner
+    //   - anyone with an active admin row on this account
+    //
+    // Grant-access screens merge these into their "blocked admin phones"
+    // set, so the owner and active admins do not show up in the
+    // member / staff / admin candidate lists.
+    const { rows: excludedRows } = await pool.query(
+      `SELECT RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10) AS phone
+         FROM accounts a
+         JOIN users u ON u.id = a.created_by
+        WHERE a.id = $1
+
+        UNION
+
+       SELECT RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10) AS phone
+         FROM account_members am
+         JOIN users u ON u.id = am.user_id
+        WHERE am.account_id = $1
+          AND am.role       = 'admin'
+          AND am.status     = 'active'`,
+      [accountId]
+    );
+
+    const excluded_phones = excludedRows
+      .map((r) => r.phone)
+      .filter((p) => typeof p === "string" && p.length === 10);
+
     return res.json({
       success: true,
       count: rows.length,
       invitations: rows,
+      excluded_phones,
     });
   } catch (err) {
     console.error("listInvitations error:", err);
@@ -461,6 +495,9 @@ const acceptInvitation = async (req, res) => {
 
     await client.query("BEGIN");
 
+    // Grant the invitation's role. If it's admin, also activate
+    // member_visibility / staff_visibility for whichever live members
+    // or staff rows exist for this phone at accept time.
     await grantRoleWithImpliedRoles(
       client,
       inv.account_id,

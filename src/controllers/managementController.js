@@ -1,5 +1,6 @@
 // src/controllers/managementController.js
 const { pool } = require("../config/database");
+const { isEligibleForAutoGrant } = require("../utils/accessSync");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -60,14 +61,12 @@ const fail = (res, status, code, message) =>
   res.status(status).json({ code, message });
 
 // ---------------------------------------------------------------------------
-// Access sync helpers
+// Access sync helpers (member / staff side)
 //
-// These keep `account_members` in sync with the underlying members/staff
-// tables. Admin rows are never touched by these helpers — admin is
-// independent of member/staff identity.
+// Auto-grant visibility only when the user is the account owner OR an
+// active admin on this account. Everyone else goes through invitations.
 // ---------------------------------------------------------------------------
 
-// Find a user id by phone, or null if no user has that phone.
 async function findUserIdByPhone(client, phone) {
   const ten = normalizePhone(phone);
   if (!ten) return null;
@@ -80,7 +79,6 @@ async function findUserIdByPhone(client, phone) {
   return rows.length ? rows[0].id : null;
 }
 
-// Insert or reactivate the account_members row for the given role.
 async function activateAccessRole(client, accountId, userId, role) {
   if (!userId) return;
   await client.query(
@@ -92,8 +90,6 @@ async function activateAccessRole(client, accountId, userId, role) {
   );
 }
 
-// Mark the account_members row inactive and revoke the matching accepted
-// invitation. Does nothing if the row does not exist.
 async function deactivateAccessRole(client, accountId, userId, role) {
   if (!userId) return;
   await client.query(
@@ -115,20 +111,19 @@ async function deactivateAccessRole(client, accountId, userId, role) {
   );
 }
 
-// After a member row was created or reactivated, ensure the user's
-// member_visibility access is active.
 async function syncMemberAccessOnCreate(client, accountId, member) {
   if (!member?.phone) return;
   const userId = await findUserIdByPhone(client, member.phone);
   if (!userId) return;
+  if (!(await isEligibleForAutoGrant(client, accountId, userId))) return;
   await activateAccessRole(client, accountId, userId, "member_visibility");
 }
 
-// After a staff row was created or reactivated.
 async function syncStaffAccessOnCreate(client, accountId, staff) {
   if (!staff?.phone) return;
   const userId = await findUserIdByPhone(client, staff.phone);
   if (!userId) return;
+  if (!(await isEligibleForAutoGrant(client, accountId, userId))) return;
   await activateAccessRole(client, accountId, userId, "staff_visibility");
 }
 
@@ -210,7 +205,8 @@ const listMembers = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const month = normalizeMonth(req.query?.month);
 
@@ -282,7 +278,8 @@ const getMember = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
@@ -377,9 +374,7 @@ const createMember = async (req, res) => {
 
     const created = rows[0];
 
-    // If a user with that phone exists, make sure they have
-    // member_visibility access. If no user exists, they'll get access
-    // when they sign up and accept the invitation (normal flow).
+    // Auto-grant only for owner / active admin.
     await syncMemberAccessOnCreate(client, accountId, created);
 
     await client.query("COMMIT");
@@ -409,7 +404,8 @@ const updateMember = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows } = await client.query(
       `SELECT * FROM members
@@ -461,8 +457,6 @@ const updateMember = async (req, res) => {
       [...values, id, accountId]
     );
 
-    // If the phone changed, the linked user's member_visibility access
-    // may need to be re-synced. Reactivate for the new phone.
     if (Object.prototype.hasOwnProperty.call(updates, "phone")) {
       await syncMemberAccessOnCreate(client, accountId, updated.rows[0]);
     }
@@ -478,9 +472,6 @@ const updateMember = async (req, res) => {
   }
 };
 
-// ── SOFT DELETE ──
-// Marks the member row inactive and cascades to account_members
-// (member_visibility) and to invitations.
 const deleteMember = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -543,7 +534,8 @@ const getPhoneVisibility = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows: memberRows } = await pool.query(
       `SELECT id, name, phone FROM members
@@ -646,7 +638,8 @@ const updatePhoneVisibility = async (req, res) => {
     }
 
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows: memberRows } = await client.query(
       `SELECT id, phone FROM members
@@ -707,7 +700,8 @@ const listStaff = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const month = normalizeMonth(req.query?.month);
 
@@ -784,7 +778,8 @@ const getStaff = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows } = await pool.query(
       `SELECT id, account_id, name, phone, role, photo_url,
@@ -847,8 +842,6 @@ const createStaff = async (req, res) => {
 
     const created = rows[0];
 
-    // If a user with that phone exists, make sure they have
-    // staff_visibility access.
     await syncStaffAccessOnCreate(client, accountId, created);
 
     await client.query("COMMIT");
@@ -879,7 +872,8 @@ const updateStaff = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows } = await client.query(
       `SELECT * FROM staff
@@ -943,9 +937,6 @@ const updateStaff = async (req, res) => {
   }
 };
 
-// ── SOFT DELETE ──
-// Marks the staff row inactive and cascades to account_members
-// (staff_visibility) and to invitations.
 const deleteStaff = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1011,7 +1002,8 @@ const getStaffAttendance = async (req, res) => {
       return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
     }
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows } = await pool.query(
       `SELECT staff_id, month, statuses, paid_days,
@@ -1343,7 +1335,8 @@ const listExpenses = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows } = await pool.query(
       `SELECT id, account_id, category, title, amount, transaction_type,
@@ -1369,7 +1362,8 @@ const getExpense = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
-    if (!role) return fail(res, 403, "forbidden", "You do not have access to this account");
+    if (!role)
+      return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows } = await pool.query(
       `SELECT id, account_id, category, title, amount, transaction_type,

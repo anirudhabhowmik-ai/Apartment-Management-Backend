@@ -1,11 +1,20 @@
 // src/utils/accessSync.js
 //
-// Write-time helpers for keeping account_members in sync with the
-// underlying members / staff tables.
+// Shared helpers for keeping account_members in sync with the members
+// and staff tables.
 //
-// Rule: granting admin also grants member_visibility and staff_visibility,
-// but ONLY where a live members / staff row exists for that phone.
-// Revoking admin never touches the base roles.
+// Two rules:
+//
+//   1. grantRoleWithImpliedRoles:
+//      When an admin invitation is accepted, also activate
+//      member_visibility / staff_visibility for whichever members /
+//      staff rows exist for that phone at accept time.
+//
+//   2. isEligibleForAutoGrant:
+//      When a members / staff row is created, auto-grant the matching
+//      visibility ONLY if the user is the account owner OR holds an
+//      active admin role on that account. Everyone else goes through
+//      the invitation flow.
 
 const normalizePhone = (raw) => {
   if (!raw) return null;
@@ -86,6 +95,40 @@ async function hasActiveStaffRow(client, accountId, phone) {
   return rows.length > 0;
 }
 
+/**
+ * True when the user is:
+ *   - the account owner (accounts.created_by = userId), OR
+ *   - an active admin on this account.
+ *
+ * Used to decide whether a member/staff row creation should also
+ * auto-grant the matching visibility without an invitation.
+ */
+async function isEligibleForAutoGrant(client, accountId, userId) {
+  if (!userId) return false;
+  const { rows } = await client.query(
+    `SELECT 1
+       FROM accounts a
+      WHERE a.id = $1 AND a.created_by = $2
+
+      UNION ALL
+
+      SELECT 1
+       FROM account_members am
+      WHERE am.account_id = $1
+        AND am.user_id    = $2
+        AND am.role       = 'admin'
+        AND am.status     = 'active'
+      LIMIT 1`,
+    [accountId, userId]
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Grant `role` to `userId` on `accountId`. If `role` is 'admin', also
+ * activate member_visibility and staff_visibility for whichever live
+ * members / staff rows exist for `phone`.
+ */
 async function grantRoleWithImpliedRoles(
   client,
   accountId,
@@ -115,5 +158,6 @@ module.exports = {
   deactivateAccessRole,
   hasActiveMemberRow,
   hasActiveStaffRow,
+  isEligibleForAutoGrant,
   grantRoleWithImpliedRoles,
 };
