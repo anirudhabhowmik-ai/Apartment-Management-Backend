@@ -30,6 +30,10 @@ router.post(
 );
 
 // Owner-only inside the controller
+router.get(
+  "/accounts/:accountId/access/:userId/preview-revoke",
+  invitationController.previewRevoke
+);
 router.delete(
   "/accounts/:accountId/access/:userId",
   invitationController.revokeAccess
