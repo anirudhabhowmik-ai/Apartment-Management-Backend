@@ -22,10 +22,6 @@ const fail = (res, status, code) => res.status(status).json({ code });
 
 const VALID_ROLES = ["admin", "member_visibility", "staff_visibility"];
 
-/**
- * Roles the caller actually holds on this account.
- * "owner" is derived from accounts.created_by, not from account_members.
- */
 async function getRolesForAccount(userId, accountId) {
   const { rows: ownerRows } = await pool.query(
     `SELECT 1 FROM accounts WHERE id = $1 AND created_by = $2`,
@@ -69,7 +65,6 @@ const preflight = async (req, res) => {
     const phone = normalizePhone(rawPhone);
     if (!phone) return fail(res, 400, "invalid_input");
 
-    // Owner self-check
     const { rows: ownerRows } = await pool.query(
       `SELECT u.phone
          FROM accounts a
@@ -81,7 +76,6 @@ const preflight = async (req, res) => {
       return res.json({ kind: "self" });
     }
 
-    // Already-joined user?
     const { rows: userRows } = await pool.query(
       `SELECT id FROM users
         WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
@@ -117,7 +111,6 @@ const preflight = async (req, res) => {
       }
     }
 
-    // Pending invitation for this phone + role?
     const { rows: pendingRows } = await pool.query(
       `SELECT id, role FROM invitations
         WHERE account_id = $1
@@ -129,7 +122,6 @@ const preflight = async (req, res) => {
       return res.json({ kind: "pending" });
     }
 
-    // Promoting a lower-role member to admin?
     if (role === "admin") {
       const { rows: acceptedLowerRoles } = await pool.query(
         `SELECT role, invited_name
@@ -184,7 +176,6 @@ const createInvitation = async (req, res) => {
     const phone = normalizePhone(rawPhone);
     if (!phone) return fail(res, 400, "invalid_input");
 
-    // Owner cannot invite themselves.
     const { rows: ownerRows } = await pool.query(
       `SELECT u.phone
          FROM accounts a
@@ -198,7 +189,6 @@ const createInvitation = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // Admin invite supersedes any pending lower-role invite for the same phone.
     if (role === "admin") {
       await client.query(
         `UPDATE invitations
@@ -293,9 +283,6 @@ const listInvitations = async (req, res) => {
       params,
     );
 
-    // Phones that must not appear in any grant-access picker:
-    //   - the account owner
-    //   - anyone with an active admin row on this account
     const { rows: excludedRows } = await pool.query(
       `SELECT RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10) AS phone
          FROM accounts a
@@ -424,12 +411,6 @@ const listMyInvitations = async (req, res) => {
 
 // ===========================================================================
 // ACCEPT
-//
-// On accept:
-//   1. Upsert account_members with the invited role (exclusive).
-//   2. Mark the invitation accepted.
-//   3. If the user still has no name, seed it from invited_name.
-//   4. If admin, cancel any pending lower-role invites for the same phone.
 // ===========================================================================
 
 const acceptInvitation = async (req, res) => {
@@ -463,10 +444,8 @@ const acceptInvitation = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 1. Grant role (exclusive).
     await grantRoleWithImpliedRoles(client, inv.account_id, userId, inv.role);
 
-    // 2. Mark invitation accepted.
     await client.query(
       `UPDATE invitations
           SET status = 'accepted', accepted_by = $1, responded_at = NOW()
@@ -474,7 +453,6 @@ const acceptInvitation = async (req, res) => {
       [userId, id],
     );
 
-    // 3. Seed users.name from the invitation if the user has none.
     if (
       inv.invited_name &&
       (!userRows[0].name || String(userRows[0].name).trim() === "")
@@ -487,7 +465,6 @@ const acceptInvitation = async (req, res) => {
       );
     }
 
-    // 4. Admin supersedes lower-role invites for the same phone.
     if (inv.role === "admin") {
       await client.query(
         `UPDATE invitations
@@ -564,9 +541,6 @@ const rejectInvitation = async (req, res) => {
 
 // ===========================================================================
 // ADMIN LINKED PROFILES
-//
-// Returns the member/staff rows associated with an accepted admin invite.
-// Uses user_id joins — members/staff no longer carry phone.
 // ===========================================================================
 
 const getAdminLinkedProfiles = async (req, res) => {
@@ -768,7 +742,6 @@ const revokeAccess = async (req, res) => {
     );
     const phone = userRows.length ? normalizePhone(userRows[0].phone) : null;
 
-    // Detect if the target still has active member / staff rows.
     const { rows: memberRows } = await client.query(
       `SELECT 1 FROM members
         WHERE account_id = $1
@@ -801,7 +774,6 @@ const revokeAccess = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 1. Deactivate the admin role.
     const { rowCount: adminDeactivated } = await client.query(
       `UPDATE account_members
           SET status = 'inactive', updated_at = NOW()
@@ -820,7 +792,6 @@ const revokeAccess = async (req, res) => {
     const kept = [];
     const revoked = [];
 
-    // 2. Member visibility
     if (keepMemberVisibility && hasMemberRow) {
       await client.query(
         `INSERT INTO account_members (account_id, user_id, role, status)
@@ -852,7 +823,6 @@ const revokeAccess = async (req, res) => {
       revoked.push("member_visibility");
     }
 
-    // 3. Staff visibility
     if (keepStaffVisibility && hasStaffRow) {
       await client.query(
         `INSERT INTO account_members (account_id, user_id, role, status)
@@ -884,7 +854,6 @@ const revokeAccess = async (req, res) => {
       revoked.push("staff_visibility");
     }
 
-    // 4. Mark the admin invitation as revoked.
     await client.query(
       `UPDATE invitations
           SET status = 'revoked', responded_at = NOW()
@@ -912,6 +881,106 @@ const revokeAccess = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// RENAME PERSON ON ACCOUNT
+//
+// One number, one name. Renames the user, any active members / staff rows
+// on this account (bumping updated_at), and any pending invitations, all in
+// one transaction.
+//
+// PATCH /api/accounts/:accountId/rename-person
+// Body: { phone: "9876543210", name: "New Name" }
+// ===========================================================================
+
+const renamePersonOnAccount = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+    const { phone: rawPhone, name: rawName } = req.body || {};
+
+    if (!userId) return fail(res, 401, "unauthenticated");
+
+    const requesterRoles = await getRolesForAccount(userId, accountId);
+    if (!hasOwnerOrAdmin(requesterRoles)) return fail(res, 403, "forbidden");
+
+    const phone = normalizePhone(rawPhone);
+    if (!phone) return fail(res, 400, "invalid_input");
+
+    const cleanName = String(rawName || "").trim();
+    if (!cleanName) return fail(res, 400, "invalid_input");
+
+    await client.query("BEGIN");
+
+    const { rows: userRows } = await client.query(
+      `SELECT id, name FROM users
+        WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $1`,
+      [phone],
+    );
+
+    if (userRows.length === 0) {
+      await client.query("ROLLBACK");
+      return fail(res, 404, "not_found");
+    }
+
+    const userIds = userRows.map((r) => r.id);
+
+    // 1. Rename the user(s).
+    await client.query(
+      `UPDATE users
+          SET name = $1, updated_at = NOW()
+        WHERE id = ANY($2::uuid[])`,
+      [cleanName, userIds],
+    );
+
+    // 2. Bump members / staff updated_at so a later refetch shows the change.
+    const membersResult = await client.query(
+      `UPDATE members
+          SET updated_at = NOW()
+        WHERE account_id = $1
+          AND user_id    = ANY($2::uuid[])
+          AND status     = 'active'`,
+      [accountId, userIds],
+    );
+
+    const staffResult = await client.query(
+      `UPDATE staff
+          SET updated_at = NOW()
+        WHERE account_id = $1
+          AND user_id    = ANY($2::uuid[])
+          AND status     = 'active'`,
+      [accountId, userIds],
+    );
+
+    // 3. Update pending invitations so the acceptance banner uses the new name.
+    const invitationsResult = await client.query(
+      `UPDATE invitations
+          SET invited_name = $1
+        WHERE account_id = $2
+          AND status     = 'pending'
+          AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $3`,
+      [cleanName, accountId, phone],
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      name: cleanName,
+      users_updated: userIds.length,
+      members_updated: membersResult.rowCount,
+      staff_updated: staffResult.rowCount,
+      invitations_updated: invitationsResult.rowCount,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("renamePersonOnAccount error:", err);
+    return fail(res, 500, "server_error");
+  } finally {
+    client.release();
+  }
+};
+
 module.exports = {
   preflight,
   createInvitation,
@@ -924,4 +993,5 @@ module.exports = {
   getAdminLinkedProfiles,
   previewRevoke,
   revokeAccess,
+  renamePersonOnAccount,
 };

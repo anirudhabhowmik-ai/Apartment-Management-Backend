@@ -29,6 +29,14 @@ router.post(
   invitationController.dismissInvitation
 );
 
+// NEW: rename a person on this account (owner/admin only — enforced inside
+// the controller). One number → one name: updates users.name, members and
+// staff updated_at, and pending invitations.
+router.patch(
+  "/accounts/:accountId/rename-person",
+  invitationController.renamePersonOnAccount
+);
+
 // Owner-only inside the controller
 router.get(
   "/accounts/:accountId/access/:userId/preview-revoke",
