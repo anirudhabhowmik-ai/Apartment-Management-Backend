@@ -1,29 +1,3 @@
-// src/utils/accessSync.js
-//
-// Shared helpers for keeping account_members in sync with members / staff.
-//
-// Rules:
-//
-//   1. Roles live on account_members. One role per (account, user).
-//      A user can be admin on one account and member_visibility on
-//      another — that's why roles are not on `users`.
-//
-//   2. grantRoleWithImpliedRoles(accountId, userId, role):
-//      grants `role` and deactivates every other role for the same
-//      (account, user). Accepting an admin invite REPLACES an existing
-//      member_visibility / staff_visibility row rather than stacking.
-//
-//   3. isEligibleForAutoGrant(accountId, userId):
-//      true when the user is the account owner OR an active admin.
-//      Used to decide whether a member / staff row creation can
-//      auto-grant the matching visibility without an invitation.
-//
-//   4. ensureUserForPhone(phone, fallbackName):
-//      returns the users.id for a phone, creating the row if missing.
-//      Never grants access — access is still invitation-only (or
-//      auto-grant for owner/admin). Used by managementController when
-//      adding a member/staff row for a phone we don't know yet.
-
 const normalizePhone = (raw) => {
   if (!raw) return null;
   const digits = String(raw).replace(/\D/g, "");
