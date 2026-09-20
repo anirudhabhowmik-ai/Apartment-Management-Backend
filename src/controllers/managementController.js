@@ -486,15 +486,7 @@ const getMember = async (req, res) => {
 };
 
 // ===========================================================================
-// createMember — FIXED
-//
-// Bug: previously `role: memberRole = "flat"` silently defaulted to "flat"
-// whenever the client omitted `role`. Combined with the client not sending
-// `role` in "existing person" mode, every new record was saved as flat.
-//
-// Fix: `role` is now REQUIRED on every create (both modes), and the backend
-// fails loudly if it is missing or invalid. `custom_role` is required when
-// role === "custom".
+// createMember
 // ===========================================================================
 const createMember = async (req, res) => {
   const client = await pool.connect();
@@ -513,7 +505,7 @@ const createMember = async (req, res) => {
     const mode = body.mode === "existing" ? "existing" : "new";
 
     const {
-      role: memberRole, // <-- NO silent default
+      role: memberRole,
       wing = null,
       flat_number,
       area_sqft = null,
@@ -526,9 +518,6 @@ const createMember = async (req, res) => {
       return fail(res, 400, "invalid_input", "Flat number is required");
     }
 
-    // Role is REQUIRED in both modes. A user may hold multiple roles
-    // (e.g. flat owner + shop owner), so the client must always declare
-    // which role is being added for this record.
     if (!memberRole) {
       return fail(
         res,
@@ -548,7 +537,6 @@ const createMember = async (req, res) => {
       );
     }
 
-    // `custom` must carry a non-empty custom role name.
     if (memberRole === "custom" && !String(custom_role || "").trim()) {
       return fail(
         res,
@@ -661,6 +649,9 @@ const createMember = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// updateMember — now accepts photo_url (writes to users.photo_url)
+// ===========================================================================
 const updateMember = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -679,7 +670,7 @@ const updateMember = async (req, res) => {
       );
 
     const { rows } = await client.query(
-      `SELECT id FROM members
+      `SELECT id, user_id FROM members
         WHERE id = $1 AND account_id = $2 AND status = 'active'`,
       [id, accountId],
     );
@@ -689,6 +680,9 @@ const updateMember = async (req, res) => {
       return fail(res, 403, "forbidden", "Only owners and admins can edit members");
     }
 
+    const targetUserId = rows[0].user_id;
+
+    // ── 1. Collect allowed field updates for the members table. ──
     const allowedFields = [
       "role",
       "wing",
@@ -704,9 +698,6 @@ const updateMember = async (req, res) => {
         updates[key] = req.body[key];
       }
     }
-    if (Object.keys(updates).length === 0) {
-      return fail(res, 400, "invalid_input", "No permitted fields to update");
-    }
 
     if (updates.role !== undefined) {
       const validRoles = ["flat", "shop", "custom"];
@@ -720,19 +711,50 @@ const updateMember = async (req, res) => {
       }
     }
 
-    const keys = Object.keys(updates);
-    const values = keys.map((k) => updates[k]);
-    const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
+    // ── 2. Photo update (lives on users.photo_url). ──
+    const hasPhoto = Object.prototype.hasOwnProperty.call(req.body, "photo_url");
+    const rawPhoto = hasPhoto ? req.body.photo_url : undefined;
+    const photoUrl =
+      rawPhoto === null || rawPhoto === undefined ? null : String(rawPhoto);
 
-    const updated = await client.query(
-      `UPDATE members
-          SET ${setClause}, updated_at = NOW()
-        WHERE id = $${keys.length + 1}
-          AND account_id = $${keys.length + 2}
-        RETURNING id`,
-      [...values, id, accountId],
-    );
+    if (Object.keys(updates).length === 0 && !hasPhoto) {
+      return fail(res, 400, "invalid_input", "No permitted fields to update");
+    }
 
+    await client.query("BEGIN");
+
+    // ── 3. Write the photo to the shared users row, if provided. ──
+    if (hasPhoto && targetUserId) {
+      await client.query(
+        `UPDATE users SET photo_url = $1, updated_at = NOW() WHERE id = $2`,
+        [photoUrl, targetUserId],
+      );
+    }
+
+    // ── 4. Apply the members-table field updates. ──
+    if (Object.keys(updates).length > 0) {
+      const keys = Object.keys(updates);
+      const values = keys.map((k) => updates[k]);
+      const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
+
+      await client.query(
+        `UPDATE members
+            SET ${setClause}, updated_at = NOW()
+          WHERE id = $${keys.length + 1}
+            AND account_id = $${keys.length + 2}`,
+        [...values, id, accountId],
+      );
+    } else if (hasPhoto) {
+      // Photo-only change still bumps the row timestamp so the client
+      // cache invalidates and the joined read returns fresh data.
+      await client.query(
+        `UPDATE members SET updated_at = NOW()
+          WHERE id = $1 AND account_id = $2`,
+        [id, accountId],
+      );
+    }
+
+    // ── 5. Re-read the joined row (with the updated photo). ──
     const { rows: joined } = await client.query(
       `SELECT m.id, m.account_id, m.user_id, m.role,
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
@@ -742,7 +764,7 @@ const updateMember = async (req, res) => {
          FROM members m
          JOIN users u ON u.id = m.user_id
         WHERE m.id = $1`,
-      [updated.rows[0].id],
+      [id],
     );
 
     await client.query("COMMIT");
@@ -1099,7 +1121,7 @@ const getStaff = async (req, res) => {
 };
 
 // ===========================================================================
-// createStaff — same fix pattern: role is REQUIRED
+// createStaff
 // ===========================================================================
 const createStaff = async (req, res) => {
   const client = await pool.connect();
@@ -1223,6 +1245,9 @@ const createStaff = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// updateStaff — now accepts photo_url (writes to users.photo_url)
+// ===========================================================================
 const updateStaff = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1241,7 +1266,7 @@ const updateStaff = async (req, res) => {
       );
 
     const { rows } = await client.query(
-      `SELECT id FROM staff
+      `SELECT id, user_id FROM staff
         WHERE id = $1 AND account_id = $2 AND status = 'active'`,
       [id, accountId],
     );
@@ -1251,31 +1276,59 @@ const updateStaff = async (req, res) => {
       return fail(res, 403, "forbidden", "Only owners and admins can edit staff");
     }
 
-    const allowedFields = ["role", "monthly_salary"];
+    const targetUserId = rows[0].user_id;
 
+    // ── 1. Collect allowed field updates for the staff table. ──
+    const allowedFields = ["role", "monthly_salary"];
     const updates = {};
     for (const key of allowedFields) {
       if (Object.prototype.hasOwnProperty.call(req.body, key)) {
         updates[key] = req.body[key];
       }
     }
-    if (Object.keys(updates).length === 0) {
+
+    // ── 2. Photo update (lives on users.photo_url). ──
+    const hasPhoto = Object.prototype.hasOwnProperty.call(req.body, "photo_url");
+    const rawPhoto = hasPhoto ? req.body.photo_url : undefined;
+    const photoUrl =
+      rawPhoto === null || rawPhoto === undefined ? null : String(rawPhoto);
+
+    if (Object.keys(updates).length === 0 && !hasPhoto) {
       return fail(res, 400, "invalid_input", "No permitted fields to update");
     }
 
-    const keys = Object.keys(updates);
-    const values = keys.map((k) => updates[k]);
-    const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
+    await client.query("BEGIN");
 
-    const updated = await client.query(
-      `UPDATE staff
-          SET ${setClause}, updated_at = NOW()
-        WHERE id = $${keys.length + 1}
-          AND account_id = $${keys.length + 2}
-        RETURNING id`,
-      [...values, id, accountId],
-    );
+    // ── 3. Write the photo to the shared users row, if provided. ──
+    if (hasPhoto && targetUserId) {
+      await client.query(
+        `UPDATE users SET photo_url = $1, updated_at = NOW() WHERE id = $2`,
+        [photoUrl, targetUserId],
+      );
+    }
 
+    // ── 4. Apply the staff-table field updates. ──
+    if (Object.keys(updates).length > 0) {
+      const keys = Object.keys(updates);
+      const values = keys.map((k) => updates[k]);
+      const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
+
+      await client.query(
+        `UPDATE staff
+            SET ${setClause}, updated_at = NOW()
+          WHERE id = $${keys.length + 1}
+            AND account_id = $${keys.length + 2}`,
+        [...values, id, accountId],
+      );
+    } else if (hasPhoto) {
+      await client.query(
+        `UPDATE staff SET updated_at = NOW()
+          WHERE id = $1 AND account_id = $2`,
+        [id, accountId],
+      );
+    }
+
+    // ── 5. Re-read the joined row (with the updated photo). ──
     const { rows: joined } = await client.query(
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
@@ -1284,7 +1337,7 @@ const updateStaff = async (req, res) => {
          FROM staff s
          JOIN users u ON u.id = s.user_id
         WHERE s.id = $1`,
-      [updated.rows[0].id],
+      [id],
     );
 
     await client.query("COMMIT");

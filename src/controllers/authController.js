@@ -100,10 +100,32 @@ async function verifyMsg91AccessToken(accessToken, submittedPhone) {
 // Folds sourceUserId into targetUserId, then deletes the source row.
 // Runs inside an open transaction. Caller has already proven control
 // of the source phone via OTP, so this is safe.
+//
+// Before deleting the source, we copy its photo_url and name to the
+// target IF the target is missing them. This preserves photos set on
+// the source user when two logins merge via a phone-number change.
 // -----------------------------------------------------------------------------
 
 async function mergeUsers(client, targetUserId, sourceUserId) {
   if (targetUserId === sourceUserId) return;
+
+  // Carry the source user's photo and name to the target, but only when
+  // the target is missing them. Names / photos that already exist on the
+  // target are not overwritten.
+  await client.query(
+    `UPDATE users AS tgt
+        SET photo_url  = COALESCE(NULLIF(tgt.photo_url, ''), src.photo_url),
+            name       = COALESCE(NULLIF(tgt.name, ''),      src.name),
+            updated_at = NOW()
+       FROM users AS src
+      WHERE tgt.id = $1
+        AND src.id = $2
+        AND (
+          (tgt.photo_url IS NULL OR tgt.photo_url = '') OR
+          (tgt.name      IS NULL OR tgt.name      = '')
+        )`,
+    [targetUserId, sourceUserId],
+  );
 
   // Every (table, column) that has a FK to users(id) and should be
   // reassigned to the surviving user. Confirmed against the schema.
@@ -481,7 +503,8 @@ const confirmPhoneChange = async (req, res) => {
       );
 
       // Move every FK reference from the source to the current user,
-      // then delete the source user.
+      // and carry over photo / name where the current user is missing
+      // them, then delete the source user.
       await mergeUsers(client, current.id, sourceUserId);
 
       // Now claim the target phone for the current user.
