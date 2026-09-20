@@ -240,6 +240,10 @@ const createInvitation = async (req, res) => {
 
 // ===========================================================================
 // LIST
+//
+// Each accepted invitation now carries the accepted user's live name and
+// photo, so the Admin & Owners list can render a real avatar. Pending rows
+// still return only invited_name (no accepted user yet).
 // ===========================================================================
 
 const listInvitations = async (req, res) => {
@@ -272,12 +276,15 @@ const listInvitations = async (req, res) => {
          i.responded_at,
          i.dismissed_at,
          i.accepted_by,
-         u.phone     AS invited_by_phone,
-         a.name      AS account_name,
-         a.photo_url AS account_photo_url
+         u.phone                 AS invited_by_phone,
+         a.name                  AS account_name,
+         a.photo_url             AS account_photo_url,
+         au.name                 AS accepted_user_name,
+         au.photo_url            AS accepted_user_photo_url
        FROM invitations i
-       LEFT JOIN users    u ON u.id = i.invited_by
-       LEFT JOIN accounts a ON a.id = i.account_id
+       LEFT JOIN users    u  ON u.id  = i.invited_by
+       LEFT JOIN users    au ON au.id = i.accepted_by
+       LEFT JOIN accounts a  ON a.id  = i.account_id
        ${where}
        ORDER BY i.created_at DESC`,
       params,
@@ -883,13 +890,6 @@ const revokeAccess = async (req, res) => {
 
 // ===========================================================================
 // RENAME PERSON ON ACCOUNT
-//
-// One number, one name. Renames the user, any active members / staff rows
-// on this account (bumping updated_at), and any pending invitations, all in
-// one transaction.
-//
-// PATCH /api/accounts/:accountId/rename-person
-// Body: { phone: "9876543210", name: "New Name" }
 // ===========================================================================
 
 const renamePersonOnAccount = async (req, res) => {
@@ -925,7 +925,6 @@ const renamePersonOnAccount = async (req, res) => {
 
     const userIds = userRows.map((r) => r.id);
 
-    // 1. Rename the user(s).
     await client.query(
       `UPDATE users
           SET name = $1, updated_at = NOW()
@@ -933,7 +932,6 @@ const renamePersonOnAccount = async (req, res) => {
       [cleanName, userIds],
     );
 
-    // 2. Bump members / staff updated_at so a later refetch shows the change.
     const membersResult = await client.query(
       `UPDATE members
           SET updated_at = NOW()
@@ -952,7 +950,6 @@ const renamePersonOnAccount = async (req, res) => {
       [accountId, userIds],
     );
 
-    // 3. Update pending invitations so the acceptance banner uses the new name.
     const invitationsResult = await client.query(
       `UPDATE invitations
           SET invited_name = $1
