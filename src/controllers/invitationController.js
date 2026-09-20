@@ -241,9 +241,13 @@ const createInvitation = async (req, res) => {
 // ===========================================================================
 // LIST
 //
-// Each accepted invitation now carries the accepted user's live name and
-// photo, so the Admin & Owners list can render a real avatar. Pending rows
-// still return only invited_name (no accepted user yet).
+// Every invitation row now carries three identity sources:
+//   - invited_by  (inviter's name + phone)
+//   - accepted_by (accepted user's name + photo) — null until accepted
+//   - invitee     (user found by matching invited_phone) — name + photo
+//
+// This lets the pending invitation row show the invitee's live photo even
+// before they accept, when the phone number already belongs to someone.
 // ===========================================================================
 
 const listInvitations = async (req, res) => {
@@ -280,10 +284,14 @@ const listInvitations = async (req, res) => {
          a.name                  AS account_name,
          a.photo_url             AS account_photo_url,
          au.name                 AS accepted_user_name,
-         au.photo_url            AS accepted_user_photo_url
+         au.photo_url            AS accepted_user_photo_url,
+         iu.name                 AS invitee_user_name,
+         iu.photo_url            AS invitee_user_photo_url
        FROM invitations i
        LEFT JOIN users    u  ON u.id  = i.invited_by
        LEFT JOIN users    au ON au.id = i.accepted_by
+       LEFT JOIN users    iu ON RIGHT(REGEXP_REPLACE(COALESCE(iu.phone,''),'\\D','','g'),10)
+                             = RIGHT(REGEXP_REPLACE(i.invited_phone,'\\D','','g'),10)
        LEFT JOIN accounts a  ON a.id  = i.account_id
        ${where}
        ORDER BY i.created_at DESC`,
