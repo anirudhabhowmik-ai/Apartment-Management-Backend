@@ -243,12 +243,6 @@ async function syncStaffAccessOnCreate(client, accountId, staffRow) {
 
 // ===========================================================================
 // listAccountPeople
-//
-// Everyone linked to this account, deduped by user_id:
-//   owner, admins, members, staff
-//
-// Row shape: { user_id, name, phone, photo_url, kind }
-// kind ∈ { "owner", "admin", "member", "staff" }
 // ===========================================================================
 
 const listAccountPeople = async (req, res) => {
@@ -270,7 +264,6 @@ const listAccountPeople = async (req, res) => {
 
     const map = new Map();
 
-    // Owner
     const { rows: ownerRows } = await pool.query(
       `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM accounts a
@@ -289,7 +282,6 @@ const listAccountPeople = async (req, res) => {
       });
     }
 
-    // Admins
     const { rows: adminRows } = await pool.query(
       `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM account_members am
@@ -311,7 +303,6 @@ const listAccountPeople = async (req, res) => {
       });
     }
 
-    // Members
     const { rows: memberRows } = await pool.query(
       `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM members m
@@ -332,7 +323,6 @@ const listAccountPeople = async (req, res) => {
       });
     }
 
-    // Staff
     const { rows: staffRows } = await pool.query(
       `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM staff s
@@ -495,6 +485,17 @@ const getMember = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// createMember — FIXED
+//
+// Bug: previously `role: memberRole = "flat"` silently defaulted to "flat"
+// whenever the client omitted `role`. Combined with the client not sending
+// `role` in "existing person" mode, every new record was saved as flat.
+//
+// Fix: `role` is now REQUIRED on every create (both modes), and the backend
+// fails loudly if it is missing or invalid. `custom_role` is required when
+// role === "custom".
+// ===========================================================================
 const createMember = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -512,22 +513,59 @@ const createMember = async (req, res) => {
     const mode = body.mode === "existing" ? "existing" : "new";
 
     const {
-      role: memberRole = "flat",
+      role: memberRole, // <-- NO silent default
       wing = null,
       flat_number,
       area_sqft = null,
       parking_available = false,
       maintenance_amount = 0,
+      custom_role = null,
     } = body;
 
     if (!flat_number) {
       return fail(res, 400, "invalid_input", "Flat number is required");
     }
 
+    // Role is REQUIRED in both modes. A user may hold multiple roles
+    // (e.g. flat owner + shop owner), so the client must always declare
+    // which role is being added for this record.
+    if (!memberRole) {
+      return fail(
+        res,
+        400,
+        "invalid_input",
+        "Member role is required (one of: flat, shop, custom)",
+      );
+    }
+
     const validRoles = ["flat", "shop", "custom"];
     if (!validRoles.includes(memberRole)) {
-      return fail(res, 400, "invalid_role", "Invalid member role");
+      return fail(
+        res,
+        400,
+        "invalid_role",
+        `Invalid member role: ${memberRole}`,
+      );
     }
+
+    // `custom` must carry a non-empty custom role name.
+    if (memberRole === "custom" && !String(custom_role || "").trim()) {
+      return fail(
+        res,
+        400,
+        "invalid_input",
+        "custom_role is required when role is 'custom'",
+      );
+    }
+
+    console.log(
+      "[createMember] accountId=%s mode=%s memberRole=%s flat_number=%s user_id=%s",
+      accountId,
+      mode,
+      memberRole,
+      flat_number,
+      body.user_id,
+    );
 
     await client.query("BEGIN");
 
@@ -572,6 +610,8 @@ const createMember = async (req, res) => {
         );
       }
     }
+
+    console.log("[createMember] inserting member with role =", memberRole);
 
     const { rows } = await client.query(
       `INSERT INTO members
@@ -666,6 +706,18 @@ const updateMember = async (req, res) => {
     }
     if (Object.keys(updates).length === 0) {
       return fail(res, 400, "invalid_input", "No permitted fields to update");
+    }
+
+    if (updates.role !== undefined) {
+      const validRoles = ["flat", "shop", "custom"];
+      if (!validRoles.includes(updates.role)) {
+        return fail(
+          res,
+          400,
+          "invalid_role",
+          `Invalid member role: ${updates.role}`,
+        );
+      }
     }
 
     const keys = Object.keys(updates);
@@ -1046,6 +1098,9 @@ const getStaff = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// createStaff — same fix pattern: role is REQUIRED
+// ===========================================================================
 const createStaff = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1069,17 +1124,25 @@ const createStaff = async (req, res) => {
     }
 
     const validRoles = [
-  "sweeper",
-  "security",
-  "maintenance",
-  "gardener",
-  "driver",
-  "accountant",
-  "custom",
-];
+      "sweeper",
+      "security",
+      "maintenance",
+      "gardener",
+      "driver",
+      "accountant",
+      "custom",
+    ];
     if (!validRoles.includes(staffRole)) {
-      return fail(res, 400, "invalid_role", "Invalid staff role");
+      return fail(res, 400, "invalid_role", `Invalid staff role: ${staffRole}`);
     }
+
+    console.log(
+      "[createStaff] accountId=%s mode=%s staffRole=%s user_id=%s",
+      accountId,
+      mode,
+      staffRole,
+      body.user_id,
+    );
 
     await client.query("BEGIN");
 
