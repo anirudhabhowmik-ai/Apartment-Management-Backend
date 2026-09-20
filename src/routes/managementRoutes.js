@@ -7,6 +7,9 @@ const c = require("../controllers/managementController");
 
 router.use(authenticate);
 
+// ---------------- People (owner + admins + members + staff) ----------------
+router.get("/:accountId/people", c.listAccountPeople);
+
 // ---------------- Members ----------------
 router.get("/:accountId/members", c.listMembers);
 router.get("/:accountId/members/:id", c.getMember);

@@ -1,11 +1,11 @@
 // @ts-nocheck
 // src/controllers/managementController.js
 const { pool } = require("../config/database");
-const { isEligibleForAutoGrant } = require("../utils/accessSync");
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+const {
+  isEligibleForAutoGrant,
+  ensureUserForPhone,
+  deactivateAccessRole,
+} = require("../utils/accessSync");
 
 const getUserId = (req) =>
   req.user?.userId ?? req.user?.id ?? req.userId ?? null;
@@ -39,210 +39,88 @@ const toNullableNote = (v) => {
   return s.length === 0 ? null : s;
 };
 
+const fail = (res, status, code, message) =>
+  res.status(status).json({ code, message });
+
 async function getRoleForAccount(userId, accountId) {
   const { rows: ownerRows } = await pool.query(
     `SELECT 1 FROM accounts WHERE id = $1 AND created_by = $2`,
-    [accountId, userId]
+    [accountId, userId],
   );
   if (ownerRows.length) return "owner";
 
   const { rows } = await pool.query(
     `SELECT role FROM account_members
-       WHERE account_id = $1
-         AND user_id = $2
-         AND status = 'active'
+       WHERE account_id = $1 AND user_id = $2 AND status = 'active'
        LIMIT 1`,
-    [accountId, userId]
+    [accountId, userId],
   );
-
   return rows.length ? rows[0].role : null;
 }
-
-const fail = (res, status, code, message) =>
-  res.status(status).json({ code, message });
-
-// ---------------------------------------------------------------------------
-// Access sync helpers (member / staff side)
-// ---------------------------------------------------------------------------
-
-async function findUserIdByPhone(client, phone) {
-  const ten = normalizePhone(phone);
-  if (!ten) return null;
-  const { rows } = await client.query(
-    `SELECT id FROM users
-       WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
-       LIMIT 1`,
-    [ten]
-  );
-  return rows.length ? rows[0].id : null;
-}
-
-async function activateAccessRole(client, accountId, userId, role) {
-  if (!userId) return;
-  await client.query(
-    `INSERT INTO account_members (account_id, user_id, role, status)
-     VALUES ($1, $2, $3, 'active')
-     ON CONFLICT (account_id, user_id, role)
-     DO UPDATE SET status = 'active', updated_at = NOW()`,
-    [accountId, userId, role]
-  );
-}
-
-async function deactivateAccessRole(client, accountId, userId, role) {
-  if (!userId) return;
-  await client.query(
-    `UPDATE account_members
-        SET status = 'inactive', updated_at = NOW()
-      WHERE account_id = $1
-        AND user_id = $2
-        AND role = $3`,
-    [accountId, userId, role]
-  );
-  await client.query(
-    `UPDATE invitations
-        SET status = 'revoked', responded_at = NOW()
-      WHERE account_id = $1
-        AND accepted_by = $2
-        AND role = $3
-        AND status = 'accepted'`,
-    [accountId, userId, role]
-  );
-}
-
-async function syncMemberAccessOnCreate(client, accountId, member) {
-  if (!member?.phone) return;
-  const userId = await findUserIdByPhone(client, member.phone);
-  if (!userId) return;
-  if (!(await isEligibleForAutoGrant(client, accountId, userId))) return;
-  await activateAccessRole(client, accountId, userId, "member_visibility");
-}
-
-async function syncStaffAccessOnCreate(client, accountId, staff) {
-  if (!staff?.phone) return;
-  const userId = await findUserIdByPhone(client, staff.phone);
-  if (!userId) return;
-  if (!(await isEligibleForAutoGrant(client, accountId, userId))) return;
-  await activateAccessRole(client, accountId, userId, "staff_visibility");
-}
-
-// ---------------------------------------------------------------------------
-// Name-conflict helpers
-//
-// "One number, one name" — a phone number may only be associated with a
-// single display name across members, staff, and invitations on the
-// same account. If a new row is being created for a phone that already
-// has a different name elsewhere, we return a conflict so the caller can
-// confirm. On confirm, we propagate the new name everywhere for that
-// phone.
-// ---------------------------------------------------------------------------
-
-async function findExistingNameForPhone(
-  client,
-  accountId,
-  phone,
-  excludeKind = null,
-  excludeId = null
-) {
-  const ten = normalizePhone(phone);
-  if (!ten) return null;
-
-  const queries = [];
-
-  if (excludeKind !== "member") {
-    queries.push(
-      client.query(
-        `SELECT name, 'member' AS source
-           FROM members
-          WHERE account_id = $1
-            AND status = 'active'
-            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-          LIMIT 1`,
-        [accountId, ten]
-      )
-    );
-  }
-
-  if (excludeKind !== "staff") {
-    queries.push(
-      client.query(
-        `SELECT name, 'staff' AS source
-           FROM staff
-          WHERE account_id = $1
-            AND status = 'active'
-            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-          LIMIT 1`,
-        [accountId, ten]
-      )
-    );
-  }
-
-  if (excludeKind !== "invitation") {
-    queries.push(
-      client.query(
-        `SELECT invited_name AS name, 'invitation' AS source
-           FROM invitations
-          WHERE account_id = $1
-            AND invited_name IS NOT NULL
-            AND invited_name <> ''
-            AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
-            AND status = 'pending'
-          LIMIT 1`,
-        [accountId, ten]
-      )
-    );
-  }
-
-  const results = await Promise.all(queries);
-  for (const result of results) {
-    if (result.rows.length > 0) {
-      return result.rows[0].name;
-    }
-  }
-  return null;
-}
-
-async function renameAllOccurrencesForPhone(
-  client,
-  accountId,
-  phone,
-  newName
-) {
-  const ten = normalizePhone(phone);
-  if (!ten || !newName) return;
-
-  await client.query(
-    `UPDATE members
-        SET name = $3, updated_at = NOW()
-      WHERE account_id = $1
-        AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2`,
-    [accountId, ten, newName]
-  );
-
-  await client.query(
-    `UPDATE staff
-        SET name = $3, updated_at = NOW()
-      WHERE account_id = $1
-        AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2`,
-    [accountId, ten, newName]
-  );
-
-  await client.query(
-    `UPDATE invitations
-        SET invited_name = $3
-      WHERE account_id = $1
-        AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
-        AND status = 'pending'`,
-    [accountId, ten, newName]
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Due-amount computation
-// ---------------------------------------------------------------------------
 
 function normalizeMonth(raw) {
   if (typeof raw === "string" && /^\d{4}-\d{2}$/.test(raw)) return raw;
   return new Date().toISOString().slice(0, 7);
+}
+
+function shapeMemberRow(row, payment) {
+  return {
+    id: row.id,
+    account_id: row.account_id,
+    user_id: row.user_id,
+    name: row.name ?? "",
+    phone: row.phone ?? "",
+    photo_url: row.photo_url ?? null,
+    role: row.role,
+    wing: row.wing ?? null,
+    flat_number: row.flat_number,
+    area_sqft: row.area_sqft ?? null,
+    parking_available: !!row.parking_available,
+    maintenance_amount: Number(row.maintenance_amount) || 0,
+    status: row.status,
+    created_by: row.created_by,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    due_amount: payment
+      ? computeMemberDue(row, payment)
+      : computeMemberDue(row, null),
+    due_month: payment?.month ?? null,
+    monthly_payments: payment
+      ? { [payment.month]: mapMemberPaymentRow(payment) }
+      : {},
+  };
+}
+
+function shapeStaffRow(row, payment, attendance) {
+  return {
+    id: row.id,
+    account_id: row.account_id,
+    user_id: row.user_id,
+    name: row.name ?? "",
+    phone: row.phone ?? "",
+    photo_url: row.photo_url ?? null,
+    role: row.role,
+    monthly_salary: Number(row.monthly_salary) || 0,
+    status: row.status,
+    created_by: row.created_by,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    due_amount: computeStaffDue(row, attendance, payment),
+    due_month: payment?.month ?? attendance?.month ?? null,
+    monthly_payments: payment
+      ? { [payment.month]: mapStaffPaymentRow(payment) }
+      : {},
+    attendance_for_month: attendance
+      ? {
+          statuses: attendance.statuses,
+          paidDays: attendance.paid_days,
+          calculatedSalary:
+            attendance.calculated_salary != null
+              ? Number(attendance.calculated_salary)
+              : null,
+        }
+      : null,
+  };
 }
 
 function computeMemberDue(memberRow, paymentRow) {
@@ -303,6 +181,189 @@ function mapStaffPaymentRow(p) {
   };
 }
 
+async function syncMemberAccessOnCreate(client, accountId, memberRow) {
+  if (!memberRow?.user_id) return;
+  if (!(await isEligibleForAutoGrant(client, accountId, memberRow.user_id)))
+    return;
+
+  const { rows: existingAdmin } = await client.query(
+    `SELECT 1 FROM account_members
+       WHERE account_id = $1 AND user_id = $2 AND role = 'admin' AND status = 'active'
+       LIMIT 1`,
+    [accountId, memberRow.user_id],
+  );
+  if (existingAdmin.length) return;
+
+  const { rows: existingMember } = await client.query(
+    `SELECT 1 FROM account_members
+       WHERE account_id = $1 AND user_id = $2 AND role = 'member_visibility' AND status = 'active'
+       LIMIT 1`,
+    [accountId, memberRow.user_id],
+  );
+  if (existingMember.length) return;
+
+  await client.query(
+    `INSERT INTO account_members (account_id, user_id, role, status)
+     VALUES ($1, $2, 'member_visibility', 'active')
+     ON CONFLICT (account_id, user_id, role)
+     DO UPDATE SET status = 'active', updated_at = NOW()`,
+    [accountId, memberRow.user_id],
+  );
+}
+
+async function syncStaffAccessOnCreate(client, accountId, staffRow) {
+  if (!staffRow?.user_id) return;
+  if (!(await isEligibleForAutoGrant(client, accountId, staffRow.user_id)))
+    return;
+
+  const { rows: existingAdmin } = await client.query(
+    `SELECT 1 FROM account_members
+       WHERE account_id = $1 AND user_id = $2 AND role = 'admin' AND status = 'active'
+       LIMIT 1`,
+    [accountId, staffRow.user_id],
+  );
+  if (existingAdmin.length) return;
+
+  const { rows: existingStaff } = await client.query(
+    `SELECT 1 FROM account_members
+       WHERE account_id = $1 AND user_id = $2 AND role = 'staff_visibility' AND status = 'active'
+       LIMIT 1`,
+    [accountId, staffRow.user_id],
+  );
+  if (existingStaff.length) return;
+
+  await client.query(
+    `INSERT INTO account_members (account_id, user_id, role, status)
+     VALUES ($1, $2, 'staff_visibility', 'active')
+     ON CONFLICT (account_id, user_id, role)
+     DO UPDATE SET status = 'active', updated_at = NOW()`,
+    [accountId, staffRow.user_id],
+  );
+}
+
+// ===========================================================================
+// listAccountPeople
+//
+// Everyone linked to this account, deduped by user_id:
+//   owner, admins, members, staff
+//
+// Row shape: { user_id, name, phone, photo_url, kind }
+// kind ∈ { "owner", "admin", "member", "staff" }
+// ===========================================================================
+
+const listAccountPeople = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
+
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role)
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
+
+    const map = new Map();
+
+    // Owner
+    const { rows: ownerRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+         FROM accounts a
+         JOIN users u ON u.id = a.created_by
+        WHERE a.id = $1`,
+      [accountId],
+    );
+    for (const r of ownerRows) {
+      if (!r.user_id) continue;
+      map.set(r.user_id, {
+        user_id: r.user_id,
+        name: r.name ?? "",
+        phone: r.phone ?? null,
+        photo_url: r.photo_url ?? null,
+        kind: "owner",
+      });
+    }
+
+    // Admins
+    const { rows: adminRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+         FROM account_members am
+         JOIN users u ON u.id = am.user_id
+        WHERE am.account_id = $1
+          AND am.role       = 'admin'
+          AND am.status     = 'active'`,
+      [accountId],
+    );
+    for (const r of adminRows) {
+      if (!r.user_id) continue;
+      if (map.has(r.user_id)) continue;
+      map.set(r.user_id, {
+        user_id: r.user_id,
+        name: r.name ?? "",
+        phone: r.phone ?? null,
+        photo_url: r.photo_url ?? null,
+        kind: "admin",
+      });
+    }
+
+    // Members
+    const { rows: memberRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+         FROM members m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.account_id = $1
+          AND m.status     = 'active'`,
+      [accountId],
+    );
+    for (const r of memberRows) {
+      if (!r.user_id) continue;
+      if (map.has(r.user_id)) continue;
+      map.set(r.user_id, {
+        user_id: r.user_id,
+        name: r.name ?? "",
+        phone: r.phone ?? null,
+        photo_url: r.photo_url ?? null,
+        kind: "member",
+      });
+    }
+
+    // Staff
+    const { rows: staffRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+         FROM staff s
+         JOIN users u ON u.id = s.user_id
+        WHERE s.account_id = $1
+          AND s.status     = 'active'`,
+      [accountId],
+    );
+    for (const r of staffRows) {
+      if (!r.user_id) continue;
+      if (map.has(r.user_id)) continue;
+      map.set(r.user_id, {
+        user_id: r.user_id,
+        name: r.name ?? "",
+        phone: r.phone ?? null,
+        photo_url: r.photo_url ?? null,
+        kind: "staff",
+      });
+    }
+
+    const result = Array.from(map.values()).sort((a, b) =>
+      String(a.name).localeCompare(String(b.name)),
+    );
+
+    return res.json(result);
+  } catch (err) {
+    console.error("listAccountPeople error:", err);
+    return fail(res, 500, "server_error", "Failed to load people");
+  }
+};
+
 // ===========================================================================
 // MEMBERS
 // ===========================================================================
@@ -312,21 +373,30 @@ const listMembers = async (req, res) => {
     const userId = getUserId(req);
     const { accountId } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const month = normalizeMonth(req.query?.month);
 
     const { rows } = await pool.query(
-      `SELECT id, account_id, name, phone, role, photo_url,
-              wing, flat_number, area_sqft, parking_available,
-              maintenance_amount, status, created_by, created_at, updated_at
-         FROM members
-        WHERE account_id = $1
-        ORDER BY flat_number, name`,
-      [accountId]
+      `SELECT m.id, m.account_id, m.user_id, m.role,
+              m.wing, m.flat_number, m.area_sqft, m.parking_available,
+              m.maintenance_amount, m.status, m.created_by,
+              m.created_at, m.updated_at,
+              u.name, u.phone, u.photo_url
+         FROM members m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.account_id = $1
+        ORDER BY m.flat_number, u.name`,
+      [accountId],
     );
 
     const { rows: payRows } = await pool.query(
@@ -337,24 +407,15 @@ const listMembers = async (req, res) => {
          JOIN members m ON m.id = mmp.member_id
         WHERE m.account_id = $1
           AND mmp.month = $2`,
-      [accountId, month]
+      [accountId, month],
     );
 
     const paymentByMember = new Map();
     for (const p of payRows) paymentByMember.set(p.member_id, p);
 
-    const result = rows.map((m) => {
-      const payment = paymentByMember.get(m.id) ?? null;
-      const dueAmount = computeMemberDue(m, payment);
-      return {
-        ...m,
-        due_amount: dueAmount,
-        due_month: month,
-        monthly_payments: payment
-          ? { [payment.month]: mapMemberPaymentRow(payment) }
-          : {},
-      };
-    });
+    const result = rows.map((m) =>
+      shapeMemberRow(m, paymentByMember.get(m.id) ?? null),
+    );
 
     if (role === "owner" || role === "admin") return res.json(result);
 
@@ -362,7 +423,7 @@ const listMembers = async (req, res) => {
     const { rows: allowed } = await pool.query(
       `SELECT member_id FROM member_phone_visibility
         WHERE account_id = $1 AND viewer_user_id = $2`,
-      [accountId, userId]
+      [accountId, userId],
     );
     const allowedMemberIds = new Set(allowed.map((r) => r.member_id));
 
@@ -385,24 +446,33 @@ const getMember = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const { rows } = await pool.query(
-      `SELECT id, account_id, name, phone, role, photo_url,
-              wing, flat_number, area_sqft, parking_available,
-              maintenance_amount, status, created_by, created_at, updated_at
-         FROM members
-        WHERE id = $1
-          AND account_id = $2
-          AND status = 'active'`,
-      [id, accountId]
+      `SELECT m.id, m.account_id, m.user_id, m.role,
+              m.wing, m.flat_number, m.area_sqft, m.parking_available,
+              m.maintenance_amount, m.status, m.created_by,
+              m.created_at, m.updated_at,
+              u.name, u.phone, u.photo_url
+         FROM members m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.id = $1
+          AND m.account_id = $2
+          AND m.status = 'active'`,
+      [id, accountId],
     );
 
     if (!rows.length) return fail(res, 404, "not_found", "Member not found");
-    const member = rows[0];
+    const member = shapeMemberRow(rows[0], null);
 
     if (role === "owner" || role === "admin") return res.json(member);
 
@@ -414,10 +484,10 @@ const getMember = async (req, res) => {
     const { rows: allowed } = await pool.query(
       `SELECT 1 FROM member_phone_visibility
         WHERE member_id = $1 AND viewer_user_id = $2 LIMIT 1`,
-      [member.id, userId]
+      [member.id, userId],
     );
-
     if (allowed.length) return res.json(member);
+
     return res.json({ ...member, phone: null });
   } catch (err) {
     console.error("getMember error:", err);
@@ -431,106 +501,117 @@ const createMember = async (req, res) => {
     const userId = getUserId(req);
     const { accountId } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can add members");
     }
 
+    const body = req.body || {};
+    const mode = body.mode === "existing" ? "existing" : "new";
+
     const {
-      name,
-      phone = null,
       role: memberRole = "owner",
-      photo_url = null,
       wing = null,
       flat_number,
       area_sqft = null,
       parking_available = false,
       maintenance_amount = 0,
-      confirm_rename = false,
-    } = req.body;
+    } = body;
 
-    if (!name || !flat_number) {
-      return fail(res, 400, "invalid_input", "Name and flat number are required");
+    if (!flat_number) {
+      return fail(res, 400, "invalid_input", "Flat number is required");
     }
 
-    const validRoles = ["owner", "secretary", "tenant", "custom"];
+    const validRoles = ["owner", "manager", "custom"];
     if (!validRoles.includes(memberRole)) {
       return fail(res, 400, "invalid_role", "Invalid member role");
     }
 
-    const trimmedName = name.trim();
-    const ten = normalizePhone(phone);
-
     await client.query("BEGIN");
 
-    // ── Name-conflict check ──
-    if (ten) {
-      const existingName = await findExistingNameForPhone(
-        client,
-        accountId,
-        ten,
-        "member", // exclude members? no — we want to include them; the
-                  // "excludeKind" is meant to skip the same table only when
-                  // we are checking from within an edit of that row. For
-                  // create, no row exists yet, so we do not exclude.
-        null
-      );
+    let targetUserId = null;
 
-      if (existingName && existingName !== trimmedName && !confirm_rename) {
+    if (mode === "existing") {
+      targetUserId = body.user_id || null;
+      if (!targetUserId) {
         await client.query("ROLLBACK");
-        return res.status(409).json({
-          code: "name_conflict",
-          existing_name: existingName,
-          phone: ten,
-        });
+        return fail(res, 400, "invalid_input", "user_id is required for mode=existing");
+      }
+      const { rows: u } = await client.query(
+        `SELECT id FROM users WHERE id = $1 LIMIT 1`,
+        [targetUserId],
+      );
+      if (!u.length) {
+        await client.query("ROLLBACK");
+        return fail(res, 404, "not_found", "Person not found");
+      }
+    } else {
+      const name = (body.name || "").trim();
+      const phone = normalizePhone(body.phone);
+      const photo_url = body.photo_url ?? null;
+
+      if (!name) {
+        await client.query("ROLLBACK");
+        return fail(res, 400, "invalid_input", "Name is required");
+      }
+      if (!phone) {
+        await client.query("ROLLBACK");
+        return fail(res, 400, "invalid_input", "A valid 10-digit phone is required");
       }
 
-      if (existingName && existingName !== trimmedName && confirm_rename) {
-        await renameAllOccurrencesForPhone(
-          client,
-          accountId,
-          ten,
-          trimmedName
+      targetUserId = await ensureUserForPhone(client, phone, name);
+
+      if (photo_url !== null && photo_url !== undefined) {
+        await client.query(
+          `UPDATE users
+              SET photo_url = COALESCE(photo_url, $1), updated_at = NOW()
+            WHERE id = $2`,
+          [photo_url, targetUserId],
         );
       }
     }
 
     const { rows } = await client.query(
       `INSERT INTO members
-         (account_id, name, phone, role, photo_url, wing, flat_number,
-          area_sqft, parking_available, maintenance_amount, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',$11)
-       RETURNING *`,
+         (account_id, user_id, role, wing, flat_number,
+          area_sqft, parking_available, maintenance_amount,
+          status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)
+       RETURNING id`,
       [
         accountId,
-        trimmedName,
-        phone,
+        targetUserId,
         memberRole,
-        photo_url,
         wing,
         flat_number,
         area_sqft,
         parking_available,
         maintenance_amount,
         userId,
-      ]
+      ],
     );
 
-    const created = rows[0];
+    const memberId = rows[0].id;
 
-    await syncMemberAccessOnCreate(client, accountId, created);
+    const { rows: joined } = await client.query(
+      `SELECT m.id, m.account_id, m.user_id, m.role,
+              m.wing, m.flat_number, m.area_sqft, m.parking_available,
+              m.maintenance_amount, m.status, m.created_by,
+              m.created_at, m.updated_at,
+              u.name, u.phone, u.photo_url
+         FROM members m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.id = $1`,
+      [memberId],
+    );
+
+    await syncMemberAccessOnCreate(client, accountId, joined[0]);
 
     await client.query("COMMIT");
 
-    const month = normalizeMonth(req.query?.month);
-
-    return res.status(201).json({
-      ...created,
-      due_amount: computeMemberDue(created, null),
-      due_month: month,
-      monthly_payments: {},
-    });
+    return res.status(201).json(shapeMemberRow(joined[0], null));
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("createMember error:", err);
@@ -546,35 +627,36 @@ const updateMember = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const { rows } = await client.query(
-      `SELECT * FROM members
+      `SELECT id FROM members
         WHERE id = $1 AND account_id = $2 AND status = 'active'`,
-      [id, accountId]
+      [id, accountId],
     );
     if (!rows.length) return fail(res, 404, "not_found", "Member not found");
-    const existing = rows[0];
 
-    let allowedFields;
-    if (role === "owner" || role === "admin") {
-      allowedFields = [
-        "name","phone","role","photo_url","wing","flat_number",
-        "area_sqft","parking_available","maintenance_amount","confirm_rename",
-      ];
-    } else if (role === "member") {
-      const phone = getUserPhone(req);
-      const existingPhone = (existing.phone || "").replace(/\D/g, "").slice(-10);
-      if (!phone || phone !== existingPhone) {
-        return fail(res, 403, "forbidden", "You can only edit your own record");
-      }
-      allowedFields = ["name", "phone", "photo_url", "confirm_rename"];
-    } else {
-      return fail(res, 403, "forbidden", "You do not have access to this record");
+    if (role !== "owner" && role !== "admin") {
+      return fail(res, 403, "forbidden", "Only owners and admins can edit members");
     }
+
+    const allowedFields = [
+      "role",
+      "wing",
+      "flat_number",
+      "area_sqft",
+      "parking_available",
+      "maintenance_amount",
+    ];
 
     const updates = {};
     for (const key of allowedFields) {
@@ -586,47 +668,6 @@ const updateMember = async (req, res) => {
       return fail(res, 400, "invalid_input", "No permitted fields to update");
     }
 
-    const confirmRename = updates.confirm_rename === true;
-    delete updates.confirm_rename;
-
-    await client.query("BEGIN");
-
-    // ── Name-conflict check: only when name or phone is being changed ──
-    const newPhone = updates.phone !== undefined ? normalizePhone(updates.phone) : normalizePhone(existing.phone);
-    const newName = updates.name !== undefined ? String(updates.name).trim() : existing.name;
-
-    if ((updates.phone !== undefined || updates.name !== undefined) && newPhone) {
-      const conflictingName = await findExistingNameForPhone(
-        client,
-        accountId,
-        newPhone,
-        "member",
-        id
-      );
-
-      if (
-        conflictingName &&
-        conflictingName !== newName &&
-        !confirmRename
-      ) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({
-          code: "name_conflict",
-          existing_name: conflictingName,
-          phone: newPhone,
-        });
-      }
-
-      if (conflictingName && conflictingName !== newName && confirmRename) {
-        await renameAllOccurrencesForPhone(
-          client,
-          accountId,
-          newPhone,
-          newName
-        );
-      }
-    }
-
     const keys = Object.keys(updates);
     const values = keys.map((k) => updates[k]);
     const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
@@ -636,16 +677,24 @@ const updateMember = async (req, res) => {
           SET ${setClause}, updated_at = NOW()
         WHERE id = $${keys.length + 1}
           AND account_id = $${keys.length + 2}
-        RETURNING *`,
-      [...values, id, accountId]
+        RETURNING id`,
+      [...values, id, accountId],
     );
 
-    if (Object.prototype.hasOwnProperty.call(updates, "phone")) {
-      await syncMemberAccessOnCreate(client, accountId, updated.rows[0]);
-    }
+    const { rows: joined } = await client.query(
+      `SELECT m.id, m.account_id, m.user_id, m.role,
+              m.wing, m.flat_number, m.area_sqft, m.parking_available,
+              m.maintenance_amount, m.status, m.created_by,
+              m.created_at, m.updated_at,
+              u.name, u.phone, u.photo_url
+         FROM members m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.id = $1`,
+      [updated.rows[0].id],
+    );
 
     await client.query("COMMIT");
-    return res.json(updated.rows[0]);
+    return res.json(shapeMemberRow(joined[0], null));
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("updateMember error:", err);
@@ -661,7 +710,8 @@ const deleteMember = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can delete members");
@@ -672,11 +722,9 @@ const deleteMember = async (req, res) => {
     const updated = await client.query(
       `UPDATE members
           SET status = 'inactive', updated_at = NOW()
-        WHERE id = $1
-          AND account_id = $2
-          AND status = 'active'
-        RETURNING phone`,
-      [id, accountId]
+        WHERE id = $1 AND account_id = $2 AND status = 'active'
+        RETURNING user_id`,
+      [id, accountId],
     );
 
     if (updated.rowCount === 0) {
@@ -684,15 +732,30 @@ const deleteMember = async (req, res) => {
       return fail(res, 404, "not_found", "Member not found");
     }
 
-    const phone = updated.rows[0]?.phone;
-    const targetUserId = await findUserIdByPhone(client, phone);
+    const targetUserId = updated.rows[0]?.user_id;
+
     if (targetUserId) {
-      await deactivateAccessRole(
-        client,
-        accountId,
-        targetUserId,
-        "member_visibility"
+      const { rows: stillMember } = await client.query(
+        `SELECT 1 FROM members WHERE account_id = $1 AND user_id = $2 AND status = 'active' LIMIT 1`,
+        [accountId, targetUserId],
       );
+      if (!stillMember.length) {
+        const { rows: stillStaff } = await client.query(
+          `SELECT 1 FROM staff WHERE account_id = $1 AND user_id = $2 AND status = 'active' LIMIT 1`,
+          [accountId, targetUserId],
+        );
+        if (!stillStaff.length) {
+          const { rows: isAdmin } = await client.query(
+            `SELECT 1 FROM account_members
+              WHERE account_id = $1 AND user_id = $2 AND role = 'admin' AND status = 'active'
+              LIMIT 1`,
+            [accountId, targetUserId],
+          );
+          if (!isAdmin.length) {
+            await deactivateAccessRole(client, accountId, targetUserId, "member_visibility");
+          }
+        }
+      }
     }
 
     await client.query("COMMIT");
@@ -706,24 +769,28 @@ const deleteMember = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// MEMBER PHONE VISIBILITY
-// ===========================================================================
-
 const getPhoneVisibility = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId, id: memberId } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const { rows: memberRows } = await pool.query(
-      `SELECT id, name, phone FROM members
-        WHERE id = $1 AND account_id = $2 AND status = 'active'`,
-      [memberId, accountId]
+      `SELECT m.id, u.phone, u.id AS user_id
+         FROM members m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.id = $1 AND m.account_id = $2 AND m.status = 'active'`,
+      [memberId, accountId],
     );
     if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
 
@@ -740,8 +807,9 @@ const getPhoneVisibility = async (req, res) => {
       `SELECT
           u.id            AS user_id,
           u.phone         AS user_phone,
+          u.name          AS user_name,
+          u.photo_url     AS user_photo_url,
           am.role         AS role,
-          COALESCE(m.name, s.name, '') AS name,
           CASE
             WHEN m.id IS NOT NULL THEN 'member'
             WHEN s.id IS NOT NULL THEN 'staff'
@@ -752,52 +820,45 @@ const getPhoneVisibility = async (req, res) => {
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          LEFT JOIN members m
-           ON m.account_id = am.account_id
+           ON m.user_id = u.id
+          AND m.account_id = am.account_id
           AND m.status = 'active'
-          AND RIGHT(REGEXP_REPLACE(m.phone,'\\D','','g'),10)
-              = RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10)
          LEFT JOIN staff s
-           ON s.account_id = am.account_id
+           ON s.user_id = u.id
+          AND s.account_id = am.account_id
           AND s.status = 'active'
-          AND RIGHT(REGEXP_REPLACE(s.phone,'\\D','','g'),10)
-              = RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10)
         WHERE am.account_id = $1
           AND am.status = 'active'
-          AND RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10) <> $2
+          AND u.id <> $2
         ORDER BY
           CASE am.role
-            WHEN 'owner' THEN 1
-            WHEN 'admin' THEN 2
-            WHEN 'member' THEN 3
-            WHEN 'staff' THEN 4
-            ELSE 5
+            WHEN 'admin' THEN 1
+            WHEN 'member_visibility' THEN 2
+            WHEN 'staff_visibility' THEN 3
+            ELSE 4
           END,
-          COALESCE(m.name, s.name, '')`,
-      [accountId, targetPhone]
+          COALESCE(u.name, '')`,
+      [accountId, targetMember.user_id],
     );
 
     const { rows: existing } = await pool.query(
       `SELECT viewer_user_id FROM member_phone_visibility WHERE member_id = $1`,
-      [memberId]
+      [memberId],
     );
     const allowedSet = new Set(existing.map((r) => r.viewer_user_id));
 
     const result = people.map((p) => {
-      const isOwnerOrAdmin = p.role === "owner" || p.role === "admin";
+      const isAdmin = p.role === "admin";
       return {
         user_id: p.user_id,
-        name: p.name || "(unnamed)",
+        name: p.user_name || "(unnamed)",
         role: p.role,
         person_type: p.person_type,
         member_id: p.member_id,
         staff_id: p.staff_id,
-        enabled: isOwnerOrAdmin ? true : allowedSet.has(p.user_id),
-        locked: isOwnerOrAdmin,
-        note: isOwnerOrAdmin
-          ? p.role === "owner"
-            ? "Owner can view by default"
-            : "Admin can view by default"
-          : null,
+        enabled: isAdmin ? true : allowedSet.has(p.user_id),
+        locked: isAdmin,
+        note: isAdmin ? "Admin can view by default" : null,
       };
     });
 
@@ -815,19 +876,27 @@ const updatePhoneVisibility = async (req, res) => {
     const { accountId, id: memberId } = req.params;
     const { viewer_user_ids } = req.body;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     if (!Array.isArray(viewer_user_ids)) {
       return fail(res, 400, "invalid_input", "viewer_user_ids must be an array");
     }
 
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const { rows: memberRows } = await client.query(
-      `SELECT id, phone FROM members
-        WHERE id = $1 AND account_id = $2 AND status = 'active'`,
-      [memberId, accountId]
+      `SELECT m.id, u.phone
+         FROM members m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.id = $1 AND m.account_id = $2 AND m.status = 'active'`,
+      [memberId, accountId],
     );
     if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
 
@@ -840,11 +909,9 @@ const updatePhoneVisibility = async (req, res) => {
     }
 
     await client.query("BEGIN");
-
-    await client.query(
-      `DELETE FROM member_phone_visibility WHERE member_id = $1`,
-      [memberId]
-    );
+    await client.query(`DELETE FROM member_phone_visibility WHERE member_id = $1`, [
+      memberId,
+    ]);
 
     if (viewer_user_ids.length > 0) {
       await client.query(
@@ -857,7 +924,7 @@ const updatePhoneVisibility = async (req, res) => {
             AND am.account_id = $1
             AND am.status = 'active'
           WHERE u.id = ANY($3::uuid[])`,
-        [accountId, memberId, viewer_user_ids]
+        [accountId, memberId, viewer_user_ids],
       );
     }
 
@@ -872,29 +939,34 @@ const updatePhoneVisibility = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// STAFF
-// ===========================================================================
-
 const listStaff = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const month = normalizeMonth(req.query?.month);
 
     const { rows } = await pool.query(
-      `SELECT id, account_id, name, phone, role, photo_url,
-              monthly_salary, status, created_by, created_at, updated_at
-         FROM staff
-        WHERE account_id = $1
-        ORDER BY name`,
-      [accountId]
+      `SELECT s.id, s.account_id, s.user_id, s.role,
+              s.monthly_salary, s.status, s.created_by,
+              s.created_at, s.updated_at,
+              u.name, u.phone, u.photo_url
+         FROM staff s
+         JOIN users u ON u.id = s.user_id
+        WHERE s.account_id = $1
+        ORDER BY u.name`,
+      [accountId],
     );
 
     const { rows: payRows } = await pool.query(
@@ -905,7 +977,7 @@ const listStaff = async (req, res) => {
          JOIN staff s ON s.id = smp.staff_id
         WHERE s.account_id = $1
           AND smp.month = $2`,
-      [accountId, month]
+      [accountId, month],
     );
     const paymentByStaff = new Map();
     for (const p of payRows) paymentByStaff.set(p.staff_id, p);
@@ -917,35 +989,18 @@ const listStaff = async (req, res) => {
          JOIN staff s ON s.id = sa.staff_id
         WHERE s.account_id = $1
           AND sa.month = $2`,
-      [accountId, month]
+      [accountId, month],
     );
     const attendanceByStaff = new Map();
     for (const a of attRows) attendanceByStaff.set(a.staff_id, a);
 
-    const result = rows.map((s) => {
-      const attendance = attendanceByStaff.get(s.id) ?? null;
-      const payment = paymentByStaff.get(s.id) ?? null;
-      const dueAmount = computeStaffDue(s, attendance, payment);
-
-      return {
-        ...s,
-        due_amount: dueAmount,
-        due_month: month,
-        monthly_payments: payment
-          ? { [payment.month]: mapStaffPaymentRow(payment) }
-          : {},
-        attendance_for_month: attendance
-          ? {
-              statuses: attendance.statuses,
-              paidDays: attendance.paid_days,
-              calculatedSalary:
-                attendance.calculated_salary != null
-                  ? Number(attendance.calculated_salary)
-                  : null,
-            }
-          : null,
-      };
-    });
+    const result = rows.map((s) =>
+      shapeStaffRow(
+        s,
+        paymentByStaff.get(s.id) ?? null,
+        attendanceByStaff.get(s.id) ?? null,
+      ),
+    );
 
     return res.json(result);
   } catch (err) {
@@ -959,23 +1014,32 @@ const getStaff = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const { rows } = await pool.query(
-      `SELECT id, account_id, name, phone, role, photo_url,
-              monthly_salary, status, created_by, created_at, updated_at
-         FROM staff
-        WHERE id = $1
-          AND account_id = $2
-          AND status = 'active'`,
-      [id, accountId]
+      `SELECT s.id, s.account_id, s.user_id, s.role,
+              s.monthly_salary, s.status, s.created_by,
+              s.created_at, s.updated_at,
+              u.name, u.phone, u.photo_url
+         FROM staff s
+         JOIN users u ON u.id = s.user_id
+        WHERE s.id = $1
+          AND s.account_id = $2
+          AND s.status = 'active'`,
+      [id, accountId],
     );
 
     if (!rows.length) return fail(res, 404, "not_found", "Staff not found");
-    return res.json(rows[0]);
+    return res.json(shapeStaffRow(rows[0], null, null));
   } catch (err) {
     console.error("getStaff error:", err);
     return fail(res, 500, "server_error", "Failed to load staff");
@@ -988,89 +1052,104 @@ const createStaff = async (req, res) => {
     const userId = getUserId(req);
     const { accountId } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can add staff");
     }
 
-    const {
-      name,
-      phone = null,
-      role: staffRole,
-      photo_url = null,
-      monthly_salary = 0,
-      confirm_rename = false,
-    } = req.body;
+    const body = req.body || {};
+    const mode = body.mode === "existing" ? "existing" : "new";
 
-    if (!name || !staffRole) {
-      return fail(res, 400, "invalid_input", "Name and role are required");
+    const { role: staffRole, monthly_salary = 0 } = body;
+
+    if (!staffRole) {
+      return fail(res, 400, "invalid_input", "Role is required");
     }
 
     const validRoles = [
-      "sweeper","security","maintenance","gardener","driver","custom",
+      "sweeper",
+      "security",
+      "maintenance",
+      "gardener",
+      "driver",
+      "custom",
     ];
     if (!validRoles.includes(staffRole)) {
       return fail(res, 400, "invalid_role", "Invalid staff role");
     }
 
-    const trimmedName = name.trim();
-    const ten = normalizePhone(phone);
-
     await client.query("BEGIN");
 
-    // ── Name-conflict check ──
-    if (ten) {
-      const existingName = await findExistingNameForPhone(
-        client,
-        accountId,
-        ten,
-        null,
-        null
-      );
+    let targetUserId = null;
 
-      if (existingName && existingName !== trimmedName && !confirm_rename) {
+    if (mode === "existing") {
+      targetUserId = body.user_id || null;
+      if (!targetUserId) {
         await client.query("ROLLBACK");
-        return res.status(409).json({
-          code: "name_conflict",
-          existing_name: existingName,
-          phone: ten,
-        });
+        return fail(res, 400, "invalid_input", "user_id is required for mode=existing");
+      }
+      const { rows: u } = await client.query(
+        `SELECT id FROM users WHERE id = $1 LIMIT 1`,
+        [targetUserId],
+      );
+      if (!u.length) {
+        await client.query("ROLLBACK");
+        return fail(res, 404, "not_found", "Person not found");
+      }
+    } else {
+      const name = (body.name || "").trim();
+      const phone = normalizePhone(body.phone);
+      const photo_url = body.photo_url ?? null;
+
+      if (!name) {
+        await client.query("ROLLBACK");
+        return fail(res, 400, "invalid_input", "Name is required");
+      }
+      if (!phone) {
+        await client.query("ROLLBACK");
+        return fail(res, 400, "invalid_input", "A valid 10-digit phone is required");
       }
 
-      if (existingName && existingName !== trimmedName && confirm_rename) {
-        await renameAllOccurrencesForPhone(
-          client,
-          accountId,
-          ten,
-          trimmedName
+      targetUserId = await ensureUserForPhone(client, phone, name);
+
+      if (photo_url !== null && photo_url !== undefined) {
+        await client.query(
+          `UPDATE users
+              SET photo_url = COALESCE(photo_url, $1), updated_at = NOW()
+            WHERE id = $2`,
+          [photo_url, targetUserId],
         );
       }
     }
 
     const { rows } = await client.query(
       `INSERT INTO staff
-         (account_id, name, phone, role, photo_url, monthly_salary, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,'active',$7)
-       RETURNING *`,
-      [accountId, trimmedName, phone, staffRole, photo_url, monthly_salary, userId]
+         (account_id, user_id, role, monthly_salary, status, created_by)
+       VALUES ($1,$2,$3,$4,'active',$5)
+       RETURNING id`,
+      [accountId, targetUserId, staffRole, monthly_salary, userId],
     );
 
-    const created = rows[0];
+    const staffId = rows[0].id;
 
-    await syncStaffAccessOnCreate(client, accountId, created);
+    const { rows: joined } = await client.query(
+      `SELECT s.id, s.account_id, s.user_id, s.role,
+              s.monthly_salary, s.status, s.created_by,
+              s.created_at, s.updated_at,
+              u.name, u.phone, u.photo_url
+         FROM staff s
+         JOIN users u ON u.id = s.user_id
+        WHERE s.id = $1`,
+      [staffId],
+    );
+
+    await syncStaffAccessOnCreate(client, accountId, joined[0]);
 
     await client.query("COMMIT");
 
-    const month = normalizeMonth(req.query?.month);
-
-    return res.status(201).json({
-      ...created,
-      due_amount: computeStaffDue(created, null, null),
-      due_month: month,
-      monthly_payments: {},
-      attendance_for_month: null,
-    });
+    return res.status(201).json(shapeStaffRow(joined[0], null, null));
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("createStaff error:", err);
@@ -1086,34 +1165,29 @@ const updateStaff = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const { rows } = await client.query(
-      `SELECT * FROM staff
+      `SELECT id FROM staff
         WHERE id = $1 AND account_id = $2 AND status = 'active'`,
-      [id, accountId]
+      [id, accountId],
     );
     if (!rows.length) return fail(res, 404, "not_found", "Staff not found");
-    const existing = rows[0];
 
-    let allowedFields;
-    if (role === "owner" || role === "admin") {
-      allowedFields = [
-        "name","phone","role","photo_url","monthly_salary","confirm_rename",
-      ];
-    } else if (role === "staff") {
-      const phone = getUserPhone(req);
-      const existingPhone = (existing.phone || "").replace(/\D/g, "").slice(-10);
-      if (!phone || phone !== existingPhone) {
-        return fail(res, 403, "forbidden", "You can only edit your own record");
-      }
-      allowedFields = ["name", "phone", "photo_url", "confirm_rename"];
-    } else {
-      return fail(res, 403, "forbidden", "You do not have access to this record");
+    if (role !== "owner" && role !== "admin") {
+      return fail(res, 403, "forbidden", "Only owners and admins can edit staff");
     }
+
+    const allowedFields = ["role", "monthly_salary"];
 
     const updates = {};
     for (const key of allowedFields) {
@@ -1125,46 +1199,6 @@ const updateStaff = async (req, res) => {
       return fail(res, 400, "invalid_input", "No permitted fields to update");
     }
 
-    const confirmRename = updates.confirm_rename === true;
-    delete updates.confirm_rename;
-
-    await client.query("BEGIN");
-
-    const newPhone = updates.phone !== undefined ? normalizePhone(updates.phone) : normalizePhone(existing.phone);
-    const newName = updates.name !== undefined ? String(updates.name).trim() : existing.name;
-
-    if ((updates.phone !== undefined || updates.name !== undefined) && newPhone) {
-      const conflictingName = await findExistingNameForPhone(
-        client,
-        accountId,
-        newPhone,
-        "staff",
-        id
-      );
-
-      if (
-        conflictingName &&
-        conflictingName !== newName &&
-        !confirmRename
-      ) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({
-          code: "name_conflict",
-          existing_name: conflictingName,
-          phone: newPhone,
-        });
-      }
-
-      if (conflictingName && conflictingName !== newName && confirmRename) {
-        await renameAllOccurrencesForPhone(
-          client,
-          accountId,
-          newPhone,
-          newName
-        );
-      }
-    }
-
     const keys = Object.keys(updates);
     const values = keys.map((k) => updates[k]);
     const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
@@ -1174,16 +1208,23 @@ const updateStaff = async (req, res) => {
           SET ${setClause}, updated_at = NOW()
         WHERE id = $${keys.length + 1}
           AND account_id = $${keys.length + 2}
-        RETURNING *`,
-      [...values, id, accountId]
+        RETURNING id`,
+      [...values, id, accountId],
     );
 
-    if (Object.prototype.hasOwnProperty.call(updates, "phone")) {
-      await syncStaffAccessOnCreate(client, accountId, updated.rows[0]);
-    }
+    const { rows: joined } = await client.query(
+      `SELECT s.id, s.account_id, s.user_id, s.role,
+              s.monthly_salary, s.status, s.created_by,
+              s.created_at, s.updated_at,
+              u.name, u.phone, u.photo_url
+         FROM staff s
+         JOIN users u ON u.id = s.user_id
+        WHERE s.id = $1`,
+      [updated.rows[0].id],
+    );
 
     await client.query("COMMIT");
-    return res.json(updated.rows[0]);
+    return res.json(shapeStaffRow(joined[0], null, null));
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("updateStaff error:", err);
@@ -1199,7 +1240,8 @@ const deleteStaff = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can delete staff");
@@ -1210,11 +1252,9 @@ const deleteStaff = async (req, res) => {
     const updated = await client.query(
       `UPDATE staff
           SET status = 'inactive', updated_at = NOW()
-        WHERE id = $1
-          AND account_id = $2
-          AND status = 'active'
-        RETURNING phone`,
-      [id, accountId]
+        WHERE id = $1 AND account_id = $2 AND status = 'active'
+        RETURNING user_id`,
+      [id, accountId],
     );
 
     if (updated.rowCount === 0) {
@@ -1222,15 +1262,30 @@ const deleteStaff = async (req, res) => {
       return fail(res, 404, "not_found", "Staff not found");
     }
 
-    const phone = updated.rows[0]?.phone;
-    const targetUserId = await findUserIdByPhone(client, phone);
+    const targetUserId = updated.rows[0]?.user_id;
+
     if (targetUserId) {
-      await deactivateAccessRole(
-        client,
-        accountId,
-        targetUserId,
-        "staff_visibility"
+      const { rows: stillStaff } = await client.query(
+        `SELECT 1 FROM staff WHERE account_id = $1 AND user_id = $2 AND status = 'active' LIMIT 1`,
+        [accountId, targetUserId],
       );
+      if (!stillStaff.length) {
+        const { rows: stillMember } = await client.query(
+          `SELECT 1 FROM members WHERE account_id = $1 AND user_id = $2 AND status = 'active' LIMIT 1`,
+          [accountId, targetUserId],
+        );
+        if (!stillMember.length) {
+          const { rows: isAdmin } = await client.query(
+            `SELECT 1 FROM account_members
+              WHERE account_id = $1 AND user_id = $2 AND role = 'admin' AND status = 'active'
+              LIMIT 1`,
+            [accountId, targetUserId],
+          );
+          if (!isAdmin.length) {
+            await deactivateAccessRole(client, accountId, targetUserId, "staff_visibility");
+          }
+        }
+      }
     }
 
     await client.query("COMMIT");
@@ -1244,31 +1299,31 @@ const deleteStaff = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// STAFF ATTENDANCE
-// ===========================================================================
-
 const getStaffAttendance = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId, id: staffId, month } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
     }
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const { rows } = await pool.query(
       `SELECT staff_id, month, statuses, paid_days,
               calculated_salary, updated_at
          FROM staff_attendance
-        WHERE staff_id = $1
-          AND account_id = $2
-          AND month = $3`,
-      [staffId, accountId, month]
+        WHERE staff_id = $1 AND account_id = $2 AND month = $3`,
+      [staffId, accountId, month],
     );
 
     if (!rows.length) return res.json(null);
@@ -1284,9 +1339,11 @@ const upsertStaffAttendance = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId, id: staffId, month } = req.params;
-    const { statuses, calculated_salary: calculatedSalaryOverride } = req.body || {};
+    const { statuses, calculated_salary: calculatedSalaryOverride } =
+      req.body || {};
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     if (!/^\d{4}-\d{2}$/.test(month)) {
       return fail(res, 400, "invalid_input", "Month must be in YYYY-MM format");
     }
@@ -1312,7 +1369,7 @@ const upsertStaffAttendance = async (req, res) => {
     const { rows: staffRows } = await client.query(
       `SELECT id, monthly_salary FROM staff
         WHERE id = $1 AND account_id = $2 AND status = 'active'`,
-      [staffId, accountId]
+      [staffId, accountId],
     );
     if (!staffRows.length) return fail(res, 404, "not_found", "Staff not found");
 
@@ -1335,7 +1392,10 @@ const upsertStaffAttendance = async (req, res) => {
       totalDays > 0 ? Math.round((baseSalary / totalDays) * paidDays) : 0;
 
     let calculatedSalary = autoCalculated;
-    if (calculatedSalaryOverride !== undefined && calculatedSalaryOverride !== null) {
+    if (
+      calculatedSalaryOverride !== undefined &&
+      calculatedSalaryOverride !== null
+    ) {
       const n = Number(calculatedSalaryOverride);
       if (Number.isFinite(n) && n >= 0) calculatedSalary = Math.round(n);
     }
@@ -1352,7 +1412,15 @@ const upsertStaffAttendance = async (req, res) => {
          calculated_salary = EXCLUDED.calculated_salary,
          updated_at        = NOW()
        RETURNING *`,
-      [accountId, staffId, month, JSON.stringify(statuses), paidDays, calculatedSalary, userId]
+      [
+        accountId,
+        staffId,
+        month,
+        JSON.stringify(statuses),
+        paidDays,
+        calculatedSalary,
+        userId,
+      ],
     );
 
     await client.query("COMMIT");
@@ -1363,17 +1431,21 @@ const upsertStaffAttendance = async (req, res) => {
       `SELECT additional_amount, deduction_amount
          FROM staff_monthly_payments
         WHERE staff_id = $1 AND month = $2`,
-      [staffId, month]
+      [staffId, month],
     );
     const paymentRow = payRows[0] ?? null;
 
     const dueAmount = computeStaffDue(
       { monthly_salary: baseSalary },
       attendanceRow,
-      paymentRow
+      paymentRow,
     );
 
-    return res.json({ ...attendanceRow, due_amount: dueAmount, due_month: month });
+    return res.json({
+      ...attendanceRow,
+      due_amount: dueAmount,
+      due_month: month,
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("upsertStaffAttendance error:", err);
@@ -1382,10 +1454,6 @@ const upsertStaffAttendance = async (req, res) => {
     client.release();
   }
 };
-
-// ===========================================================================
-// PAYMENTS
-// ===========================================================================
 
 const upsertMemberPayment = async (req, res) => {
   const client = await pool.connect();
@@ -1400,7 +1468,8 @@ const upsertMemberPayment = async (req, res) => {
     }
     const month = rawMonth;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can update payments");
@@ -1409,7 +1478,7 @@ const upsertMemberPayment = async (req, res) => {
     const { rows: memberRows } = await client.query(
       `SELECT id, maintenance_amount FROM members
         WHERE id = $1 AND account_id = $2 AND status = 'active'`,
-      [memberId, accountId]
+      [memberId, accountId],
     );
     if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
 
@@ -1437,7 +1506,10 @@ const upsertMemberPayment = async (req, res) => {
 
     const additionalNumber = additionalAmount ?? 0;
     const deductionNumber = deductionAmount ?? 0;
-    const netAmount = Math.max(0, baseAmount + additionalNumber - deductionNumber);
+    const netAmount = Math.max(
+      0,
+      baseAmount + additionalNumber - deductionNumber,
+    );
 
     await client.query("BEGIN");
 
@@ -1457,7 +1529,17 @@ const upsertMemberPayment = async (req, res) => {
          net_amount        = EXCLUDED.net_amount,
          updated_at        = NOW()
        RETURNING *`,
-      [memberId, month, status, paidDate, additionalAmount, additionalNote, deductionAmount, deductionNote, netAmount]
+      [
+        memberId,
+        month,
+        status,
+        paidDate,
+        additionalAmount,
+        additionalNote,
+        deductionAmount,
+        deductionNote,
+        netAmount,
+      ],
     );
 
     await client.query("COMMIT");
@@ -1465,7 +1547,11 @@ const upsertMemberPayment = async (req, res) => {
     const paymentRow = rows[0];
     const dueAmount = computeMemberDue(memberRows[0], paymentRow);
 
-    return res.json({ ...paymentRow, due_amount: dueAmount, due_month: month });
+    return res.json({
+      ...paymentRow,
+      due_amount: dueAmount,
+      due_month: month,
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("upsertMemberPayment error:", err);
@@ -1488,7 +1574,8 @@ const upsertStaffPayment = async (req, res) => {
     }
     const month = rawMonth;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can update payments");
@@ -1497,7 +1584,7 @@ const upsertStaffPayment = async (req, res) => {
     const { rows: staffRows } = await client.query(
       `SELECT id, monthly_salary FROM staff
         WHERE id = $1 AND account_id = $2 AND status = 'active'`,
-      [staffId, accountId]
+      [staffId, accountId],
     );
     if (!staffRows.length) return fail(res, 404, "not_found", "Staff not found");
 
@@ -1521,7 +1608,7 @@ const upsertStaffPayment = async (req, res) => {
     const { rows: attendanceRows } = await client.query(
       `SELECT calculated_salary FROM staff_attendance
         WHERE staff_id = $1 AND account_id = $2 AND month = $3`,
-      [staffId, accountId, month]
+      [staffId, accountId, month],
     );
     const attendanceRow = attendanceRows[0] ?? null;
 
@@ -1531,7 +1618,8 @@ const upsertStaffPayment = async (req, res) => {
         ? Number(attendanceRow.calculated_salary)
         : null;
 
-    const effectiveBase = attendanceBase != null ? attendanceBase : monthlySalary;
+    const effectiveBase =
+      attendanceBase != null ? attendanceBase : monthlySalary;
 
     const additionalAmount = toNullableAmount(body.additionalAmount);
     const additionalNote = toNullableNote(body.additionalNote);
@@ -1541,7 +1629,10 @@ const upsertStaffPayment = async (req, res) => {
     const additionalNumber = additionalAmount ?? 0;
     const deductionNumber = deductionAmount ?? 0;
 
-    const netAmount = Math.max(0, effectiveBase + additionalNumber - deductionNumber);
+    const netAmount = Math.max(
+      0,
+      effectiveBase + additionalNumber - deductionNumber,
+    );
 
     await client.query("BEGIN");
 
@@ -1561,7 +1652,17 @@ const upsertStaffPayment = async (req, res) => {
          net_amount        = EXCLUDED.net_amount,
          updated_at        = NOW()
        RETURNING *`,
-      [staffId, month, status, paidDate, additionalAmount, additionalNote, deductionAmount, deductionNote, netAmount]
+      [
+        staffId,
+        month,
+        status,
+        paidDate,
+        additionalAmount,
+        additionalNote,
+        deductionAmount,
+        deductionNote,
+        netAmount,
+      ],
     );
 
     await client.query("COMMIT");
@@ -1580,19 +1681,21 @@ const upsertStaffPayment = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// EXPENSES
-// ===========================================================================
-
 const listExpenses = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const { rows } = await pool.query(
       `SELECT id, account_id, category, title, amount, transaction_type,
@@ -1601,7 +1704,7 @@ const listExpenses = async (req, res) => {
          FROM expenses
         WHERE account_id = $1
         ORDER BY expense_date DESC, created_at DESC`,
-      [accountId]
+      [accountId],
     );
 
     return res.json(rows);
@@ -1616,10 +1719,16 @@ const getExpense = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "no_account_access", "You no longer have access to this account");
+      return fail(
+        res,
+        403,
+        "no_account_access",
+        "You no longer have access to this account",
+      );
 
     const { rows } = await pool.query(
       `SELECT id, account_id, category, title, amount, transaction_type,
@@ -1627,7 +1736,7 @@ const getExpense = async (req, res) => {
               description, bill_attachments, created_by, created_at, updated_at
          FROM expenses
         WHERE id = $1 AND account_id = $2`,
-      [id, accountId]
+      [id, accountId],
     );
 
     if (!rows.length) return fail(res, 404, "not_found", "Expense not found");
@@ -1644,14 +1753,17 @@ const createExpense = async (req, res) => {
     const userId = getUserId(req);
     const { accountId } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can add expenses");
     }
 
     const {
-      category, title, amount,
+      category,
+      title,
+      amount,
       transaction_type = "expense",
       status = "paid",
       reminder_enabled = false,
@@ -1680,11 +1792,18 @@ const createExpense = async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8, CURRENT_DATE),$9,$10,$11)
        RETURNING *`,
       [
-        accountId, category, title.trim(), amount,
-        transaction_type, status, reminder_enabled,
-        expense_date || null, description,
-        JSON.stringify(bill_attachments), userId,
-      ]
+        accountId,
+        category,
+        title.trim(),
+        amount,
+        transaction_type,
+        status,
+        reminder_enabled,
+        expense_date || null,
+        description,
+        JSON.stringify(bill_attachments),
+        userId,
+      ],
     );
 
     await client.query("COMMIT");
@@ -1704,15 +1823,23 @@ const updateExpense = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can update expenses");
     }
 
     const allowedFields = [
-      "category","title","amount","transaction_type","status",
-      "reminder_enabled","expense_date","description","bill_attachments",
+      "category",
+      "title",
+      "amount",
+      "transaction_type",
+      "status",
+      "reminder_enabled",
+      "expense_date",
+      "description",
+      "bill_attachments",
     ];
 
     const updates = {};
@@ -1741,7 +1868,7 @@ const updateExpense = async (req, res) => {
         WHERE id = $${keys.length + 1}
           AND account_id = $${keys.length + 2}
         RETURNING *`,
-      [...values, id, accountId]
+      [...values, id, accountId],
     );
 
     await client.query("COMMIT");
@@ -1765,7 +1892,8 @@ const deleteExpense = async (req, res) => {
     const userId = getUserId(req);
     const { accountId, id } = req.params;
 
-    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
     const role = await getRoleForAccount(userId, accountId);
     if (role !== "owner" && role !== "admin") {
       return fail(res, 403, "forbidden", "Only owners and admins can delete expenses");
@@ -1773,7 +1901,7 @@ const deleteExpense = async (req, res) => {
 
     const result = await pool.query(
       `DELETE FROM expenses WHERE id = $1 AND account_id = $2`,
-      [id, accountId]
+      [id, accountId],
     );
 
     if (result.rowCount === 0) {
@@ -1787,9 +1915,9 @@ const deleteExpense = async (req, res) => {
   }
 };
 
-// ===========================================================================
-
 module.exports = {
+  listAccountPeople,
+
   listMembers,
   getMember,
   createMember,

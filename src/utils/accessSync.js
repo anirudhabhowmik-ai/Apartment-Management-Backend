@@ -1,20 +1,28 @@
 // src/utils/accessSync.js
 //
-// Shared helpers for keeping account_members in sync with the members
-// and staff tables.
+// Shared helpers for keeping account_members in sync with members / staff.
 //
-// Two rules:
+// Rules:
 //
-//   1. grantRoleWithImpliedRoles:
-//      When an admin invitation is accepted, also activate
-//      member_visibility / staff_visibility for whichever members /
-//      staff rows exist for that phone at accept time.
+//   1. Roles live on account_members. One role per (account, user).
+//      A user can be admin on one account and member_visibility on
+//      another — that's why roles are not on `users`.
 //
-//   2. isEligibleForAutoGrant:
-//      When a members / staff row is created, auto-grant the matching
-//      visibility ONLY if the user is the account owner OR holds an
-//      active admin role on that account. Everyone else goes through
-//      the invitation flow.
+//   2. grantRoleWithImpliedRoles(accountId, userId, role):
+//      grants `role` and deactivates every other role for the same
+//      (account, user). Accepting an admin invite REPLACES an existing
+//      member_visibility / staff_visibility row rather than stacking.
+//
+//   3. isEligibleForAutoGrant(accountId, userId):
+//      true when the user is the account owner OR an active admin.
+//      Used to decide whether a member / staff row creation can
+//      auto-grant the matching visibility without an invitation.
+//
+//   4. ensureUserForPhone(phone, fallbackName):
+//      returns the users.id for a phone, creating the row if missing.
+//      Never grants access — access is still invitation-only (or
+//      auto-grant for owner/admin). Used by managementController when
+//      adding a member/staff row for a phone we don't know yet.
 
 const normalizePhone = (raw) => {
   if (!raw) return null;
@@ -23,6 +31,10 @@ const normalizePhone = (raw) => {
   return ten.length === 10 ? ten : null;
 };
 
+// -----------------------------------------------------------------------------
+// Users lookup
+// -----------------------------------------------------------------------------
+
 async function findUserIdByPhone(client, phone) {
   const ten = normalizePhone(phone);
   if (!ten) return null;
@@ -30,81 +42,149 @@ async function findUserIdByPhone(client, phone) {
     `SELECT id FROM users
        WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
        LIMIT 1`,
-    [ten]
+    [ten],
   );
   return rows.length ? rows[0].id : null;
 }
 
-async function activateAccessRole(client, accountId, userId, role) {
+/**
+ * Return users.id for `phone`, creating the row if it doesn't exist.
+ * If the user already exists and has no name, seed it from `fallbackName`.
+ * Never grants access — this only touches `users`.
+ */
+async function ensureUserForPhone(client, phone, fallbackName) {
+  const ten = normalizePhone(phone);
+  if (!ten) return null;
+
+  const { rows: existing } = await client.query(
+    `SELECT id, name FROM users
+       WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
+       LIMIT 1`,
+    [ten],
+  );
+
+  if (existing.length) {
+    const user = existing[0];
+    if (fallbackName && (!user.name || String(user.name).trim() === "")) {
+      await client.query(
+        `UPDATE users
+            SET name = $1, updated_at = NOW()
+          WHERE id = $2`,
+        [fallbackName, user.id],
+      );
+    }
+    return user.id;
+  }
+
+  const { rows: created } = await client.query(
+    `INSERT INTO users (phone, name, is_active, last_login_at)
+     VALUES ($1, $2, true, NULL)
+     RETURNING id`,
+    [ten, fallbackName || null],
+  );
+  return created[0].id;
+}
+
+// -----------------------------------------------------------------------------
+// Membership checks (by user_id — members/staff no longer carry phone)
+// -----------------------------------------------------------------------------
+
+async function hasActiveMemberRow(client, accountId, userId) {
+  if (!userId) return false;
+  const { rows } = await client.query(
+    `SELECT 1 FROM members
+      WHERE account_id = $1
+        AND user_id    = $2
+        AND status     = 'active'
+      LIMIT 1`,
+    [accountId, userId],
+  );
+  return rows.length > 0;
+}
+
+async function hasActiveStaffRow(client, accountId, userId) {
+  if (!userId) return false;
+  const { rows } = await client.query(
+    `SELECT 1 FROM staff
+      WHERE account_id = $1
+        AND user_id    = $2
+        AND status     = 'active'
+      LIMIT 1`,
+    [accountId, userId],
+  );
+  return rows.length > 0;
+}
+
+// -----------------------------------------------------------------------------
+// Role grant / revoke
+// -----------------------------------------------------------------------------
+
+async function deactivateAccessRole(client, accountId, userId, role) {
   if (!userId) return;
+
+  await client.query(
+    `UPDATE account_members
+        SET status = 'inactive', updated_at = NOW()
+      WHERE account_id = $1
+        AND user_id    = $2
+        AND role       = $3`,
+    [accountId, userId, role],
+  );
+
+  await client.query(
+    `UPDATE invitations
+        SET status = 'revoked', responded_at = NOW()
+      WHERE account_id  = $1
+        AND accepted_by = $2
+        AND role        = $3
+        AND status      = 'accepted'`,
+    [accountId, userId, role],
+  );
+}
+
+/**
+ * Grant EXACTLY ONE role for (account, user).
+ *
+ * Deactivates every other active role for the same (account, user),
+ * then upserts the target role as active. So:
+ *   admin               replaces member_visibility / staff_visibility
+ *   member_visibility   replaces admin / staff_visibility
+ *   staff_visibility    replaces admin / member_visibility
+ */
+async function grantRoleWithImpliedRoles(client, accountId, userId, role) {
+  if (!userId) return;
+
+  await client.query(
+    `UPDATE account_members
+        SET status = 'inactive', updated_at = NOW()
+      WHERE account_id = $1
+        AND user_id    = $2
+        AND role      <> $3
+        AND status     = 'active'`,
+    [accountId, userId, role],
+  );
+
   await client.query(
     `INSERT INTO account_members (account_id, user_id, role, status)
      VALUES ($1, $2, $3, 'active')
      ON CONFLICT (account_id, user_id, role)
      DO UPDATE SET status = 'active', updated_at = NOW()`,
-    [accountId, userId, role]
+    [accountId, userId, role],
   );
 }
 
-async function deactivateAccessRole(client, accountId, userId, role) {
-  if (!userId) return;
-  await client.query(
-    `UPDATE account_members
-        SET status = 'inactive', updated_at = NOW()
-      WHERE account_id = $1
-        AND user_id = $2
-        AND role = $3`,
-    [accountId, userId, role]
-  );
-  await client.query(
-    `UPDATE invitations
-        SET status = 'revoked', responded_at = NOW()
-      WHERE account_id = $1
-        AND accepted_by = $2
-        AND role = $3
-        AND status = 'accepted'`,
-    [accountId, userId, role]
-  );
-}
-
-async function hasActiveMemberRow(client, accountId, phone) {
-  const ten = normalizePhone(phone);
-  if (!ten) return false;
-  const { rows } = await client.query(
-    `SELECT 1 FROM members
-      WHERE account_id = $1
-        AND status = 'active'
-        AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-      LIMIT 1`,
-    [accountId, ten]
-  );
-  return rows.length > 0;
-}
-
-async function hasActiveStaffRow(client, accountId, phone) {
-  const ten = normalizePhone(phone);
-  if (!ten) return false;
-  const { rows } = await client.query(
-    `SELECT 1 FROM staff
-      WHERE account_id = $1
-        AND status = 'active'
-        AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-      LIMIT 1`,
-    [accountId, ten]
-  );
-  return rows.length > 0;
-}
+// -----------------------------------------------------------------------------
+// Auto-grant eligibility
+// -----------------------------------------------------------------------------
 
 /**
  * True when the user is:
  *   - the account owner (accounts.created_by = userId), OR
  *   - an active admin on this account.
- *
- * Used to decide whether a member/staff row creation should also
- * auto-grant the matching visibility without an invitation.
  */
 async function isEligibleForAutoGrant(client, accountId, userId) {
   if (!userId) return false;
+
   const { rows } = await client.query(
     `SELECT 1
        FROM accounts a
@@ -119,45 +199,19 @@ async function isEligibleForAutoGrant(client, accountId, userId) {
         AND am.role       = 'admin'
         AND am.status     = 'active'
       LIMIT 1`,
-    [accountId, userId]
+    [accountId, userId],
   );
+
   return rows.length > 0;
-}
-
-/**
- * Grant `role` to `userId` on `accountId`. If `role` is 'admin', also
- * activate member_visibility and staff_visibility for whichever live
- * members / staff rows exist for `phone`.
- */
-async function grantRoleWithImpliedRoles(
-  client,
-  accountId,
-  userId,
-  role,
-  phone
-) {
-  await activateAccessRole(client, accountId, userId, role);
-
-  if (role !== "admin") return;
-
-  const ten = normalizePhone(phone);
-  if (!ten) return;
-
-  if (await hasActiveMemberRow(client, accountId, ten)) {
-    await activateAccessRole(client, accountId, userId, "member_visibility");
-  }
-  if (await hasActiveStaffRow(client, accountId, ten)) {
-    await activateAccessRole(client, accountId, userId, "staff_visibility");
-  }
 }
 
 module.exports = {
   normalizePhone,
   findUserIdByPhone,
-  activateAccessRole,
-  deactivateAccessRole,
+  ensureUserForPhone,
   hasActiveMemberRow,
   hasActiveStaffRow,
-  isEligibleForAutoGrant,
+  deactivateAccessRole,
   grantRoleWithImpliedRoles,
+  isEligibleForAutoGrant,
 };

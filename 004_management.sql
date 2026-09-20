@@ -2,13 +2,16 @@
 -- management.sql
 --
 -- Everything for member / staff / expense management:
---   • members                     — flat residents
+--   • members                     — flat residents (per-record only; identity on users)
 --   • staff                       — workers hired by the society
 --   • expenses                    — bills the society pays
 --   • member_monthly_payments     — one row per member per month (paid/due)
 --   • staff_attendance            — one row per staff per month (attendance)
 --   • staff_monthly_payments      — one row per staff per month (paid/due)
 --   • member_phone_visibility     — per-member phone visibility allow-list
+--
+-- Identity (name, phone, photo_url) lives on `users`. Members and staff
+-- carry a `user_id` FK instead.
 --
 -- Depends on (must exist first):
 --   • users            (auth.sql)
@@ -27,11 +30,12 @@ CREATE TABLE IF NOT EXISTS members (
         REFERENCES accounts(id)
         ON DELETE CASCADE,
 
-    name VARCHAR(150) NOT NULL,
-    phone VARCHAR(20),
+    user_id UUID
+        REFERENCES users(id)
+        ON DELETE SET NULL,
+
     role VARCHAR(60) NOT NULL DEFAULT 'owner'
         CHECK (role IN ('owner', 'secretary', 'tenant', 'custom')),
-    photo_url TEXT,
 
     wing VARCHAR(50),
     flat_number VARCHAR(50) NOT NULL,
@@ -53,11 +57,11 @@ CREATE TABLE IF NOT EXISTS members (
 CREATE INDEX IF NOT EXISTS idx_members_account_id
     ON members(account_id);
 
+CREATE INDEX IF NOT EXISTS idx_members_user_id
+    ON members(user_id);
+
 CREATE INDEX IF NOT EXISTS idx_members_flat_number
     ON members(account_id, flat_number);
-
-CREATE INDEX IF NOT EXISTS idx_members_phone
-    ON members(phone);
 
 CREATE INDEX IF NOT EXISTS idx_members_account_status
     ON members(account_id, status);
@@ -73,12 +77,13 @@ CREATE TABLE IF NOT EXISTS staff (
         REFERENCES accounts(id)
         ON DELETE CASCADE,
 
-    name VARCHAR(150) NOT NULL,
-    phone VARCHAR(20),
+    user_id UUID
+        REFERENCES users(id)
+        ON DELETE SET NULL,
+
     role VARCHAR(60) NOT NULL
         CHECK (role IN ('sweeper', 'security', 'maintenance', 'gardener',
                         'driver', 'custom')),
-    photo_url TEXT,
 
     monthly_salary NUMERIC(12,2) NOT NULL DEFAULT 0,
 
@@ -96,8 +101,8 @@ CREATE TABLE IF NOT EXISTS staff (
 CREATE INDEX IF NOT EXISTS idx_staff_account_id
     ON staff(account_id);
 
-CREATE INDEX IF NOT EXISTS idx_staff_phone
-    ON staff(phone);
+CREATE INDEX IF NOT EXISTS idx_staff_user_id
+    ON staff(user_id);
 
 CREATE INDEX IF NOT EXISTS idx_staff_account_status
     ON staff(account_id, status);

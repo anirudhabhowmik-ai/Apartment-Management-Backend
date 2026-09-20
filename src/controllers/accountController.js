@@ -1,24 +1,13 @@
 // @ts-nocheck
 // src/controllers/accountController.js
 const { pool } = require("../config/database");
-const {
-  grantRoleWithImpliedRoles,
-} = require("../utils/accessSync");
+const { grantRoleWithImpliedRoles } = require("../utils/accessSync");
 
-// ---------------------------------------------------------------------------
-// Helper — resolve the caller's user id from the request.
-// ---------------------------------------------------------------------------
 const getUserId = (req) =>
   req.user?.userId ?? req.user?.id ?? req.userId ?? null;
 
 const fail = (res, status, code) => res.status(status).json({ code });
 
-// ---------------------------------------------------------------------------
-// POST /accounts
-//
-// Creates an account and inserts the owner into account_members with the
-// role `admin`. Ownership itself is derived from accounts.created_by.
-// ---------------------------------------------------------------------------
 const createAccount = async (req, res) => {
   const client = await pool.connect();
 
@@ -48,21 +37,7 @@ const createAccount = async (req, res) => {
 
     const account = accountResult.rows[0];
 
-    // Owner is admin on their own account. `owner` is never stored on
-    // account_members — it is derived from accounts.created_by.
-    const { rows: userPhoneRows } = await client.query(
-      `SELECT phone FROM users WHERE id = $1`,
-      [userId]
-    );
-    const userPhone = userPhoneRows.length ? userPhoneRows[0].phone : null;
-
-    await grantRoleWithImpliedRoles(
-      client,
-      account.id,
-      userId,
-      "admin",
-      userPhone,
-    );
+    await grantRoleWithImpliedRoles(client, account.id, userId, "admin");
 
     await client.query(
       `UPDATE users SET last_account_id = $1, updated_at = NOW() WHERE id = $2`,
@@ -86,24 +61,10 @@ const createAccount = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// GET /accounts
-//
-// Returns the accounts the caller can currently access — exactly ONE row
-// per account, with the highest-priority role for that user.
-// ---------------------------------------------------------------------------
 const listAccounts = async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return fail(res, 401, "unauthenticated");
-
-    const { rows: userRows } = await pool.query(
-      `SELECT phone FROM users WHERE id = $1`,
-      [userId],
-    );
-    const rawPhone = userRows.length ? userRows[0].phone : null;
-    const digits = rawPhone ? String(rawPhone).replace(/\D/g, "") : "";
-    const phone = digits.length > 10 ? digits.slice(-10) : digits;
 
     const { rows } = await pool.query(
       `
@@ -139,40 +100,34 @@ const listAccounts = async (req, res) => {
          AND am.user_id = $1
          AND am.status = 'active'
         WHERE
-          -- Owner always sees their own account.
           a.created_by = $1
 
-          -- Active admin row (no underlying row required).
           OR (am.role = 'admin')
 
-          -- member_visibility: needs an active members row matching my phone.
           OR (
             am.role = 'member_visibility'
-            AND $2 <> ''
             AND EXISTS (
               SELECT 1 FROM members m
                WHERE m.account_id = a.id
-                 AND m.status = 'active'
-                 AND RIGHT(REGEXP_REPLACE(m.phone,'\\D','','g'),10) = $2
+                 AND m.user_id    = $1
+                 AND m.status     = 'active'
             )
           )
 
-          -- staff_visibility: needs an active staff row matching my phone.
           OR (
             am.role = 'staff_visibility'
-            AND $2 <> ''
             AND EXISTS (
               SELECT 1 FROM staff s
                WHERE s.account_id = a.id
-                 AND s.status = 'active'
-                 AND RIGHT(REGEXP_REPLACE(s.phone,'\\D','','g'),10) = $2
+                 AND s.user_id    = $1
+                 AND s.status     = 'active'
             )
           )
         ORDER BY a.id, role_priority
       ) sub
       ORDER BY sub.created_at DESC
       `,
-      [userId, phone],
+      [userId],
     );
 
     const { rows: userRowsForLast } = await pool.query(
@@ -190,11 +145,6 @@ const listAccounts = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// PATCH /accounts/:id
-// Body: { name?, photo_url? }
-// Owner or admin only.
-// ---------------------------------------------------------------------------
 const updateAccount = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -252,10 +202,6 @@ const updateAccount = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// DELETE /accounts/:id
-// Owner only. Cascades to account_members, invitations, members, staff.
-// ---------------------------------------------------------------------------
 const deleteAccount = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -287,11 +233,6 @@ const deleteAccount = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// POST /accounts/:id/transfer-ownership
-// Body: { newOwnerUserId: string }
-// Owner only.
-// ---------------------------------------------------------------------------
 const transferOwnership = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -331,31 +272,8 @@ const transferOwnership = async (req, res) => {
       [newOwnerUserId, id],
     );
 
-    // Previous owner keeps admin.
-    const { rows: prevPhoneRows } = await client.query(
-      `SELECT phone FROM users WHERE id = $1`,
-      [userId],
-    );
-    await grantRoleWithImpliedRoles(
-      client,
-      id,
-      userId,
-      "admin",
-      prevPhoneRows.length ? prevPhoneRows[0].phone : null,
-    );
-
-    // New owner becomes admin (and inherits base visibility if applicable).
-    const { rows: newPhoneRows } = await client.query(
-      `SELECT phone FROM users WHERE id = $1`,
-      [newOwnerUserId],
-    );
-    await grantRoleWithImpliedRoles(
-      client,
-      id,
-      newOwnerUserId,
-      "admin",
-      newPhoneRows.length ? newPhoneRows[0].phone : null,
-    );
+    await grantRoleWithImpliedRoles(client, id, userId, "admin");
+    await grantRoleWithImpliedRoles(client, id, newOwnerUserId, "admin");
 
     await client.query("COMMIT");
 
@@ -369,9 +287,6 @@ const transferOwnership = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// PATCH /accounts/me/last-account
-// ---------------------------------------------------------------------------
 const setLastAccount = async (req, res) => {
   try {
     const userId = getUserId(req);
