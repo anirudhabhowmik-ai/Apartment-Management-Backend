@@ -34,8 +34,8 @@ CREATE TABLE IF NOT EXISTS members (
         REFERENCES users(id)
         ON DELETE SET NULL,
 
-    role VARCHAR(60) NOT NULL DEFAULT 'owner'
-        CHECK (role IN ('owner', 'secretary', 'tenant', 'custom')),
+    role VARCHAR(60) NOT NULL DEFAULT 'flat'
+        CHECK (role IN ('flat', 'shop', 'custom')),
 
     wing VARCHAR(50),
     flat_number VARCHAR(50) NOT NULL,
@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS staff (
 
     role VARCHAR(60) NOT NULL
         CHECK (role IN ('sweeper', 'security', 'maintenance', 'gardener',
-                        'driver', 'custom')),
+                        'driver', 'accountant', 'custom')),
 
     monthly_salary NUMERIC(12,2) NOT NULL DEFAULT 0,
 

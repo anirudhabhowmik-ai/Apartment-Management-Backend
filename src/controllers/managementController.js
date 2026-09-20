@@ -512,7 +512,7 @@ const createMember = async (req, res) => {
     const mode = body.mode === "existing" ? "existing" : "new";
 
     const {
-      role: memberRole = "owner",
+      role: memberRole = "flat",
       wing = null,
       flat_number,
       area_sqft = null,
@@ -524,7 +524,7 @@ const createMember = async (req, res) => {
       return fail(res, 400, "invalid_input", "Flat number is required");
     }
 
-    const validRoles = ["owner", "manager", "custom"];
+    const validRoles = ["flat", "shop", "custom"];
     if (!validRoles.includes(memberRole)) {
       return fail(res, 400, "invalid_role", "Invalid member role");
     }
@@ -1069,13 +1069,14 @@ const createStaff = async (req, res) => {
     }
 
     const validRoles = [
-      "sweeper",
-      "security",
-      "maintenance",
-      "gardener",
-      "driver",
-      "custom",
-    ];
+  "sweeper",
+  "security",
+  "maintenance",
+  "gardener",
+  "driver",
+  "accountant",
+  "custom",
+];
     if (!validRoles.includes(staffRole)) {
       return fail(res, 400, "invalid_role", "Invalid staff role");
     }
