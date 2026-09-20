@@ -63,6 +63,27 @@ function normalizeMonth(raw) {
   return new Date().toISOString().slice(0, 7);
 }
 
+// ---------------------------------------------------------------------------
+// Identity lock helper
+//
+// A member/staff row's identity (name, phone, photo) is locked to the
+// owner/admin when the linked user has an ACTIVE account_members row for
+// this account. That means they've accepted an invitation and "joined".
+// ---------------------------------------------------------------------------
+
+async function hasActiveAccountMemberRow(client, accountId, userId) {
+  if (!accountId || !userId) return false;
+  const { rows } = await client.query(
+    `SELECT 1 FROM account_members
+       WHERE account_id = $1
+         AND user_id    = $2
+         AND status     = 'active'
+       LIMIT 1`,
+    [accountId, userId],
+  );
+  return rows.length > 0;
+}
+
 function shapeMemberRow(row, payment) {
   return {
     id: row.id,
@@ -81,6 +102,7 @@ function shapeMemberRow(row, payment) {
     created_by: row.created_by,
     created_at: row.created_at,
     updated_at: row.updated_at,
+    has_access: !!row.has_access,
     due_amount: payment
       ? computeMemberDue(row, payment)
       : computeMemberDue(row, null),
@@ -105,6 +127,7 @@ function shapeStaffRow(row, payment, attendance) {
     created_by: row.created_by,
     created_at: row.created_at,
     updated_at: row.updated_at,
+    has_access: !!row.has_access,
     due_amount: computeStaffDue(row, attendance, payment),
     due_month: payment?.month ?? attendance?.month ?? null,
     monthly_payments: payment
@@ -381,7 +404,13 @@ const listMembers = async (req, res) => {
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
               m.maintenance_amount, m.status, m.created_by,
               m.created_at, m.updated_at,
-              u.name, u.phone, u.photo_url
+              u.name, u.phone, u.photo_url,
+              EXISTS (
+                SELECT 1 FROM account_members am
+                 WHERE am.account_id = m.account_id
+                   AND am.user_id    = m.user_id
+                   AND am.status     = 'active'
+              ) AS has_access
          FROM members m
          JOIN users u ON u.id = m.user_id
         WHERE m.account_id = $1
@@ -452,7 +481,13 @@ const getMember = async (req, res) => {
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
               m.maintenance_amount, m.status, m.created_by,
               m.created_at, m.updated_at,
-              u.name, u.phone, u.photo_url
+              u.name, u.phone, u.photo_url,
+              EXISTS (
+                SELECT 1 FROM account_members am
+                 WHERE am.account_id = m.account_id
+                   AND am.user_id    = m.user_id
+                   AND am.status     = 'active'
+              ) AS has_access
          FROM members m
          JOIN users u ON u.id = m.user_id
         WHERE m.id = $1
@@ -505,55 +540,25 @@ const createMember = async (req, res) => {
     const mode = body.mode === "existing" ? "existing" : "new";
 
     const {
-      role: memberRole,
+      role: rawMemberRole,
       wing = null,
       flat_number,
       area_sqft = null,
       parking_available = false,
       maintenance_amount = 0,
-      custom_role = null,
     } = body;
 
     if (!flat_number) {
       return fail(res, 400, "invalid_input", "Flat number is required");
     }
 
+    const memberRole = String(rawMemberRole || "").trim();
     if (!memberRole) {
-      return fail(
-        res,
-        400,
-        "invalid_input",
-        "Member role is required (one of: flat, shop, custom)",
-      );
+      return fail(res, 400, "invalid_input", "Member role is required");
     }
-
-    const validRoles = ["flat", "shop", "custom"];
-    if (!validRoles.includes(memberRole)) {
-      return fail(
-        res,
-        400,
-        "invalid_role",
-        `Invalid member role: ${memberRole}`,
-      );
+    if (memberRole.length > 60) {
+      return fail(res, 400, "invalid_input", "Member role is too long");
     }
-
-    if (memberRole === "custom" && !String(custom_role || "").trim()) {
-      return fail(
-        res,
-        400,
-        "invalid_input",
-        "custom_role is required when role is 'custom'",
-      );
-    }
-
-    console.log(
-      "[createMember] accountId=%s mode=%s memberRole=%s flat_number=%s user_id=%s",
-      accountId,
-      mode,
-      memberRole,
-      flat_number,
-      body.user_id,
-    );
 
     await client.query("BEGIN");
 
@@ -599,8 +604,6 @@ const createMember = async (req, res) => {
       }
     }
 
-    console.log("[createMember] inserting member with role =", memberRole);
-
     const { rows } = await client.query(
       `INSERT INTO members
          (account_id, user_id, role, wing, flat_number,
@@ -628,7 +631,13 @@ const createMember = async (req, res) => {
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
               m.maintenance_amount, m.status, m.created_by,
               m.created_at, m.updated_at,
-              u.name, u.phone, u.photo_url
+              u.name, u.phone, u.photo_url,
+              EXISTS (
+                SELECT 1 FROM account_members am
+                 WHERE am.account_id = m.account_id
+                   AND am.user_id    = m.user_id
+                   AND am.status     = 'active'
+              ) AS has_access
          FROM members m
          JOIN users u ON u.id = m.user_id
         WHERE m.id = $1`,
@@ -650,7 +659,13 @@ const createMember = async (req, res) => {
 };
 
 // ===========================================================================
-// updateMember — now accepts photo_url (writes to users.photo_url)
+// updateMember
+//
+// Admin/owner can edit every field.
+//
+// Exception: if the target user has an ACTIVE account_members row, the
+// identity fields (name, phone, photo) are locked — only the user
+// themselves can change them (via the profile editor).
 // ===========================================================================
 const updateMember = async (req, res) => {
   const client = await pool.connect();
@@ -682,7 +697,45 @@ const updateMember = async (req, res) => {
 
     const targetUserId = rows[0].user_id;
 
-    // ── 1. Collect allowed field updates for the members table. ──
+    // ── Is this person's identity locked? ──
+    const identityLocked = await hasActiveAccountMemberRow(
+      client,
+      accountId,
+      targetUserId,
+    );
+
+    // ── Identity fields (name, phone, photo_url) ──
+    const hasName = Object.prototype.hasOwnProperty.call(req.body, "name");
+    const hasPhone = Object.prototype.hasOwnProperty.call(req.body, "phone");
+    const hasPhoto = Object.prototype.hasOwnProperty.call(req.body, "photo_url");
+
+    if (identityLocked && (hasName || hasPhone || hasPhoto)) {
+      return fail(
+        res,
+        403,
+        "user_identity_locked",
+        "This person has joined the app. Their name, phone and photo can only be changed by them.",
+      );
+    }
+
+    const newName = hasName
+      ? String(req.body.name ?? "").trim() || null
+      : null;
+    const newPhone = hasPhone ? normalizePhone(req.body.phone) : null;
+    const newPhoto = hasPhoto
+      ? req.body.photo_url === null
+        ? null
+        : String(req.body.photo_url)
+      : undefined;
+
+    if (hasName && !newName) {
+      return fail(res, 400, "invalid_input", "Name cannot be empty");
+    }
+    if (hasPhone && !newPhone) {
+      return fail(res, 400, "invalid_input", "A valid 10-digit phone is required");
+    }
+
+    // ── Non-identity member fields ──
     const allowedFields = [
       "role",
       "wing",
@@ -700,38 +753,84 @@ const updateMember = async (req, res) => {
     }
 
     if (updates.role !== undefined) {
-      const validRoles = ["flat", "shop", "custom"];
-      if (!validRoles.includes(updates.role)) {
-        return fail(
-          res,
-          400,
-          "invalid_role",
-          `Invalid member role: ${updates.role}`,
-        );
+      const roleStr = String(updates.role || "").trim();
+      if (!roleStr) {
+        return fail(res, 400, "invalid_input", "Role cannot be empty");
       }
+      if (roleStr.length > 60) {
+        return fail(res, 400, "invalid_input", "Role is too long");
+      }
+      updates.role = roleStr;
     }
 
-    // ── 2. Photo update (lives on users.photo_url). ──
-    const hasPhoto = Object.prototype.hasOwnProperty.call(req.body, "photo_url");
-    const rawPhoto = hasPhoto ? req.body.photo_url : undefined;
-    const photoUrl =
-      rawPhoto === null || rawPhoto === undefined ? null : String(rawPhoto);
+    const nothingToUpdate =
+      Object.keys(updates).length === 0 &&
+      !hasName &&
+      !hasPhone &&
+      !hasPhoto;
 
-    if (Object.keys(updates).length === 0 && !hasPhoto) {
+    if (nothingToUpdate) {
       return fail(res, 400, "invalid_input", "No permitted fields to update");
     }
 
     await client.query("BEGIN");
 
-    // ── 3. Write the photo to the shared users row, if provided. ──
-    if (hasPhoto && targetUserId) {
+    // ── Write identity changes to the shared users row ──
+    if (!identityLocked && (hasName || hasPhone || hasPhoto)) {
+      // Phone collision check.
+      if (hasPhone) {
+        const { rows: conflict } = await client.query(
+          `SELECT id FROM users WHERE phone = $1 AND id <> $2 LIMIT 1`,
+          [`91${newPhone}`, targetUserId],
+        );
+        // Also try the bare 10-digit variant in case the column stores
+        // either form historically.
+        let conflictRows = conflict;
+        if (!conflictRows.length) {
+          const { rows: alt } = await client.query(
+            `SELECT id FROM users WHERE phone = $1 AND id <> $2 LIMIT 1`,
+            [newPhone, targetUserId],
+          );
+          conflictRows = alt;
+        }
+        if (conflictRows.length) {
+          await client.query("ROLLBACK");
+          return fail(
+            res,
+            409,
+            "phone_in_use",
+            "This phone number already belongs to another user.",
+          );
+        }
+      }
+
+      const setParts = [];
+      const values = [];
+      if (hasName) {
+        values.push(newName);
+        setParts.push(`name = $${values.length}`);
+      }
+      if (hasPhone) {
+        // Store in E.164-ish form `91XXXXXXXXXX` to match the rest of
+        // the codebase (authController.normalizePhone).
+        values.push(`91${newPhone}`);
+        setParts.push(`phone = $${values.length}`);
+      }
+      if (hasPhoto) {
+        values.push(newPhoto);
+        setParts.push(`photo_url = $${values.length}`);
+      }
+      values.push(targetUserId);
+
       await client.query(
-        `UPDATE users SET photo_url = $1, updated_at = NOW() WHERE id = $2`,
-        [photoUrl, targetUserId],
+        `UPDATE users
+            SET ${setParts.join(", ")}, updated_at = NOW()
+          WHERE id = $${values.length}`,
+        values,
       );
     }
 
-    // ── 4. Apply the members-table field updates. ──
+    // ── Non-identity member fields ──
     if (Object.keys(updates).length > 0) {
       const keys = Object.keys(updates);
       const values = keys.map((k) => updates[k]);
@@ -744,9 +843,7 @@ const updateMember = async (req, res) => {
             AND account_id = $${keys.length + 2}`,
         [...values, id, accountId],
       );
-    } else if (hasPhoto) {
-      // Photo-only change still bumps the row timestamp so the client
-      // cache invalidates and the joined read returns fresh data.
+    } else if (!identityLocked && (hasName || hasPhone || hasPhoto)) {
       await client.query(
         `UPDATE members SET updated_at = NOW()
           WHERE id = $1 AND account_id = $2`,
@@ -754,13 +851,18 @@ const updateMember = async (req, res) => {
       );
     }
 
-    // ── 5. Re-read the joined row (with the updated photo). ──
     const { rows: joined } = await client.query(
       `SELECT m.id, m.account_id, m.user_id, m.role,
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
               m.maintenance_amount, m.status, m.created_by,
               m.created_at, m.updated_at,
-              u.name, u.phone, u.photo_url
+              u.name, u.phone, u.photo_url,
+              EXISTS (
+                SELECT 1 FROM account_members am
+                 WHERE am.account_id = m.account_id
+                   AND am.user_id    = m.user_id
+                   AND am.status     = 'active'
+              ) AS has_access
          FROM members m
          JOIN users u ON u.id = m.user_id
         WHERE m.id = $1`,
@@ -1035,7 +1137,13 @@ const listStaff = async (req, res) => {
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
               s.created_at, s.updated_at,
-              u.name, u.phone, u.photo_url
+              u.name, u.phone, u.photo_url,
+              EXISTS (
+                SELECT 1 FROM account_members am
+                 WHERE am.account_id = s.account_id
+                   AND am.user_id    = s.user_id
+                   AND am.status     = 'active'
+              ) AS has_access
          FROM staff s
          JOIN users u ON u.id = s.user_id
         WHERE s.account_id = $1
@@ -1103,7 +1211,13 @@ const getStaff = async (req, res) => {
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
               s.created_at, s.updated_at,
-              u.name, u.phone, u.photo_url
+              u.name, u.phone, u.photo_url,
+              EXISTS (
+                SELECT 1 FROM account_members am
+                 WHERE am.account_id = s.account_id
+                   AND am.user_id    = s.user_id
+                   AND am.status     = 'active'
+              ) AS has_access
          FROM staff s
          JOIN users u ON u.id = s.user_id
         WHERE s.id = $1
@@ -1139,32 +1253,15 @@ const createStaff = async (req, res) => {
     const body = req.body || {};
     const mode = body.mode === "existing" ? "existing" : "new";
 
-    const { role: staffRole, monthly_salary = 0 } = body;
+    const { role: rawStaffRole, monthly_salary = 0 } = body;
 
+    const staffRole = String(rawStaffRole || "").trim();
     if (!staffRole) {
       return fail(res, 400, "invalid_input", "Role is required");
     }
-
-    const validRoles = [
-      "sweeper",
-      "security",
-      "maintenance",
-      "gardener",
-      "driver",
-      "accountant",
-      "custom",
-    ];
-    if (!validRoles.includes(staffRole)) {
-      return fail(res, 400, "invalid_role", `Invalid staff role: ${staffRole}`);
+    if (staffRole.length > 60) {
+      return fail(res, 400, "invalid_input", "Role is too long");
     }
-
-    console.log(
-      "[createStaff] accountId=%s mode=%s staffRole=%s user_id=%s",
-      accountId,
-      mode,
-      staffRole,
-      body.user_id,
-    );
 
     await client.query("BEGIN");
 
@@ -1224,7 +1321,13 @@ const createStaff = async (req, res) => {
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
               s.created_at, s.updated_at,
-              u.name, u.phone, u.photo_url
+              u.name, u.phone, u.photo_url,
+              EXISTS (
+                SELECT 1 FROM account_members am
+                 WHERE am.account_id = s.account_id
+                   AND am.user_id    = s.user_id
+                   AND am.status     = 'active'
+              ) AS has_access
          FROM staff s
          JOIN users u ON u.id = s.user_id
         WHERE s.id = $1`,
@@ -1246,7 +1349,9 @@ const createStaff = async (req, res) => {
 };
 
 // ===========================================================================
-// updateStaff — now accepts photo_url (writes to users.photo_url)
+// updateStaff
+//
+// Same identity-lock rules as updateMember.
 // ===========================================================================
 const updateStaff = async (req, res) => {
   const client = await pool.connect();
@@ -1278,7 +1383,42 @@ const updateStaff = async (req, res) => {
 
     const targetUserId = rows[0].user_id;
 
-    // ── 1. Collect allowed field updates for the staff table. ──
+    const identityLocked = await hasActiveAccountMemberRow(
+      client,
+      accountId,
+      targetUserId,
+    );
+
+    const hasName = Object.prototype.hasOwnProperty.call(req.body, "name");
+    const hasPhone = Object.prototype.hasOwnProperty.call(req.body, "phone");
+    const hasPhoto = Object.prototype.hasOwnProperty.call(req.body, "photo_url");
+
+    if (identityLocked && (hasName || hasPhone || hasPhoto)) {
+      return fail(
+        res,
+        403,
+        "user_identity_locked",
+        "This person has joined the app. Their name, phone and photo can only be changed by them.",
+      );
+    }
+
+    const newName = hasName
+      ? String(req.body.name ?? "").trim() || null
+      : null;
+    const newPhone = hasPhone ? normalizePhone(req.body.phone) : null;
+    const newPhoto = hasPhoto
+      ? req.body.photo_url === null
+        ? null
+        : String(req.body.photo_url)
+      : undefined;
+
+    if (hasName && !newName) {
+      return fail(res, 400, "invalid_input", "Name cannot be empty");
+    }
+    if (hasPhone && !newPhone) {
+      return fail(res, 400, "invalid_input", "A valid 10-digit phone is required");
+    }
+
     const allowedFields = ["role", "monthly_salary"];
     const updates = {};
     for (const key of allowedFields) {
@@ -1287,27 +1427,78 @@ const updateStaff = async (req, res) => {
       }
     }
 
-    // ── 2. Photo update (lives on users.photo_url). ──
-    const hasPhoto = Object.prototype.hasOwnProperty.call(req.body, "photo_url");
-    const rawPhoto = hasPhoto ? req.body.photo_url : undefined;
-    const photoUrl =
-      rawPhoto === null || rawPhoto === undefined ? null : String(rawPhoto);
+    if (updates.role !== undefined) {
+      const roleStr = String(updates.role || "").trim();
+      if (!roleStr) {
+        return fail(res, 400, "invalid_input", "Role cannot be empty");
+      }
+      if (roleStr.length > 60) {
+        return fail(res, 400, "invalid_input", "Role is too long");
+      }
+      updates.role = roleStr;
+    }
 
-    if (Object.keys(updates).length === 0 && !hasPhoto) {
+    const nothingToUpdate =
+      Object.keys(updates).length === 0 &&
+      !hasName &&
+      !hasPhone &&
+      !hasPhoto;
+
+    if (nothingToUpdate) {
       return fail(res, 400, "invalid_input", "No permitted fields to update");
     }
 
     await client.query("BEGIN");
 
-    // ── 3. Write the photo to the shared users row, if provided. ──
-    if (hasPhoto && targetUserId) {
+    if (!identityLocked && (hasName || hasPhone || hasPhoto)) {
+      if (hasPhone) {
+        const { rows: conflict } = await client.query(
+          `SELECT id FROM users WHERE phone = $1 AND id <> $2 LIMIT 1`,
+          [`91${newPhone}`, targetUserId],
+        );
+        let conflictRows = conflict;
+        if (!conflictRows.length) {
+          const { rows: alt } = await client.query(
+            `SELECT id FROM users WHERE phone = $1 AND id <> $2 LIMIT 1`,
+            [newPhone, targetUserId],
+          );
+          conflictRows = alt;
+        }
+        if (conflictRows.length) {
+          await client.query("ROLLBACK");
+          return fail(
+            res,
+            409,
+            "phone_in_use",
+            "This phone number already belongs to another user.",
+          );
+        }
+      }
+
+      const setParts = [];
+      const values = [];
+      if (hasName) {
+        values.push(newName);
+        setParts.push(`name = $${values.length}`);
+      }
+      if (hasPhone) {
+        values.push(`91${newPhone}`);
+        setParts.push(`phone = $${values.length}`);
+      }
+      if (hasPhoto) {
+        values.push(newPhoto);
+        setParts.push(`photo_url = $${values.length}`);
+      }
+      values.push(targetUserId);
+
       await client.query(
-        `UPDATE users SET photo_url = $1, updated_at = NOW() WHERE id = $2`,
-        [photoUrl, targetUserId],
+        `UPDATE users
+            SET ${setParts.join(", ")}, updated_at = NOW()
+          WHERE id = $${values.length}`,
+        values,
       );
     }
 
-    // ── 4. Apply the staff-table field updates. ──
     if (Object.keys(updates).length > 0) {
       const keys = Object.keys(updates);
       const values = keys.map((k) => updates[k]);
@@ -1320,7 +1511,7 @@ const updateStaff = async (req, res) => {
             AND account_id = $${keys.length + 2}`,
         [...values, id, accountId],
       );
-    } else if (hasPhoto) {
+    } else if (!identityLocked && (hasName || hasPhone || hasPhoto)) {
       await client.query(
         `UPDATE staff SET updated_at = NOW()
           WHERE id = $1 AND account_id = $2`,
@@ -1328,12 +1519,17 @@ const updateStaff = async (req, res) => {
       );
     }
 
-    // ── 5. Re-read the joined row (with the updated photo). ──
     const { rows: joined } = await client.query(
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
               s.created_at, s.updated_at,
-              u.name, u.phone, u.photo_url
+              u.name, u.phone, u.photo_url,
+              EXISTS (
+                SELECT 1 FROM account_members am
+                 WHERE am.account_id = s.account_id
+                   AND am.user_id    = s.user_id
+                   AND am.status     = 'active'
+              ) AS has_access
          FROM staff s
          JOIN users u ON u.id = s.user_id
         WHERE s.id = $1`,
