@@ -725,7 +725,12 @@ const previewRevoke = async (req, res) => {
     const { accountId, userId: targetUserId } = req.params;
 
     const requesterRoles = await getRolesForAccount(requesterId, accountId);
-    if (!isOwner(requesterRoles)) return fail(res, 403, "owner_required");
+
+    // Owner can preview anyone; a user can preview themselves.
+    const selfPreview = requesterId === targetUserId;
+    if (!isOwner(requesterRoles) && !selfPreview) {
+      return fail(res, 403, "owner_required");
+    }
 
     if (!targetUserId) return fail(res, 400, "invalid_input");
 
