@@ -97,21 +97,44 @@ async function verifyMsg91AccessToken(accessToken, submittedPhone) {
 // -----------------------------------------------------------------------------
 // mergeUsers
 //
-// Folds sourceUserId into targetUserId, then deletes the source row.
-// Runs inside an open transaction. Caller has already proven control
-// of the source phone via OTP, so this is safe.
+// Folds sourceUserId into targetUserId (target survives), then deletes
+// the source row. Runs inside an open transaction.
 //
-// Before deleting the source, we copy its photo_url and name to the
-// target IF the target is missing them. This preserves photos set on
-// the source user when two logins merge via a phone-number change.
+// What this does, in order:
+//
+//   1. Copy the source's name / photo_url onto the target ONLY where the
+//      target is missing them. The target's own values always win.
+//
+//   2. Repoint every FK that references users(id) from source → target.
+//      This is the full set used by the other controllers in this project:
+//        members.created_by, members.user_id
+//        staff.created_by,   staff.user_id
+//        accounts.created_by           (ownership transfer)
+//        expenses.created_by
+//        staff_attendance.created_by
+//        invitations.invited_by, invitations.accepted_by
+//        account_opening_balances.updated_by
+//        member_phone_visibility.viewer_user_id
+//
+//   3. Move account_members rows from source → target, skipping rows
+//      that would collide on the UNIQUE (account_id, user_id, role).
+//      The colliding source rows are deleted after the move.
+//
+//   4. Enforce the SAME invariant the rest of the codebase uses:
+//        at most ONE active role per (account_id, user_id).
+//      This matches grantRoleWithImpliedRoles. Priority when multiple
+//      active roles end up on the same (account, user):
+//        admin > member_visibility > staff_visibility
+//      Losers are set to status='inactive' (matching deactivateAccessRole),
+//      and their invitations are marked 'revoked'.
+//
+//   5. Delete the source users row. Nothing references it any more.
 // -----------------------------------------------------------------------------
 
 async function mergeUsers(client, targetUserId, sourceUserId) {
   if (targetUserId === sourceUserId) return;
 
-  // Carry the source user's photo and name to the target, but only when
-  // the target is missing them. Names / photos that already exist on the
-  // target are not overwritten.
+  // ---- 1) Fill in target's identity from source where missing. ----
   await client.query(
     `UPDATE users AS tgt
         SET photo_url  = COALESCE(NULLIF(tgt.photo_url, ''), src.photo_url),
@@ -127,26 +150,31 @@ async function mergeUsers(client, targetUserId, sourceUserId) {
     [targetUserId, sourceUserId],
   );
 
-  // Every (table, column) that has a FK to users(id) and should be
-  // reassigned to the surviving user. Confirmed against the schema.
-  const tablesWithUserFk = [
-    { table: "members", column: "created_by" },
-    { table: "members", column: "user_id" },
-    { table: "staff",   column: "created_by" },
-    { table: "staff",   column: "user_id" },
+  // ---- 2) Repoint every FK that references users(id). ----
+  const simpleFkTables = [
+    { table: "members",                 column: "created_by" },
+    { table: "members",                 column: "user_id" },
+    { table: "staff",                   column: "created_by" },
+    { table: "staff",                   column: "user_id" },
+    { table: "accounts",                column: "created_by" },
+    { table: "expenses",                column: "created_by" },
+    { table: "staff_attendance",        column: "created_by" },
+    { table: "invitations",             column: "invited_by" },
+    { table: "invitations",             column: "accepted_by" },
+    { table: "account_opening_balances", column: "updated_by" },
+    { table: "member_phone_visibility",  column: "viewer_user_id" },
   ];
 
-  for (const { table, column } of tablesWithUserFk) {
+  for (const { table, column } of simpleFkTables) {
     await client.query(
       `UPDATE ${table} SET ${column} = $1 WHERE ${column} = $2`,
       [targetUserId, sourceUserId],
     );
   }
 
-  // account_members has a UNIQUE (account_id, user_id, role). If both
-  // users are members of the same account with the same role, a naive
-  // UPDATE would violate it. Re-point only rows that don't already
-  // exist on the target, then delete the rest (they're duplicates).
+  // ---- 3) account_members: move non-colliding source rows. ----
+  // A collision = the target already has a row with the same
+  // (account_id, role). Those source rows stay put and are deleted below.
   await client.query(
     `
     UPDATE account_members am
@@ -162,12 +190,57 @@ async function mergeUsers(client, targetUserId, sourceUserId) {
     [targetUserId, sourceUserId],
   );
 
+  // ---- 3b) Delete the source's leftover colliding rows. ----
   await client.query(
     `DELETE FROM account_members WHERE user_id = $1`,
     [sourceUserId],
   );
 
-  // Source user's row can now be removed.
+  // ---- 4) Enforce one active role per (account, user) on the target. ----
+  // Returns the (account_id, role) pairs that were just deactivated so
+  // we can mirror the change in the invitations table.
+  const { rows: deactivated } = await client.query(
+    `WITH ranked AS (
+       SELECT id,
+              account_id,
+              user_id,
+              role,
+              ROW_NUMBER() OVER (
+                PARTITION BY account_id, user_id
+                ORDER BY CASE role
+                  WHEN 'admin'             THEN 1
+                  WHEN 'member_visibility' THEN 2
+                  WHEN 'staff_visibility'  THEN 3
+                  ELSE 4
+                END
+              ) AS rn
+         FROM account_members
+        WHERE user_id = $1
+          AND status  = 'active'
+     )
+     UPDATE account_members
+        SET status = 'inactive', updated_at = NOW()
+      WHERE id IN (SELECT id FROM ranked WHERE rn > 1)
+      RETURNING account_id, role`,
+    [targetUserId],
+  );
+
+  // ---- 4b) Mirror the deactivation in invitations. ----
+  // Same behaviour as deactivateAccessRole in accessSync.js.
+  for (const row of deactivated) {
+    await client.query(
+      `UPDATE invitations
+          SET status       = 'revoked',
+              responded_at = COALESCE(responded_at, NOW())
+        WHERE account_id  = $1
+          AND accepted_by = $2
+          AND role        = $3
+          AND status      = 'accepted'`,
+      [row.account_id, targetUserId, row.role],
+    );
+  }
+
+  // ---- 5) Delete the source users row. ----
   await client.query(`DELETE FROM users WHERE id = $1`, [sourceUserId]);
 }
 
@@ -206,17 +279,20 @@ async function verifyWidgetToken(req, res) {
       });
     }
 
+    const ten = normalizeTenDigit(normalizedPhone);
+
     const userResult = await pool.query(
       `SELECT id, phone, name, photo_url, is_active,
               last_login_at, last_account_id, created_at, updated_at
-         FROM users WHERE phone = $1 LIMIT 1`,
-      [normalizedPhone],
+         FROM users
+        WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
+        LIMIT 1`,
+      [ten],
     );
 
     let user;
 
     if (userResult.rows.length === 0) {
-      const ten = normalizeTenDigit(normalizedPhone);
       let seededName = null;
       if (ten) {
         const { rows: invRows } = await pool.query(
@@ -244,7 +320,6 @@ async function verifyWidgetToken(req, res) {
         return res.status(403).json({ success: false, message: "This account is inactive." });
       }
       if (!user.name || String(user.name).trim() === "") {
-        const ten = normalizeTenDigit(normalizedPhone);
         if (ten) {
           const { rows: invRows } = await pool.query(
             `SELECT invited_name FROM invitations
@@ -384,33 +459,104 @@ const requestPhoneChange = async (req, res) => {
       return fail(res, 400, "invalid_input", "A valid 10-digit phone number is required");
     }
 
-    const normalized = `91${ten}`;
-
     const { rows: currentRows } = await pool.query(
       `SELECT phone FROM users WHERE id = $1 LIMIT 1`,
       [userId],
     );
     if (!currentRows.length) return fail(res, 404, "not_found", "User not found");
-    const currentPhone = normalizePhone(currentRows[0].phone);
 
-    if (currentPhone === normalized) {
+    const currentTen = normalizeTenDigit(currentRows[0].phone);
+    if (currentTen === ten) {
       return fail(res, 400, "same_phone", "This is already your current phone number");
     }
 
-    const { rows: existingRows } = await pool.query(
-      `SELECT id FROM users WHERE phone = $1 LIMIT 1`,
-      [normalized],
+    const { rows: targetRows } = await pool.query(
+      `SELECT id, name, phone
+         FROM users
+        WHERE RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $1
+          AND id <> $2
+        LIMIT 1`,
+      [ten, userId],
     );
 
-    const willMerge = existingRows.length > 0;
+    if (!targetRows.length) {
+      return res.json({
+        success: true,
+        phone: ten,
+        willMerge: false,
+        message: "Verify the new number with the OTP to complete the change.",
+      });
+    }
+
+    const targetUserId = targetRows[0].id;
+    const targetName = (targetRows[0].name || "").trim();
+
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(DISTINCT acc_id)::int AS account_count
+         FROM (
+           SELECT account_id AS acc_id FROM account_members
+            WHERE user_id = $1 AND status = 'active'
+           UNION
+           SELECT id AS acc_id FROM accounts
+            WHERE created_by = $1
+           UNION
+           SELECT account_id AS acc_id FROM staff
+            WHERE user_id = $1 AND status = 'active'
+           UNION
+           SELECT account_id AS acc_id FROM members
+            WHERE user_id = $1 AND status = 'active'
+         ) sub`,
+      [targetUserId],
+    );
+    const accountCount = countRows[0]?.account_count ?? 0;
+
+    const { rows: accountRows } = await pool.query(
+      `SELECT name FROM (
+         SELECT a.name
+           FROM accounts a
+           JOIN account_members am
+             ON am.account_id = a.id
+            AND am.user_id    = $1
+            AND am.status     = 'active'
+         UNION
+         SELECT a.name
+           FROM accounts a
+          WHERE a.created_by = $1
+         UNION
+         SELECT a.name
+           FROM accounts a
+           JOIN staff s
+             ON s.account_id = a.id
+            AND s.user_id    = $1
+            AND s.status     = 'active'
+         UNION
+         SELECT a.name
+           FROM accounts a
+           JOIN members m
+             ON m.account_id = a.id
+            AND m.user_id    = $1
+            AND m.status     = 'active'
+       ) sub
+       WHERE name IS NOT NULL AND name <> ''
+       ORDER BY name
+       LIMIT 5`,
+      [targetUserId],
+    );
 
     return res.json({
       success: true,
       phone: ten,
-      willMerge,
-      message: willMerge
-        ? "This number already belongs to another login. Verify it with OTP to merge the two logins into one."
-        : "Verify the new number with the OTP to complete the change.",
+      willMerge: true,
+      mergeTarget: {
+        userId: targetUserId,
+        name: targetName || null,
+        phone: ten,
+        accountCount,
+        accountNames: accountRows.map((r) => r.name),
+      },
+      message: targetName
+        ? `This number already belongs to ${targetName}.`
+        : "This number already belongs to another login.",
     });
   } catch (err) {
     console.error("requestPhoneChange error:", err);
@@ -435,6 +581,8 @@ const confirmPhoneChange = async (req, res) => {
     const body = req.body || {};
     const raw = body.newPhone ?? body.new_phone ?? body.phone;
     const accessToken = body.accessToken ?? body.access_token ?? null;
+    const mergeConfirmed =
+      body.mergeConfirmed === true || body.merge_confirmed === true;
 
     const ten = normalizeTenDigit(raw);
     if (!ten) {
@@ -448,8 +596,6 @@ const confirmPhoneChange = async (req, res) => {
 
     const normalized = `91${ten}`;
 
-    // Verify OTP before opening the transaction. Verification is the
-    // security gate that makes the merge safe.
     const verification = await verifyMsg91AccessToken(accessToken, normalized);
     if (!verification.ok) {
       client.release();
@@ -470,44 +616,46 @@ const confirmPhoneChange = async (req, res) => {
     }
 
     const current = currentRows[0];
-    const currentPhone = normalizePhone(current.phone);
+    const currentTen = normalizeTenDigit(current.phone);
 
-    if (currentPhone === normalized) {
+    if (currentTen === ten) {
       await client.query("ROLLBACK");
       client.release();
       return fail(res, 400, "same_phone", "This is already your current phone number");
     }
 
     const { rows: targetRows } = await client.query(
-      `SELECT id, phone FROM users WHERE phone = $1 FOR UPDATE`,
-      [normalized],
+      `SELECT id, phone FROM users
+        WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
+          AND id <> $2
+        FOR UPDATE`,
+      [ten, userId],
     );
 
-    if (targetRows.length > 0 && targetRows[0].id !== current.id) {
+    const hasTarget = targetRows.length > 0 && targetRows[0].id !== current.id;
+
+    if (hasTarget) {
+      if (!mergeConfirmed) {
+        await client.query("ROLLBACK");
+        client.release();
+        return fail(
+          res,
+          409,
+          "merge_required",
+          "This number already belongs to another login. Confirm the merge to continue.",
+        );
+      }
+
       const sourceUserId = targetRows[0].id;
 
-      // Free the target phone so the current user's UPDATE doesn't
-      // collide with the source's UNIQUE phone constraint.
-      //
-      // users.phone is VARCHAR(15) and NOT NULL. Build a placeholder
-      // that fits within 15 chars and cannot collide with a real
-      // number (real numbers are "91" + 10 digits = 12 chars, all
-      // digits). "merged:" + first 8 chars of the UUID = 15 chars.
-      // The row is deleted before COMMIT so the placeholder is never
-      // visible outside this transaction.
       const placeholder = `merged:${String(sourceUserId).slice(0, 8)}`;
-
       await client.query(
         `UPDATE users SET phone = $1, updated_at = NOW() WHERE id = $2`,
         [placeholder, sourceUserId],
       );
 
-      // Move every FK reference from the source to the current user,
-      // and carry over photo / name where the current user is missing
-      // them, then delete the source user.
       await mergeUsers(client, current.id, sourceUserId);
 
-      // Now claim the target phone for the current user.
       await client.query(
         `UPDATE users SET phone = $1, updated_at = NOW() WHERE id = $2`,
         [normalized, current.id],
@@ -519,13 +667,13 @@ const confirmPhoneChange = async (req, res) => {
       );
     }
 
-    if (currentPhone) {
+    if (currentTen) {
       await client.query(
         `UPDATE invitations
             SET invited_phone = $1
           WHERE RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
             AND status = 'pending'`,
-        [normalized, normalizeTenDigit(currentPhone)],
+        [normalized, currentTen],
       );
     }
 
@@ -535,7 +683,10 @@ const confirmPhoneChange = async (req, res) => {
       success: true,
       requiresLogout: true,
       newPhone: ten,
-      message: "Phone number updated. Please sign in again with your new number.",
+      merged: hasTarget,
+      message: hasTarget
+        ? "Accounts merged. Please sign in again with the new number."
+        : "Phone number updated. Please sign in again with your new number.",
     });
   } catch (err) {
     try { await client.query("ROLLBACK"); } catch {}
