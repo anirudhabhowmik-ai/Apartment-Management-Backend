@@ -65,10 +65,6 @@ function normalizeMonth(raw) {
 
 // ---------------------------------------------------------------------------
 // Identity lock helper
-//
-// A member/staff row's identity (name, phone, photo) is locked to the
-// owner/admin when the linked user has an ACTIVE account_members row for
-// this account. That means they've accepted an invitation and "joined".
 // ---------------------------------------------------------------------------
 
 async function hasActiveAccountMemberRow(client, accountId, userId) {
@@ -399,6 +395,8 @@ const listMembers = async (req, res) => {
 
     const month = normalizeMonth(req.query?.month);
 
+    // NOTE: only active members are returned. Inactive (soft-deleted) rows
+    // are excluded so they never leak into dashboards or pickers.
     const { rows } = await pool.query(
       `SELECT m.id, m.account_id, m.user_id, m.role,
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
@@ -414,6 +412,7 @@ const listMembers = async (req, res) => {
          FROM members m
          JOIN users u ON u.id = m.user_id
         WHERE m.account_id = $1
+          AND m.status     = 'active'
         ORDER BY m.flat_number, u.name`,
       [accountId],
     );
@@ -660,12 +659,6 @@ const createMember = async (req, res) => {
 
 // ===========================================================================
 // updateMember
-//
-// Admin/owner can edit every field.
-//
-// Exception: if the target user has an ACTIVE account_members row, the
-// identity fields (name, phone, photo) are locked — only the user
-// themselves can change them (via the profile editor).
 // ===========================================================================
 const updateMember = async (req, res) => {
   const client = await pool.connect();
@@ -697,14 +690,12 @@ const updateMember = async (req, res) => {
 
     const targetUserId = rows[0].user_id;
 
-    // ── Is this person's identity locked? ──
     const identityLocked = await hasActiveAccountMemberRow(
       client,
       accountId,
       targetUserId,
     );
 
-    // ── Identity fields (name, phone, photo_url) ──
     const hasName = Object.prototype.hasOwnProperty.call(req.body, "name");
     const hasPhone = Object.prototype.hasOwnProperty.call(req.body, "phone");
     const hasPhoto = Object.prototype.hasOwnProperty.call(req.body, "photo_url");
@@ -735,7 +726,6 @@ const updateMember = async (req, res) => {
       return fail(res, 400, "invalid_input", "A valid 10-digit phone is required");
     }
 
-    // ── Non-identity member fields ──
     const allowedFields = [
       "role",
       "wing",
@@ -775,16 +765,12 @@ const updateMember = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // ── Write identity changes to the shared users row ──
     if (!identityLocked && (hasName || hasPhone || hasPhoto)) {
-      // Phone collision check.
       if (hasPhone) {
         const { rows: conflict } = await client.query(
           `SELECT id FROM users WHERE phone = $1 AND id <> $2 LIMIT 1`,
           [`91${newPhone}`, targetUserId],
         );
-        // Also try the bare 10-digit variant in case the column stores
-        // either form historically.
         let conflictRows = conflict;
         if (!conflictRows.length) {
           const { rows: alt } = await client.query(
@@ -811,8 +797,6 @@ const updateMember = async (req, res) => {
         setParts.push(`name = $${values.length}`);
       }
       if (hasPhone) {
-        // Store in E.164-ish form `91XXXXXXXXXX` to match the rest of
-        // the codebase (authController.normalizePhone).
         values.push(`91${newPhone}`);
         setParts.push(`phone = $${values.length}`);
       }
@@ -830,7 +814,6 @@ const updateMember = async (req, res) => {
       );
     }
 
-    // ── Non-identity member fields ──
     if (Object.keys(updates).length > 0) {
       const keys = Object.keys(updates);
       const values = keys.map((k) => updates[k]);
@@ -1115,6 +1098,10 @@ const updatePhoneVisibility = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// STAFF
+// ===========================================================================
+
 const listStaff = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -1133,6 +1120,8 @@ const listStaff = async (req, res) => {
 
     const month = normalizeMonth(req.query?.month);
 
+    // NOTE: only active staff are returned. Inactive (soft-deleted) rows
+    // are excluded so they never leak into dashboards or pickers.
     const { rows } = await pool.query(
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
@@ -1147,6 +1136,7 @@ const listStaff = async (req, res) => {
          FROM staff s
          JOIN users u ON u.id = s.user_id
         WHERE s.account_id = $1
+          AND s.status     = 'active'
         ORDER BY u.name`,
       [accountId],
     );
@@ -1350,8 +1340,6 @@ const createStaff = async (req, res) => {
 
 // ===========================================================================
 // updateStaff
-//
-// Same identity-lock rules as updateMember.
 // ===========================================================================
 const updateStaff = async (req, res) => {
   const client = await pool.connect();

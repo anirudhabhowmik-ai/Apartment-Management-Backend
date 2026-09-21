@@ -248,9 +248,6 @@ const createInvitation = async (req, res) => {
 //              - Adds `can_dismiss` = TRUE only when a matching invitation
 //                row exists with status='accepted' AND dismissed_at IS NULL
 //                AND the grant role is member_visibility or staff_visibility.
-//                This is the "Dismiss alert" flag; TRUE only for FRESH
-//                member/staff accepts. Downgraded admins and auto-granted
-//                rows get FALSE.
 //
 //   Bucket 2 — Non-accepted invitation rows (pending/rejected/cancelled/
 //              revoked) read from `invitations`.
@@ -425,17 +422,6 @@ const deleteInvitation = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// DISMISS (× on the "Dismiss alert" card)
-//
-// The frontend passes the row `id`. That id is either:
-//   - a real invitation id when `can_dismiss = true` (fresh accept), OR
-//   - an account_members.id when there is no accepted invite row.
-//
-// Only fresh accepts are dismissable. If we get the second form we just
-// no-op with success so stale clients don't error out.
-// ===========================================================================
-
 const dismissInvitation = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -444,7 +430,6 @@ const dismissInvitation = async (req, res) => {
     const requesterRoles = await getRolesForAccount(userId, accountId);
     if (requesterRoles.length === 0) return fail(res, 403, "forbidden");
 
-    // 1. Direct match by invitation id.
     const { rowCount: direct } = await pool.query(
       `UPDATE invitations
           SET dismissed_at = NOW()
@@ -453,9 +438,6 @@ const dismissInvitation = async (req, res) => {
     );
     if (direct > 0) return res.json({ success: true });
 
-    // 2. Fallback: id is an account_members.id (grant without a fresh
-    //    accepted invite row). Nothing to dismiss — return success so
-    //    the frontend doesn't blow up on stale data.
     const { rows: amRows } = await pool.query(
       `SELECT user_id, role FROM account_members
         WHERE id = $1 AND account_id = $2
@@ -830,22 +812,18 @@ const previewRevoke = async (req, res) => {
 // ===========================================================================
 // REVOKE
 //
-// Owner-only. Revokes a specific role from a user.
+// Owner-only OR self.
 //
-//   role=admin              → deactivate the admin grant. The
-//                             `keepMemberVisibility` / `keepStaffVisibility`
-//                             body flags decide whether the corresponding
-//                             member/staff grants survive. These toggles
-//                             are ONLY meaningful for admin revokes.
+//   role=admin              → revoke admin only.
+//   role=member_visibility  → revoke member only.
+//   role=staff_visibility   → revoke staff only.
+//   role=all                → revoke EVERY role the user holds on this
+//                             account (admin + member + staff). Used by
+//                             the home-page "Withdraw my access" button.
 //
-//   role=member_visibility  → deactivate the member grant + revoke the
-//                             member invite row. Toggles ignored.
-//
-//   role=staff_visibility   → deactivate the staff grant + revoke the
-//                             staff invite row. Toggles ignored.
-//
-// `listInvitations` reads accepted grants from `account_members` (source
-// of truth), so flipping rows in that table is enough to update the UI.
+// The owner cannot be revoked. Non-owners may self-revoke any role.
+// The `keepMemberVisibility` / `keepStaffVisibility` body flags are only
+// honored when `role=admin`.
 // ===========================================================================
 
 const revokeAccess = async (req, res) => {
@@ -857,16 +835,23 @@ const revokeAccess = async (req, res) => {
     const body = req.body || {};
 
     const requesterRoles = await getRolesForAccount(requesterId, accountId);
-    if (!isOwner(requesterRoles)) return fail(res, 403, "owner_required");
 
-    // Default to admin for backward compat with older clients.
+    // Owner can revoke anyone. Non-owners may only revoke themselves.
+    const selfRevoking = requesterId === targetUserId;
+    if (!isOwner(requesterRoles) && !selfRevoking) {
+      return fail(res, 403, "owner_required");
+    }
+
     const roleToRevoke = rawRole || "admin";
     if (
-      !["admin", "member_visibility", "staff_visibility"].includes(roleToRevoke)
+      !["admin", "member_visibility", "staff_visibility", "all"].includes(
+        roleToRevoke,
+      )
     ) {
       return fail(res, 400, "invalid_input");
     }
 
+    // The owner cannot be revoked.
     const { rows: ownerRows } = await pool.query(
       `SELECT created_by FROM accounts WHERE id = $1`,
       [accountId],
@@ -897,8 +882,50 @@ const revokeAccess = async (req, res) => {
 
     await client.query("BEGIN");
 
+    const kept = [];
+    const revoked = [];
+
     // ─────────────────────────────────────────────────────────────────────
-    // CASE 1 — Revoke MEMBER only
+    // role=all — revoke everything in one transaction.
+    // ─────────────────────────────────────────────────────────────────────
+    if (roleToRevoke === "all") {
+      const { rows: deactivatedRows } = await client.query(
+        `UPDATE account_members
+            SET status = 'inactive', updated_at = NOW()
+          WHERE account_id = $1
+            AND user_id    = $2
+            AND status     = 'active'
+          RETURNING role`,
+        [accountId, targetUserId],
+      );
+
+      if (deactivatedRows.length === 0) {
+        await client.query("ROLLBACK");
+        return fail(res, 404, "not_found");
+      }
+
+      await client.query(
+        `UPDATE invitations
+            SET status = 'revoked',
+                responded_at = NOW()
+          WHERE account_id  = $1
+            AND accepted_by = $2
+            AND status      = 'accepted'`,
+        [accountId, targetUserId],
+      );
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        removed: "all",
+        kept: [],
+        revoked: deactivatedRows.map((r) => r.role),
+      });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // role=member_visibility — revoke member only.
     // ─────────────────────────────────────────────────────────────────────
     if (roleToRevoke === "member_visibility") {
       const { rowCount: deactivated } = await client.query(
@@ -936,7 +963,7 @@ const revokeAccess = async (req, res) => {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // CASE 2 — Revoke STAFF only
+    // role=staff_visibility — revoke staff only.
     // ─────────────────────────────────────────────────────────────────────
     if (roleToRevoke === "staff_visibility") {
       const { rowCount: deactivated } = await client.query(
@@ -974,7 +1001,7 @@ const revokeAccess = async (req, res) => {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // CASE 3 — Revoke ADMIN (with optional keep member / keep staff)
+    // role=admin — revoke admin. The toggles are only meaningful here.
     // ─────────────────────────────────────────────────────────────────────
     const keepMemberVisibility =
       body.keepMemberVisibility === undefined
@@ -1011,10 +1038,6 @@ const revokeAccess = async (req, res) => {
       [accountId, targetUserId],
     );
 
-    const kept = [];
-    const revoked = [];
-
-    // member_visibility
     if (keepMemberVisibility && hasMemberRow) {
       await client.query(
         `INSERT INTO account_members (account_id, user_id, role, status)
@@ -1055,7 +1078,6 @@ const revokeAccess = async (req, res) => {
       revoked.push("member_visibility");
     }
 
-    // staff_visibility
     if (keepStaffVisibility && hasStaffRow) {
       await client.query(
         `INSERT INTO account_members (account_id, user_id, role, status)
