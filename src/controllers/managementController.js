@@ -39,6 +39,34 @@ const toNullableNote = (v) => {
   return s.length === 0 ? null : s;
 };
 
+// ---------------------------------------------------------------------------
+// normalizeRole
+//
+// Roles are FREE-FORM strings. Any non-empty value is accepted. The only
+// normalization we apply is:
+//   - trim outer whitespace
+//   - collapse runs of inner whitespace to a single space
+//   - drop control characters
+//   - lowercase
+//
+// This keeps create/edit round-trips stable: "Manager", "  manager  ",
+// and "MANAGER" all become "manager" everywhere.
+//
+// The DB column must NOT have a fixed-value CHECK constraint for this
+// to work. See the migration that drops `staff_role_check` /
+// `members_role_check` and replaces them with the permissive
+// `staff_role_valid` / `members_role_valid`.
+// ---------------------------------------------------------------------------
+function normalizeRole(raw) {
+  if (raw === null || raw === undefined) return "";
+  const s = String(raw).trim();
+  if (!s) return "";
+  return s
+    .replace(/\s+/g, " ")
+    .replace(/[\u0000-\u001F]/g, "")
+    .toLowerCase();
+}
+
 const fail = (res, status, code, message) =>
   res.status(status).json({ code, message });
 
@@ -62,10 +90,6 @@ function normalizeMonth(raw) {
   if (typeof raw === "string" && /^\d{4}-\d{2}$/.test(raw)) return raw;
   return new Date().toISOString().slice(0, 7);
 }
-
-// ---------------------------------------------------------------------------
-// Identity lock helper
-// ---------------------------------------------------------------------------
 
 async function hasActiveAccountMemberRow(client, accountId, userId) {
   if (!accountId || !userId) return false;
@@ -395,8 +419,6 @@ const listMembers = async (req, res) => {
 
     const month = normalizeMonth(req.query?.month);
 
-    // NOTE: only active members are returned. Inactive (soft-deleted) rows
-    // are excluded so they never leak into dashboards or pickers.
     const { rows } = await pool.query(
       `SELECT m.id, m.account_id, m.user_id, m.role,
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
@@ -519,9 +541,6 @@ const getMember = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// createMember
-// ===========================================================================
 const createMember = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -551,7 +570,8 @@ const createMember = async (req, res) => {
       return fail(res, 400, "invalid_input", "Flat number is required");
     }
 
-    const memberRole = String(rawMemberRole || "").trim();
+    // Free-form role: any non-empty string up to 60 characters.
+    const memberRole = normalizeRole(rawMemberRole);
     if (!memberRole) {
       return fail(res, 400, "invalid_input", "Member role is required");
     }
@@ -657,9 +677,6 @@ const createMember = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// updateMember
-// ===========================================================================
 const updateMember = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -743,7 +760,7 @@ const updateMember = async (req, res) => {
     }
 
     if (updates.role !== undefined) {
-      const roleStr = String(updates.role || "").trim();
+      const roleStr = normalizeRole(updates.role);
       if (!roleStr) {
         return fail(res, 400, "invalid_input", "Role cannot be empty");
       }
@@ -1120,8 +1137,6 @@ const listStaff = async (req, res) => {
 
     const month = normalizeMonth(req.query?.month);
 
-    // NOTE: only active staff are returned. Inactive (soft-deleted) rows
-    // are excluded so they never leak into dashboards or pickers.
     const { rows } = await pool.query(
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
@@ -1224,9 +1239,6 @@ const getStaff = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// createStaff
-// ===========================================================================
 const createStaff = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1245,7 +1257,8 @@ const createStaff = async (req, res) => {
 
     const { role: rawStaffRole, monthly_salary = 0 } = body;
 
-    const staffRole = String(rawStaffRole || "").trim();
+    // Free-form role: any non-empty string up to 60 characters.
+    const staffRole = normalizeRole(rawStaffRole);
     if (!staffRole) {
       return fail(res, 400, "invalid_input", "Role is required");
     }
@@ -1338,9 +1351,6 @@ const createStaff = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// updateStaff
-// ===========================================================================
 const updateStaff = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1416,7 +1426,7 @@ const updateStaff = async (req, res) => {
     }
 
     if (updates.role !== undefined) {
-      const roleStr = String(updates.role || "").trim();
+      const roleStr = normalizeRole(updates.role);
       if (!roleStr) {
         return fail(res, 400, "invalid_input", "Role cannot be empty");
       }
