@@ -23,17 +23,23 @@ if (typeof authMiddleware !== "function") {
 const {
   createAccount,
   listAccounts,
+  getAccountPeople,
   updateAccount,
   deleteAccount,
   transferOwnership,
   setLastAccount,
 } = require("../controllers/accountController");
 
+// Create + list
 router.post("/", authMiddleware, createAccount);
 router.get("/", authMiddleware, listAccounts);
 
-// Must come BEFORE "/:id" so it doesn't get shadowed.
+// Static "me/*" route — must come BEFORE "/:id" routes.
 router.patch("/me/last-account", authMiddleware, setLastAccount);
+
+// People for a specific account (owner + admins).
+// Must come BEFORE the generic "/:id" routes so it isn't shadowed.
+router.get("/:id/people", authMiddleware, getAccountPeople);
 
 // Edit account (name and/or photo)
 router.patch("/:id", authMiddleware, updateAccount);

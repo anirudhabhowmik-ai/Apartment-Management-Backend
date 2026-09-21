@@ -61,6 +61,13 @@ const createAccount = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// listAccounts
+//
+// Adds owner_name / owner_phone / owner_photo_url to every row so the
+// frontend can render the owner's identity without an extra request.
+// ===========================================================================
+
 const listAccounts = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -76,7 +83,10 @@ const listAccounts = async (req, res) => {
         sub.created_by,
         sub.created_at,
         sub.updated_at,
-        sub.role
+        sub.role,
+        sub.owner_name,
+        sub.owner_phone,
+        sub.owner_photo_url
       FROM (
         SELECT DISTINCT ON (a.id)
           a.id,
@@ -87,6 +97,9 @@ const listAccounts = async (req, res) => {
           a.created_at,
           a.updated_at,
           am.role,
+          owner.name      AS owner_name,
+          owner.phone     AS owner_phone,
+          owner.photo_url AS owner_photo_url,
           CASE
             WHEN a.created_by = $1 THEN 1
             WHEN am.role = 'admin' THEN 2
@@ -99,6 +112,8 @@ const listAccounts = async (req, res) => {
           ON am.account_id = a.id
          AND am.user_id = $1
          AND am.status = 'active'
+        LEFT JOIN users owner
+          ON owner.id = a.created_by
         WHERE
           a.created_by = $1
 
@@ -141,6 +156,97 @@ const listAccounts = async (req, res) => {
     });
   } catch (error) {
     console.error("List accounts error:", error);
+    return fail(res, 500, "server_error");
+  }
+};
+
+// ===========================================================================
+// getAccountPeople
+//
+// GET /api/accounts/:id/people
+//
+// Returns:
+//   {
+//     owner:  { user_id, name, phone, photo_url } | null,
+//     admins: [ { user_id, name, phone, photo_url } ]
+//   }
+//
+// Owner is always first in `admins` was NOT included — admins list
+// explicitly excludes the owner because the owner is rendered as a
+// separate row on the frontend.
+//
+// Accessible to any active member of the account (owner, admin, member,
+// staff). It only exposes public identity (name, phone, photo) — same
+// data the invitations list already exposes.
+// ===========================================================================
+
+const getAccountPeople = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { id: accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated");
+
+    // Confirm the requester has any active role on this account.
+    const { rows: memberRows } = await pool.query(
+      `SELECT role FROM account_members
+        WHERE account_id = $1
+          AND user_id    = $2
+          AND status     = 'active'
+        LIMIT 1`,
+      [accountId, userId],
+    );
+
+    const isOwner = await pool.query(
+      `SELECT 1 FROM accounts WHERE id = $1 AND created_by = $2`,
+      [accountId, userId],
+    );
+
+    if (memberRows.length === 0 && isOwner.rows.length === 0) {
+      return fail(res, 403, "no_account_access");
+    }
+
+    const { rows: ownerRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+         FROM accounts a
+         JOIN users u ON u.id = a.created_by
+        WHERE a.id = $1
+        LIMIT 1`,
+      [accountId],
+    );
+
+    const owner = ownerRows.length
+      ? {
+          user_id: ownerRows[0].user_id,
+          name: ownerRows[0].name ?? "",
+          phone: ownerRows[0].phone ?? null,
+          photo_url: ownerRows[0].photo_url ?? null,
+        }
+      : null;
+
+    const { rows: adminRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+         FROM account_members am
+         JOIN users u ON u.id = am.user_id
+         JOIN accounts a ON a.id = am.account_id
+        WHERE am.account_id = $1
+          AND am.role       = 'admin'
+          AND am.status     = 'active'
+          AND u.id         <> a.created_by
+        ORDER BY COALESCE(u.name, '')`,
+      [accountId],
+    );
+
+    const admins = adminRows.map((r) => ({
+      user_id: r.user_id,
+      name: r.name ?? "",
+      phone: r.phone ?? null,
+      photo_url: r.photo_url ?? null,
+    }));
+
+    return res.json({ owner, admins });
+  } catch (error) {
+    console.error("getAccountPeople error:", error);
     return fail(res, 500, "server_error");
   }
 };
@@ -336,6 +442,7 @@ const setLastAccount = async (req, res) => {
 module.exports = {
   createAccount,
   listAccounts,
+  getAccountPeople,
   updateAccount,
   deleteAccount,
   transferOwnership,
