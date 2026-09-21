@@ -1,3 +1,4 @@
+// src/utils/accessSync.js
 const normalizePhone = (raw) => {
   if (!raw) return null;
   const digits = String(raw).replace(/\D/g, "");
@@ -25,11 +26,18 @@ async function findUserIdByPhone(client, phone) {
  * Return users.id for `phone`, creating the row if it doesn't exist.
  * If the user already exists and has no name, seed it from `fallbackName`.
  * Never grants access — this only touches `users`.
+ *
+ * Storage format: 91XXXXXXXXXX (with the 91 country-code prefix).
+ * Every other writer in the codebase also stores the prefixed form.
+ * Reads still match on the last 10 digits so the function is correct
+ * even if a legacy row is stored bare.
  */
 async function ensureUserForPhone(client, phone, fallbackName) {
   const ten = normalizePhone(phone);
   if (!ten) return null;
 
+  // Read side is format-agnostic: matches either "9876543210" or
+  // "919876543210" by comparing the last 10 digits.
   const { rows: existing } = await client.query(
     `SELECT id, name FROM users
        WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
@@ -50,11 +58,13 @@ async function ensureUserForPhone(client, phone, fallbackName) {
     return user.id;
   }
 
+  // Write side: store the 91-prefixed form, matching every other
+  // writer in the codebase (login, phone-change, member/staff update).
   const { rows: created } = await client.query(
     `INSERT INTO users (phone, name, is_active, last_login_at)
      VALUES ($1, $2, true, NULL)
      RETURNING id`,
-    [ten, fallbackName || null],
+    [`91${ten}`, fallbackName || null],
   );
   return created[0].id;
 }
