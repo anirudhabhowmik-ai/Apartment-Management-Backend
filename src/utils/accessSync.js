@@ -26,18 +26,11 @@ async function findUserIdByPhone(client, phone) {
  * Return users.id for `phone`, creating the row if it doesn't exist.
  * If the user already exists and has no name, seed it from `fallbackName`.
  * Never grants access — this only touches `users`.
- *
- * Storage format: 91XXXXXXXXXX (with the 91 country-code prefix).
- * Every other writer in the codebase also stores the prefixed form.
- * Reads still match on the last 10 digits so the function is correct
- * even if a legacy row is stored bare.
  */
 async function ensureUserForPhone(client, phone, fallbackName) {
   const ten = normalizePhone(phone);
   if (!ten) return null;
 
-  // Read side is format-agnostic: matches either "9876543210" or
-  // "919876543210" by comparing the last 10 digits.
   const { rows: existing } = await client.query(
     `SELECT id, name FROM users
        WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
@@ -58,8 +51,6 @@ async function ensureUserForPhone(client, phone, fallbackName) {
     return user.id;
   }
 
-  // Write side: store the 91-prefixed form, matching every other
-  // writer in the codebase (login, phone-change, member/staff update).
   const { rows: created } = await client.query(
     `INSERT INTO users (phone, name, is_active, last_login_at)
      VALUES ($1, $2, true, NULL)
@@ -70,7 +61,7 @@ async function ensureUserForPhone(client, phone, fallbackName) {
 }
 
 // -----------------------------------------------------------------------------
-// Membership checks (by user_id — members/staff no longer carry phone)
+// Membership checks (by user_id)
 // -----------------------------------------------------------------------------
 
 async function hasActiveMemberRow(client, accountId, userId) {
@@ -127,27 +118,42 @@ async function deactivateAccessRole(client, accountId, userId, role) {
 }
 
 /**
- * Grant EXACTLY ONE role for (account, user).
+ * Grant a role for (account, user) respecting coexistence rules:
  *
- * Deactivates every other active role for the same (account, user),
- * then upserts the target role as active. So:
- *   admin               replaces member_visibility / staff_visibility
- *   member_visibility   replaces admin / staff_visibility
- *   staff_visibility    replaces admin / member_visibility
+ *   ┌──────────────────────┬──────────────────────────────────────────────┐
+ *   │ New role             │ Behaviour                                    │
+ *   ├──────────────────────┼──────────────────────────────────────────────┤
+ *   │ member_visibility    │ Adds/activates member. Does NOT touch staff. │
+ *   │ staff_visibility     │ Adds/activates staff. Does NOT touch member. │
+ *   │ admin                │ Deactivates every other active role for the  │
+ *   │                      │ user (member, staff, member+staff), then     │
+ *   │                      │ activates admin. Admin is exclusive.         │
+ *   │ ownership_transfer   │ Same as admin — deactivates everything else. │
+ *   └──────────────────────┴──────────────────────────────────────────────┘
  */
+const LOWER_ROLES = new Set(["member_visibility", "staff_visibility"]);
+const EXCLUSIVE_ROLES = new Set(["admin", "ownership_transfer"]);
+
 async function grantRoleWithImpliedRoles(client, accountId, userId, role) {
-  if (!userId) return;
+  if (!userId || !role) return;
 
-  await client.query(
-    `UPDATE account_members
-        SET status = 'inactive', updated_at = NOW()
-      WHERE account_id = $1
-        AND user_id    = $2
-        AND role      <> $3
-        AND status     = 'active'`,
-    [accountId, userId, role],
-  );
+  // ── 1. Exclusive roles evict every other active role for this user. ──
+  if (EXCLUSIVE_ROLES.has(role)) {
+    await client.query(
+      `UPDATE account_members
+          SET status = 'inactive', updated_at = NOW()
+        WHERE account_id = $1
+          AND user_id    = $2
+          AND status     = 'active'
+          AND role      <> $3`,
+      [accountId, userId, role],
+    );
+  }
 
+  // ── 2. Activate the target role.
+  //
+  //       For member / staff this is purely additive — no other active
+  //       rows are touched, so member and staff coexist.
   await client.query(
     `INSERT INTO account_members (account_id, user_id, role, status)
      VALUES ($1, $2, $3, 'active')
@@ -161,11 +167,6 @@ async function grantRoleWithImpliedRoles(client, accountId, userId, role) {
 // Auto-grant eligibility
 // -----------------------------------------------------------------------------
 
-/**
- * True when the user is:
- *   - the account owner (accounts.created_by = userId), OR
- *   - an active admin on this account.
- */
 async function isEligibleForAutoGrant(client, accountId, userId) {
   if (!userId) return false;
 
@@ -198,4 +199,6 @@ module.exports = {
   deactivateAccessRole,
   grantRoleWithImpliedRoles,
   isEligibleForAutoGrant,
+  LOWER_ROLES,
+  EXCLUSIVE_ROLES,
 };

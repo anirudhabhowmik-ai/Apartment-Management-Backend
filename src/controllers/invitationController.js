@@ -29,6 +29,14 @@ const VALID_ROLES = [
 
 const ADMIN_LIKE_ROLES = ["admin", "ownership_transfer"];
 
+// Roles that can coexist with each other (member + staff together).
+const LOWER_ROLES = ["member_visibility", "staff_visibility"];
+
+// Roles that are exclusive — an admin or ownership invite evicts every
+// other pending invite for the same phone, including the other exclusive
+// role.
+const EXCLUSIVE_ROLES = ["admin", "ownership_transfer"];
+
 const ROLE_RANK = {
   member_visibility: 1,
   staff_visibility: 1,
@@ -49,6 +57,9 @@ const isContinuationRow = (row) =>
   row.status === "pending" &&
   row.accepted_by != null &&
   row.accepted_by === row.invited_by;
+
+const isLowerRole = (r) => LOWER_ROLES.includes(r);
+const isExclusiveRole = (r) => EXCLUSIVE_ROLES.includes(r);
 
 async function getRolesForAccount(userId, accountId) {
   const { rows: ownerRows } = await pool.query(
@@ -182,13 +193,33 @@ const preflight = async (req, res) => {
     const realPendingRows = pendingRows.filter((r) => !isContinuationRow(r));
 
     if (realPendingRows.length) {
-      const top = realPendingRows[0];
-      if (top.role === role) {
+      const sameRolePending = realPendingRows.find((r) => r.role === role);
+
+      if (sameRolePending) {
         return res.json({ kind: "pending" });
+      }
+
+      // For lower↔lower (member↔staff) coexistence, no need to warn.
+      if (isLowerRole(role)) {
+        const onlyLowerPending = realPendingRows.every((r) =>
+          isLowerRole(r.role),
+        );
+        if (onlyLowerPending) {
+          return res.json({ kind: "ok" });
+        }
+      }
+
+      // For exclusive roles (admin / ownership), let the client confirm.
+      if (isExclusiveRole(role)) {
+        const top = realPendingRows[0];
+        return res.json({
+          kind: "member_to_admin",
+          memberName: top.invited_name ?? null,
+        });
       }
     }
 
-    // ── Admin promotion path ──
+    // ── Admin promotion path (accepted lower role exists) ──
     if (role === "admin") {
       const { rows: acceptedLowerRoles } = await pool.query(
         `SELECT role, invited_name
@@ -219,6 +250,22 @@ const preflight = async (req, res) => {
 
 // ===========================================================================
 // CREATE
+//
+// Role coexistence rules:
+//
+//   ┌──────────────────┬───────────────┬──────────────────────────────────┐
+//   │ Existing pending │ New invite    │ Action                           │
+//   ├──────────────────┼───────────────┼──────────────────────────────────┤
+//   │ (none)           │ member/staff  │ insert new row                   │
+//   │ member           │ staff         │ KEEP member, INSERT staff        │
+//   │ staff            │ member        │ KEEP staff,  INSERT member       │
+//   │ member/staff     │ member/staff  │ idempotent if same role          │
+//   │ member/staff     │ admin         │ cancel lower, INSERT admin       │
+//   │ member/staff     │ ownership     │ cancel lower, INSERT ownership   │
+//   │ admin            │ ownership     │ cancel admin, INSERT ownership   │
+//   │ ownership        │ admin         │ cancel ownership, INSERT admin   │
+//   │ admin/ownership  │ member/staff  │ cancel exclusive, INSERT lower   │
+//   └──────────────────┴───────────────┴──────────────────────────────────┘
 // ===========================================================================
 
 const createInvitation = async (req, res) => {
@@ -285,9 +332,10 @@ const createInvitation = async (req, res) => {
       }
     }
 
-    // ── Does a pending row already exist for this phone? ──
+    // ── Load ALL pending rows for this phone (may be several) ──
     const { rows: pendingRows } = await client.query(
-      `SELECT id, role, invited_name, invited_by, accepted_by, status
+      `SELECT id, role, invited_name, invited_by, accepted_by, status,
+              target_member_id, target_staff_id
          FROM invitations
         WHERE account_id = $1
           AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
@@ -299,138 +347,158 @@ const createInvitation = async (req, res) => {
 
     const realPending = pendingRows.filter((r) => !isContinuationRow(r));
 
-    if (realPending.length) {
-      const existing = realPending[0];
-
-      // Same role → idempotent.
-      if (existing.role === role) {
-        const { rows: sameRows } = await client.query(
-          `SELECT id, account_id, invited_phone, invited_name, role,
-                  status, created_at
-             FROM invitations
-            WHERE id = $1`,
-          [existing.id],
-        );
-
-        if (role === "ownership_transfer") {
-          await syncContinuationRows(
-            client,
-            accountId,
-            userId,
-            existing.id,
-            predecessorContinuationRoles,
-          );
-        }
-
-        await client.query("COMMIT");
-        return res.status(200).json(sameRows[0]);
-      }
-
-      // Different role → update in place.
-      const { rows: upgraded } = await client.query(
-        `UPDATE invitations
-            SET role               = $1,
-                invited_name       = COALESCE($2, invited_name),
-                target_member_id   = COALESCE($3, target_member_id),
-                target_staff_id    = COALESCE($4, target_staff_id),
-                responded_at       = NULL,
-                dismissed_at       = NULL
-          WHERE id = $5
-          RETURNING id, account_id, invited_phone, invited_name, role,
-                    status, created_at`,
-        [
-          role,
-          name || null,
-          targetMemberId || null,
-          targetStaffId || null,
-          existing.id,
-        ],
-      );
-
+    // ── CASE 1: Same role already pending → idempotent ──
+    const sameRoleRow = realPending.find((r) => r.role === role);
+    if (sameRoleRow) {
       if (role === "ownership_transfer") {
         await syncContinuationRows(
           client,
           accountId,
           userId,
-          existing.id,
+          sameRoleRow.id,
           predecessorContinuationRoles,
         );
-      } else if (existing.role === "ownership_transfer") {
-        await deleteContinuationRowsForOwner(client, accountId, userId);
       }
 
+      const { rows: sameRows } = await client.query(
+        `SELECT id, account_id, invited_phone, invited_name, role,
+                status, created_at
+           FROM invitations
+          WHERE id = $1`,
+        [sameRoleRow.id],
+      );
+
       await client.query("COMMIT");
-      return res.status(200).json(upgraded[0]);
+      return res.status(200).json(sameRows[0]);
     }
 
-    // ── No pending row — cancel stale rows for the same (phone, role) ──
-    await client.query(
-      `UPDATE invitations
-          SET status = 'cancelled',
-              responded_at = COALESCE(responded_at, NOW())
-        WHERE account_id = $1
-          AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
-          AND role = $3
-          AND status IN ('rejected','revoked','cancelled')`,
-      [accountId, phone, role],
-    );
+    // ── CASE 2: Inviting a LOWER role (member / staff) ──
+    if (isLowerRole(role)) {
+      // Evict any existing pending exclusive role.
+      const exclusiveRows = realPending.filter((r) => isExclusiveRole(r.role));
+      for (const ex of exclusiveRows) {
+        await client.query(
+          `UPDATE invitations
+              SET status = 'cancelled',
+                  responded_at = COALESCE(responded_at, NOW())
+            WHERE id = $1`,
+          [ex.id],
+        );
 
-    if (ADMIN_LIKE_ROLES.includes(role)) {
+        if (ex.role === "ownership_transfer") {
+          await deleteContinuationRowsForOwner(client, accountId, userId);
+        }
+      }
+
+      // Cancel any stale non-pending rows for the same (phone, role).
       await client.query(
         `UPDATE invitations
             SET status = 'cancelled',
                 responded_at = COALESCE(responded_at, NOW())
           WHERE account_id = $1
             AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
-            AND role IN ('member_visibility', 'staff_visibility')
-            AND status IN ('pending', 'rejected', 'revoked', 'cancelled')
-            AND NOT (
-              accepted_by IS NOT NULL
-              AND accepted_by = invited_by
-            )`,
-        [accountId, phone],
+            AND role = $3
+            AND status IN ('rejected','revoked','cancelled')`,
+        [accountId, phone, role],
       );
+
+      try {
+        const { rows } = await client.query(
+          `INSERT INTO invitations
+             (account_id, invited_by, invited_phone, invited_name, role,
+              target_member_id, target_staff_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING id, account_id, invited_phone, invited_name, role,
+                     status, created_at`,
+          [
+            accountId,
+            userId,
+            phone,
+            name || null,
+            role,
+            targetMemberId || null,
+            targetStaffId || null,
+          ],
+        );
+
+        await client.query("COMMIT");
+        return res.status(201).json(rows[0]);
+      } catch (e) {
+        await client.query("ROLLBACK");
+        if (e.code === "23505") return fail(res, 409, "conflict");
+        throw e;
+      }
     }
 
-    // ── Insert the new pending row ──
-    try {
-      const { rows } = await client.query(
-        `INSERT INTO invitations
-           (account_id, invited_by, invited_phone, invited_name, role,
-            target_member_id, target_staff_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id, account_id, invited_phone, invited_name, role,
-                   status, created_at`,
-        [
-          accountId,
-          userId,
-          phone,
-          name || null,
-          role,
-          targetMemberId || null,
-          targetStaffId || null,
-        ],
-      );
-
-      const newInvitation = rows[0];
-
-      if (role === "ownership_transfer") {
-        await syncContinuationRows(
-          client,
-          accountId,
-          userId,
-          newInvitation.id,
-          predecessorContinuationRoles,
+    // ── CASE 3: Inviting an EXCLUSIVE role (admin / ownership) ──
+    if (isExclusiveRole(role)) {
+      for (const other of realPending) {
+        await client.query(
+          `UPDATE invitations
+              SET status = 'cancelled',
+                  responded_at = COALESCE(responded_at, NOW())
+            WHERE id = $1`,
+          [other.id],
         );
+
+        if (other.role === "ownership_transfer") {
+          await deleteContinuationRowsForOwner(client, accountId, userId);
+        }
       }
 
-      await client.query("COMMIT");
-      return res.status(201).json(newInvitation);
-    } catch (e) {
-      await client.query("ROLLBACK");
-      if (e.code === "23505") return fail(res, 409, "conflict");
-      throw e;
+      await client.query(
+        `UPDATE invitations
+            SET status = 'cancelled',
+                responded_at = COALESCE(responded_at, NOW())
+          WHERE account_id = $1
+            AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
+            AND role = $3
+            AND status IN ('rejected','revoked','cancelled')`,
+        [accountId, phone, role],
+      );
+
+      try {
+        const { rows } = await client.query(
+          `INSERT INTO invitations
+             (account_id, invited_by, invited_phone, invited_name, role,
+              target_member_id, target_staff_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING id, account_id, invited_phone, invited_name, role,
+                     status, created_at`,
+          [
+            accountId,
+            userId,
+            phone,
+            name || null,
+            role,
+            targetMemberId || null,
+            targetStaffId || null,
+          ],
+        );
+
+        const newInvitation = rows[0];
+
+        if (role === "ownership_transfer") {
+          await syncContinuationRows(
+            client,
+            accountId,
+            userId,
+            newInvitation.id,
+            predecessorContinuationRoles,
+          );
+        }
+
+        await client.query("COMMIT");
+        return res.status(201).json(newInvitation);
+      } catch (e) {
+        await client.query("ROLLBACK");
+        if (e.code === "23505") return fail(res, 409, "conflict");
+        throw e;
+      }
     }
+
+    await client.query("ROLLBACK");
+    return fail(res, 400, "invalid_input");
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -496,15 +564,6 @@ async function syncContinuationRows(
 
 // ===========================================================================
 // LIST
-//
-// Response now splits owner vs admin phones:
-//   excluded_phones: [...ownerPhones, ...adminPhones]  (backward compat)
-//   owner_phones:    [...]                             (NEW)
-//   admin_phones:    [...]                             (NEW)
-//
-// The frontend uses:
-//   • For admin/member/staff invite flows → blocked = owner ∪ admin
-//   • For ownership transfer flow         → blocked = owner only
 // ===========================================================================
 
 const listInvitations = async (req, res) => {
@@ -908,6 +967,17 @@ const acceptInvitation = async (req, res) => {
         [newOwnerId, inv.account_id],
       );
 
+      // ── ADDED: Mirror the new owner as an admin row. ──
+      // The new owner must always have an active `admin` row in
+      // account_members. This also implicitly deactivates any active
+      // member/staff rows they had, since admin is exclusive.
+      await grantRoleWithImpliedRoles(
+        client,
+        inv.account_id,
+        newOwnerId,
+        "admin",
+      );
+
       // ── 4. Deactivate outgoing owner's active account_members rows ──
       if (previousOwnerId && previousOwnerId !== newOwnerId) {
         await client.query(
@@ -1017,6 +1087,8 @@ const acceptInvitation = async (req, res) => {
       );
     }
 
+    // Admin invite: cancel any other pending lower-role invites for this
+    // phone, because admin supersedes member/staff.
     if (inv.role === "admin") {
       await client.query(
         `UPDATE invitations

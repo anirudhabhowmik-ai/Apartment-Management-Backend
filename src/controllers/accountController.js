@@ -1,4 +1,3 @@
-// @ts-nocheck
 // src/controllers/accountController.js
 const { pool } = require("../config/database");
 const { grantRoleWithImpliedRoles } = require("../utils/accessSync");
@@ -63,9 +62,6 @@ const createAccount = async (req, res) => {
 
 // ===========================================================================
 // listAccounts
-//
-// Adds owner_name / owner_phone / owner_photo_url to every row so the
-// frontend can render the owner's identity without an extra request.
 // ===========================================================================
 
 const listAccounts = async (req, res) => {
@@ -162,22 +158,6 @@ const listAccounts = async (req, res) => {
 
 // ===========================================================================
 // getAccountPeople
-//
-// GET /api/accounts/:id/people
-//
-// Returns:
-//   {
-//     owner:  { user_id, name, phone, photo_url } | null,
-//     admins: [ { user_id, name, phone, photo_url } ]
-//   }
-//
-// Owner is always first in `admins` was NOT included — admins list
-// explicitly excludes the owner because the owner is rendered as a
-// separate row on the frontend.
-//
-// Accessible to any active member of the account (owner, admin, member,
-// staff). It only exposes public identity (name, phone, photo) — same
-// data the invitations list already exposes.
 // ===========================================================================
 
 const getAccountPeople = async (req, res) => {
@@ -187,7 +167,6 @@ const getAccountPeople = async (req, res) => {
 
     if (!userId) return fail(res, 401, "unauthenticated");
 
-    // Confirm the requester has any active role on this account.
     const { rows: memberRows } = await pool.query(
       `SELECT role FROM account_members
         WHERE account_id = $1
