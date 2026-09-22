@@ -20,16 +20,25 @@ router.get(
   "/accounts/:accountId/invitations",
   invitationController.listInvitations
 );
+
+// Batch delete — must be registered BEFORE the single-id route so the
+// path segment "batch" isn't captured as `:id`.
+router.delete(
+  "/accounts/:accountId/invitations/batch",
+  invitationController.deleteInvitationsBatch
+);
+
 router.delete(
   "/accounts/:accountId/invitations/:id",
   invitationController.deleteInvitation
 );
+
 router.post(
   "/accounts/:accountId/invitations/:id/dismiss",
   invitationController.dismissInvitation
 );
 
-// NEW: rename a person on this account (owner/admin only — enforced inside
+// Rename a person on this account (owner/admin only — enforced inside
 // the controller). One number → one name: updates users.name, members and
 // staff updated_at, and pending invitations.
 router.patch(

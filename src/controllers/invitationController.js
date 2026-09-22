@@ -250,22 +250,6 @@ const preflight = async (req, res) => {
 
 // ===========================================================================
 // CREATE
-//
-// Role coexistence rules:
-//
-//   ┌──────────────────┬───────────────┬──────────────────────────────────┐
-//   │ Existing pending │ New invite    │ Action                           │
-//   ├──────────────────┼───────────────┼──────────────────────────────────┤
-//   │ (none)           │ member/staff  │ insert new row                   │
-//   │ member           │ staff         │ KEEP member, INSERT staff        │
-//   │ staff            │ member        │ KEEP staff,  INSERT member       │
-//   │ member/staff     │ member/staff  │ idempotent if same role          │
-//   │ member/staff     │ admin         │ cancel lower, INSERT admin       │
-//   │ member/staff     │ ownership     │ cancel lower, INSERT ownership   │
-//   │ admin            │ ownership     │ cancel admin, INSERT ownership   │
-//   │ ownership        │ admin         │ cancel ownership, INSERT admin   │
-//   │ admin/ownership  │ member/staff  │ cancel exclusive, INSERT lower   │
-//   └──────────────────┴───────────────┴──────────────────────────────────┘
 // ===========================================================================
 
 const createInvitation = async (req, res) => {
@@ -783,6 +767,82 @@ const deleteInvitation = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// DELETE BATCH — delete multiple invitations in one atomic request
+//
+// Body: { ids: string[] }
+// Only invitations belonging to the account are touched. Ownership invites
+// also cascade-delete their continuation rows, matching deleteInvitation's
+// single-item behaviour.
+// ===========================================================================
+
+const deleteInvitationsBatch = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+
+    if (!userId) return fail(res, 401, "unauthenticated");
+    if (ids.length === 0) return fail(res, 400, "invalid_input");
+
+    const requesterRoles = await getRolesForAccount(userId, accountId);
+    if (!hasOwnerOrAdmin(requesterRoles)) return fail(res, 403, "forbidden");
+
+    await client.query("BEGIN");
+
+    // Load the matching invites so we can cascade continuation-row cleanup.
+    const { rows: invRows } = await client.query(
+      `SELECT id, role, invited_by, accepted_by, status
+         FROM invitations
+        WHERE account_id = $1
+          AND id = ANY($2::uuid[])
+        FOR UPDATE`,
+      [accountId, ids],
+    );
+
+    if (!invRows.length) {
+      await client.query("ROLLBACK");
+      return fail(res, 404, "not_found");
+    }
+
+    // Ownership invites also remove their continuation rows.
+    const ownershipInvites = invRows.filter(
+      (r) => r.role === "ownership_transfer",
+    );
+    for (const inv of ownershipInvites) {
+      await deleteContinuationRowsForOwner(
+        client,
+        accountId,
+        inv.invited_by,
+      );
+    }
+
+    const { rowCount } = await client.query(
+      `DELETE FROM invitations
+        WHERE account_id = $1
+          AND id = ANY($2::uuid[])`,
+      [accountId, ids],
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      deleted: rowCount,
+      ids: invRows.map((r) => r.id),
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("deleteInvitationsBatch error:", err);
+    return fail(res, 500, "server_error");
+  } finally {
+    client.release();
+  }
+};
+
 const dismissInvitation = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -967,10 +1027,7 @@ const acceptInvitation = async (req, res) => {
         [newOwnerId, inv.account_id],
       );
 
-      // ── ADDED: Mirror the new owner as an admin row. ──
-      // The new owner must always have an active `admin` row in
-      // account_members. This also implicitly deactivates any active
-      // member/staff rows they had, since admin is exclusive.
+      // ── 3b. Mirror the new owner as an admin row. ──
       await grantRoleWithImpliedRoles(
         client,
         inv.account_id,
@@ -1812,6 +1869,7 @@ module.exports = {
   createInvitation,
   listInvitations,
   deleteInvitation,
+  deleteInvitationsBatch,
   dismissInvitation,
   listMyInvitations,
   acceptInvitation,
