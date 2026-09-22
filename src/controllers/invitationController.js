@@ -29,12 +29,7 @@ const VALID_ROLES = [
 
 const ADMIN_LIKE_ROLES = ["admin", "ownership_transfer"];
 
-// Roles that can coexist with each other (member + staff together).
 const LOWER_ROLES = ["member_visibility", "staff_visibility"];
-
-// Roles that are exclusive — an admin or ownership invite evicts every
-// other pending invite for the same phone, including the other exclusive
-// role.
 const EXCLUSIVE_ROLES = ["admin", "ownership_transfer"];
 
 const ROLE_RANK = {
@@ -46,12 +41,6 @@ const ROLE_RANK = {
 
 const CONTINUATION_ROLES = ["admin", "member_visibility", "staff_visibility"];
 
-// ── Continuation row convention ──
-// A continuation row is a pending invitation where accepted_by is already
-// set to the same user as invited_by. No normal flow produces this state.
-//
-//   status = 'pending'  AND  accepted_by IS NOT NULL  AND  accepted_by = invited_by
-//
 const isContinuationRow = (row) =>
   row &&
   row.status === "pending" &&
@@ -104,7 +93,6 @@ const preflight = async (req, res) => {
     const phone = normalizePhone(rawPhone);
     if (!phone) return fail(res, 400, "invalid_input");
 
-    // ── Owner-target checks ──
     const { rows: ownerRows } = await pool.query(
       `SELECT u.phone
          FROM accounts a
@@ -120,7 +108,6 @@ const preflight = async (req, res) => {
       return res.json({ kind: "self" });
     }
 
-    // ── Existing user / role checks ──
     const { rows: userRows } = await pool.query(
       `SELECT id FROM users
         WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
@@ -178,8 +165,6 @@ const preflight = async (req, res) => {
       }
     }
 
-    // ── Pending invitations check ──
-    // Continuation rows are NOT real pending invites — exclude them.
     const { rows: pendingRows } = await pool.query(
       `SELECT id, role, invited_by, accepted_by, status
          FROM invitations
@@ -199,7 +184,6 @@ const preflight = async (req, res) => {
         return res.json({ kind: "pending" });
       }
 
-      // For lower↔lower (member↔staff) coexistence, no need to warn.
       if (isLowerRole(role)) {
         const onlyLowerPending = realPendingRows.every((r) =>
           isLowerRole(r.role),
@@ -209,7 +193,6 @@ const preflight = async (req, res) => {
         }
       }
 
-      // For exclusive roles (admin / ownership), let the client confirm.
       if (isExclusiveRole(role)) {
         const top = realPendingRows[0];
         return res.json({
@@ -219,7 +202,6 @@ const preflight = async (req, res) => {
       }
     }
 
-    // ── Admin promotion path (accepted lower role exists) ──
     if (role === "admin") {
       const { rows: acceptedLowerRoles } = await pool.query(
         `SELECT role, invited_name
@@ -280,7 +262,6 @@ const createInvitation = async (req, res) => {
     const phone = normalizePhone(rawPhone);
     if (!phone) return fail(res, 400, "invalid_input");
 
-    // Cannot invite the owner themselves.
     const { rows: ownerRows } = await pool.query(
       `SELECT u.phone
          FROM accounts a
@@ -294,7 +275,6 @@ const createInvitation = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // ── Ownership-uniqueness gate ──
     if (role === "ownership_transfer") {
       const { rows: otherPending } = await client.query(
         `SELECT id, invited_phone, invited_by, accepted_by, status
@@ -316,7 +296,6 @@ const createInvitation = async (req, res) => {
       }
     }
 
-    // ── Load ALL pending rows for this phone (may be several) ──
     const { rows: pendingRows } = await client.query(
       `SELECT id, role, invited_name, invited_by, accepted_by, status,
               target_member_id, target_staff_id
@@ -331,7 +310,6 @@ const createInvitation = async (req, res) => {
 
     const realPending = pendingRows.filter((r) => !isContinuationRow(r));
 
-    // ── CASE 1: Same role already pending → idempotent ──
     const sameRoleRow = realPending.find((r) => r.role === role);
     if (sameRoleRow) {
       if (role === "ownership_transfer") {
@@ -356,9 +334,7 @@ const createInvitation = async (req, res) => {
       return res.status(200).json(sameRows[0]);
     }
 
-    // ── CASE 2: Inviting a LOWER role (member / staff) ──
     if (isLowerRole(role)) {
-      // Evict any existing pending exclusive role.
       const exclusiveRows = realPending.filter((r) => isExclusiveRole(r.role));
       for (const ex of exclusiveRows) {
         await client.query(
@@ -374,7 +350,6 @@ const createInvitation = async (req, res) => {
         }
       }
 
-      // Cancel any stale non-pending rows for the same (phone, role).
       await client.query(
         `UPDATE invitations
             SET status = 'cancelled',
@@ -414,7 +389,6 @@ const createInvitation = async (req, res) => {
       }
     }
 
-    // ── CASE 3: Inviting an EXCLUSIVE role (admin / ownership) ──
     if (isExclusiveRole(role)) {
       for (const other of realPending) {
         await client.query(
@@ -547,7 +521,17 @@ async function syncContinuationRows(
 }
 
 // ===========================================================================
-// LIST
+// LIST  — CHANGED
+//
+// Response now includes:
+//   excluded_phones: [...ownerPhones, ...adminPhones]  (backward compat)
+//   owner_phones:    [...]
+//   admin_phones:    [...]
+//   admins:          [{ user_id, name, phone, photo_url }]  ← NEW
+//
+// The `admins` array is used by the ownership-transfer picker so an old
+// owner who only kept `admin` (and has no `members` row) can still be
+// selected as an ownership target.
 // ===========================================================================
 
 const listInvitations = async (req, res) => {
@@ -671,14 +655,22 @@ const listInvitations = async (req, res) => {
       [accountId],
     );
 
-    // ── Admin phones ──
-    const { rows: adminRowsExcluded } = await pool.query(
-      `SELECT RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10) AS phone
+    // ── Admin records (also used as ownership candidates by the frontend) ──
+    // Excludes the current owner because you can't transfer ownership to
+    // the person who already owns the account.
+    const { rows: adminRows } = await pool.query(
+      `SELECT
+         RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10) AS phone,
+         u.id        AS user_id,
+         u.name      AS name,
+         u.photo_url AS photo_url
          FROM account_members am
          JOIN users u ON u.id = am.user_id
+         JOIN accounts a ON a.id = am.account_id
         WHERE am.account_id = $1
           AND am.role       = 'admin'
-          AND am.status     = 'active'`,
+          AND am.status     = 'active'
+          AND u.id         <> a.created_by`,
       [accountId],
     );
 
@@ -686,9 +678,18 @@ const listInvitations = async (req, res) => {
       .map((r) => r.phone)
       .filter((p) => typeof p === "string" && p.length === 10);
 
-    const admin_phones = adminRowsExcluded
+    const admin_phones = adminRows
       .map((r) => r.phone)
       .filter((p) => typeof p === "string" && p.length === 10);
+
+    const admins = adminRows
+      .filter((r) => typeof r.phone === "string" && r.phone.length === 10)
+      .map((r) => ({
+        user_id: r.user_id,
+        name: r.name ?? "",
+        phone: r.phone,
+        photo_url: r.photo_url ?? null,
+      }));
 
     const excluded_phones = Array.from(
       new Set([...owner_phones, ...admin_phones]),
@@ -701,6 +702,7 @@ const listInvitations = async (req, res) => {
       excluded_phones,
       owner_phones,
       admin_phones,
+      admins,
     });
   } catch (err) {
     console.error("listInvitations error:", err);
@@ -768,12 +770,7 @@ const deleteInvitation = async (req, res) => {
 };
 
 // ===========================================================================
-// DELETE BATCH — delete multiple invitations in one atomic request
-//
-// Body: { ids: string[] }
-// Only invitations belonging to the account are touched. Ownership invites
-// also cascade-delete their continuation rows, matching deleteInvitation's
-// single-item behaviour.
+// DELETE BATCH
 // ===========================================================================
 
 const deleteInvitationsBatch = async (req, res) => {
@@ -791,7 +788,6 @@ const deleteInvitationsBatch = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // Load the matching invites so we can cascade continuation-row cleanup.
     const { rows: invRows } = await client.query(
       `SELECT id, role, invited_by, accepted_by, status
          FROM invitations
@@ -806,7 +802,6 @@ const deleteInvitationsBatch = async (req, res) => {
       return fail(res, 404, "not_found");
     }
 
-    // Ownership invites also remove their continuation rows.
     const ownershipInvites = invRows.filter(
       (r) => r.role === "ownership_transfer",
     );
@@ -974,7 +969,6 @@ const acceptInvitation = async (req, res) => {
     const inv = invRows[0];
 
     if (isContinuationRow(inv)) return fail(res, 400, "invalid_input");
-
     if (inv.status !== "pending") return fail(res, 409, "conflict");
 
     const invPhone = normalizePhone(inv.invited_phone);
@@ -991,7 +985,6 @@ const acceptInvitation = async (req, res) => {
       );
       const previousOwnerId = accRows[0]?.created_by ?? null;
 
-      // ── 1. Defensive user-row check ──
       const { rows: existingUser } = await client.query(
         `SELECT id FROM users WHERE id = $1`,
         [userId],
@@ -1005,7 +998,6 @@ const acceptInvitation = async (req, res) => {
         newOwnerId = inserted[0].id;
       }
 
-      // ── 2. Read outgoing owner's continuation rows ──
       const { rows: contRows } = await client.query(
         `SELECT id, role
            FROM invitations
@@ -1018,7 +1010,6 @@ const acceptInvitation = async (req, res) => {
         [inv.account_id, previousOwnerId],
       );
 
-      // ── 3. Transfer ownership ──
       await client.query(
         `UPDATE accounts
             SET created_by = $1,
@@ -1027,7 +1018,6 @@ const acceptInvitation = async (req, res) => {
         [newOwnerId, inv.account_id],
       );
 
-      // ── 3b. Mirror the new owner as an admin row. ──
       await grantRoleWithImpliedRoles(
         client,
         inv.account_id,
@@ -1035,7 +1025,6 @@ const acceptInvitation = async (req, res) => {
         "admin",
       );
 
-      // ── 4. Deactivate outgoing owner's active account_members rows ──
       if (previousOwnerId && previousOwnerId !== newOwnerId) {
         await client.query(
           `UPDATE account_members
@@ -1047,7 +1036,6 @@ const acceptInvitation = async (req, res) => {
         );
       }
 
-      // ── 5. Restore the outgoing owner's preserved roles ──
       for (const c of contRows) {
         if (!previousOwnerId) continue;
         await client.query(
@@ -1059,7 +1047,6 @@ const acceptInvitation = async (req, res) => {
         );
       }
 
-      // ── 6. Delete the continuation rows ──
       if (previousOwnerId) {
         await client.query(
           `DELETE FROM invitations
@@ -1072,7 +1059,6 @@ const acceptInvitation = async (req, res) => {
         );
       }
 
-      // ── 7. Mark ownership invitation accepted ──
       await client.query(
         `UPDATE invitations
             SET status = 'accepted', accepted_by = $1, responded_at = NOW()
@@ -1080,7 +1066,6 @@ const acceptInvitation = async (req, res) => {
         [newOwnerId, id],
       );
 
-      // ── 8. Cancel other pending invites for the new owner's phone ──
       await client.query(
         `UPDATE invitations
             SET status = 'cancelled',
@@ -1096,7 +1081,6 @@ const acceptInvitation = async (req, res) => {
         [inv.account_id, myPhone, id],
       );
 
-      // ── 9. Optionally set new owner's name if blank ──
       if (
         inv.invited_name &&
         (!userRows[0].name || String(userRows[0].name).trim() === "")
@@ -1122,7 +1106,7 @@ const acceptInvitation = async (req, res) => {
       });
     }
 
-    // ── Non-ownership branch ──
+    // Non-ownership branch
     await grantRoleWithImpliedRoles(client, inv.account_id, userId, inv.role);
 
     await client.query(
@@ -1144,8 +1128,6 @@ const acceptInvitation = async (req, res) => {
       );
     }
 
-    // Admin invite: cancel any other pending lower-role invites for this
-    // phone, because admin supersedes member/staff.
     if (inv.role === "admin") {
       await client.query(
         `UPDATE invitations
