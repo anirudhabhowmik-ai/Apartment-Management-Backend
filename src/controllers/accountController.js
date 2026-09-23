@@ -111,27 +111,30 @@ const listAccounts = async (req, res) => {
         LEFT JOIN users owner
           ON owner.id = a.created_by
         WHERE
-          a.created_by = $1
+          a.status = 'active'
+          AND (
+            a.created_by = $1
 
-          OR (am.role = 'admin')
+            OR (am.role = 'admin')
 
-          OR (
-            am.role = 'member_visibility'
-            AND EXISTS (
-              SELECT 1 FROM members m
-               WHERE m.account_id = a.id
-                 AND m.user_id    = $1
-                 AND m.status     = 'active'
+            OR (
+              am.role = 'member_visibility'
+              AND EXISTS (
+                SELECT 1 FROM members m
+                 WHERE m.account_id = a.id
+                   AND m.user_id    = $1
+                   AND m.status     = 'active'
+              )
             )
-          )
 
-          OR (
-            am.role = 'staff_visibility'
-            AND EXISTS (
-              SELECT 1 FROM staff s
-               WHERE s.account_id = a.id
-                 AND s.user_id    = $1
-                 AND s.status     = 'active'
+            OR (
+              am.role = 'staff_visibility'
+              AND EXISTS (
+                SELECT 1 FROM staff s
+                 WHERE s.account_id = a.id
+                   AND s.user_id    = $1
+                   AND s.status     = 'active'
+              )
             )
           )
         ORDER BY a.id, role_priority
@@ -168,16 +171,22 @@ const getAccountPeople = async (req, res) => {
     if (!userId) return fail(res, 401, "unauthenticated");
 
     const { rows: memberRows } = await pool.query(
-      `SELECT role FROM account_members
-        WHERE account_id = $1
-          AND user_id    = $2
-          AND status     = 'active'
+      `SELECT am.role
+         FROM account_members am
+         JOIN accounts a ON a.id = am.account_id
+        WHERE am.account_id = $1
+          AND am.user_id    = $2
+          AND am.status     = 'active'
+          AND a.status      = 'active'
         LIMIT 1`,
       [accountId, userId],
     );
 
     const isOwner = await pool.query(
-      `SELECT 1 FROM accounts WHERE id = $1 AND created_by = $2`,
+      `SELECT 1 FROM accounts
+        WHERE id = $1
+          AND created_by = $2
+          AND status = 'active'`,
       [accountId, userId],
     );
 
@@ -230,6 +239,10 @@ const getAccountPeople = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// updateAccount
+// ===========================================================================
+
 const updateAccount = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -244,6 +257,7 @@ const updateAccount = async (req, res) => {
         WHERE am.account_id = $1
           AND am.user_id = $2
           AND am.status = 'active'
+          AND a.status  = 'active'
         LIMIT 1`,
       [id, userId],
     );
@@ -287,36 +301,123 @@ const updateAccount = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// deleteAccount — soft delete
+//
+// Marks the account inactive and deactivates every related row:
+//   - accounts.status            -> 'inactive'
+//   - account_members.status     -> 'inactive'
+//   - members.status             -> 'inactive'
+//   - staff.status               -> 'inactive'
+//   - invitations.status         -> 'revoked' (only pending ones)
+//   - users.last_account_id      -> NULL for anyone pointing at it
+//
+// Runs in a single transaction so it's all-or-nothing.
+// ===========================================================================
+
 const deleteAccount = async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const userId = getUserId(req);
     const { id } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated");
 
-    const { rows } = await pool.query(
-      `SELECT created_by FROM accounts WHERE id = $1`,
+    const { rows } = await client.query(
+      `SELECT created_by, status FROM accounts WHERE id = $1`,
       [id],
     );
+
     if (!rows.length) return fail(res, 404, "not_found");
+
     if (rows[0].created_by !== userId) {
       return fail(res, 403, "owner_required");
     }
 
-    await pool.query(`DELETE FROM accounts WHERE id = $1`, [id]);
+    // Already soft-deleted — treat as idempotent success.
+    if (rows[0].status === "inactive") {
+      return res.json({ success: true, alreadyInactive: true });
+    }
 
-    await pool.query(
-      `UPDATE users SET last_account_id = NULL
-        WHERE id = $1 AND last_account_id = $2`,
-      [userId, id],
+    await client.query("BEGIN");
+
+    // 1. Mark the account itself inactive.
+    await client.query(
+      `UPDATE accounts
+          SET status     = 'inactive',
+              deleted_at = NOW(),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [id],
     );
+
+    // 2. Deactivate every role in that account.
+    //    Owner, admins, members, staff — every `account_members` row.
+    await client.query(
+      `UPDATE account_members
+          SET status     = 'inactive',
+              updated_at = NOW()
+        WHERE account_id = $1
+          AND status     = 'active'`,
+      [id],
+    );
+
+    // 3. Deactivate every resident row for this account.
+    await client.query(
+      `UPDATE members
+          SET status     = 'inactive',
+              updated_at = NOW()
+        WHERE account_id = $1
+          AND status     = 'active'`,
+      [id],
+    );
+
+    // 4. Deactivate every staff row for this account.
+    await client.query(
+      `UPDATE staff
+          SET status     = 'inactive',
+              updated_at = NOW()
+        WHERE account_id = $1
+          AND status     = 'active'`,
+      [id],
+    );
+
+    // 5. Revoke every pending invitation for this account.
+    await client.query(
+      `UPDATE invitations
+          SET status       = 'revoked',
+              responded_at = COALESCE(responded_at, NOW())
+        WHERE account_id  = $1
+          AND status      = 'pending'`,
+      [id],
+    );
+
+    // 6. Clear the last_account_id pointer for anyone pointing at it.
+    await client.query(
+      `UPDATE users
+          SET last_account_id = NULL
+        WHERE last_account_id  = $1`,
+      [id],
+    );
+
+    await client.query("COMMIT");
 
     return res.json({ success: true });
   } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
     console.error("Delete account error:", error);
     return fail(res, 500, "server_error");
+  } finally {
+    client.release();
   }
 };
+
+// ===========================================================================
+// transferOwnership
+// ===========================================================================
 
 const transferOwnership = async (req, res) => {
   const client = await pool.connect();
@@ -329,23 +430,31 @@ const transferOwnership = async (req, res) => {
     if (!newOwnerUserId) return fail(res, 400, "invalid_input");
 
     const { rows: accRows } = await pool.query(
-      `SELECT created_by FROM accounts WHERE id = $1`,
+      `SELECT created_by
+         FROM accounts
+        WHERE id = $1 AND status = 'active'`,
       [id],
     );
+
     if (!accRows.length) return fail(res, 404, "not_found");
+
     if (accRows[0].created_by !== userId) {
       return fail(res, 403, "owner_required");
     }
+
     if (newOwnerUserId === userId) {
       return fail(res, 400, "invalid_input");
     }
 
     const { rows: newOwnerRows } = await pool.query(
       `SELECT 1 FROM account_members
-        WHERE account_id = $1 AND user_id = $2 AND status = 'active'
+        WHERE account_id = $1
+          AND user_id    = $2
+          AND status     = 'active'
         LIMIT 1`,
       [id, newOwnerUserId],
     );
+
     if (!newOwnerRows.length) {
       return fail(res, 400, "invalid_input");
     }
@@ -372,6 +481,10 @@ const transferOwnership = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// setLastAccount
+// ===========================================================================
+
 const setLastAccount = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -385,8 +498,13 @@ const setLastAccount = async (req, res) => {
 
     if (accountId) {
       const { rows: memberRows } = await pool.query(
-        `SELECT 1 FROM account_members
-           WHERE account_id = $1 AND user_id = $2 AND status = 'active'
+        `SELECT 1
+           FROM account_members am
+           JOIN accounts a ON a.id = am.account_id
+          WHERE am.account_id = $1
+            AND am.user_id    = $2
+            AND am.status     = 'active'
+            AND a.status      = 'active'
           LIMIT 1`,
         [accountId, userId],
       );
@@ -394,7 +512,9 @@ const setLastAccount = async (req, res) => {
       if (!memberRows.length) {
         const { rows: ownerRows } = await pool.query(
           `SELECT 1 FROM accounts
-             WHERE id = $1 AND created_by = $2
+             WHERE id = $1
+               AND created_by = $2
+               AND status = 'active'
             LIMIT 1`,
           [accountId, userId],
         );
