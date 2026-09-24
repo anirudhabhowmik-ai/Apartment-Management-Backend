@@ -2,18 +2,27 @@
 const { pool } = require("../config/database");
 
 // ---------------------------------------------------------------------------
-// Helpers (mirrors managementController.js)
+// Helpers
 // ---------------------------------------------------------------------------
 
 const getUserId = (req) =>
   req.user?.userId ?? req.user?.id ?? req.userId ?? null;
 
+// Returns the last 10 digits, used for lookups.
 const getUserPhone = (req) => {
   const raw = req.user?.phone ?? null;
   if (!raw) return null;
   const digits = String(raw).replace(/\D/g, "");
   return digits.length > 10 ? digits.slice(-10) : digits;
 };
+
+// Prefix for the phone we actually store in the DB.
+const withCountryCode = (tenDigit) =>
+  tenDigit && /^[6-9]\d{9}$/.test(tenDigit) ? `91${tenDigit}` : null;
+
+const isUuid = (s) =>
+  typeof s === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 
 async function getRoleForAccount(userId, accountId) {
   const { rows: ownerRows } = await pool.query(
@@ -54,7 +63,50 @@ const isValidMonth = (s) =>
   typeof s === "string" && /^\d{4}-\d{2}$/.test(s);
 
 // ---------------------------------------------------------------------------
-// Row → API mapper (matches CalendarEvent on the frontend)
+// Role normalization for the DB CHECK constraints.
+//
+// `account_members.role` can be: 'admin', 'owner', 'member',
+// 'member_visibility', 'staff_visibility', 'staff', or anything else a future
+// migration adds. But `calendar_events.created_by_role` and
+// `calendar_event_responses.role` only accept ('admin', 'owner', 'member').
+//
+// Anything not admin/owner collapses to 'member'.
+// ---------------------------------------------------------------------------
+
+const normalizeCalendarRole = (role) =>
+  role === "admin" || role === "owner" ? role : "member";
+
+// ---------------------------------------------------------------------------
+// Attachments
+// ---------------------------------------------------------------------------
+
+function normalizeAttachments(raw) {
+  if (raw === undefined) return undefined;
+  if (raw === null) return [];
+  if (!Array.isArray(raw)) return [];
+
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const uri = typeof item.uri === "string" ? item.uri.trim() : "";
+    if (!uri) continue;
+
+    const entry = { uri };
+    entry.name =
+      typeof item.name === "string" && item.name.trim()
+        ? item.name.trim()
+        : "Attachment";
+    if (typeof item.mimeType === "string" && item.mimeType.trim()) {
+      entry.mimeType = item.mimeType.trim();
+    }
+    out.push(entry);
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Row -> API mapper
 // ---------------------------------------------------------------------------
 
 function mapEventRow(e, responses = []) {
@@ -65,12 +117,14 @@ function mapEventRow(e, responses = []) {
     description: e.description ?? undefined,
     type: e.type,
     resource: e.resource ?? undefined,
-    date: e.event_date, // already ::text from SQL
+    date: e.event_date,
     startTime: e.start_time ?? undefined,
     endTime: e.end_time ?? undefined,
     status: e.status,
     isImportant: !!e.is_important,
     rsvpEnabled: !!e.rsvp_enabled,
+
+    attachments: Array.isArray(e.attachments) ? e.attachments : [],
 
     createdById: e.created_by_id,
     createdByName: e.created_by_name ?? undefined,
@@ -99,11 +153,11 @@ function mapEventRow(e, responses = []) {
   };
 }
 
-// Shared SELECT list — event_date cast to text so pg returns 'YYYY-MM-DD'
 const EVENT_COLS = `
   e.id, e.account_id, e.title, e.description, e.type, e.resource,
   e.event_date::text AS event_date, e.start_time, e.end_time,
   e.status, e.is_important, e.rsvp_enabled,
+  e.attachments,
   e.created_by_id, e.created_by_name, e.created_by_phone, e.created_by_role,
   e.approved_by_id, e.approved_by_name, e.approved_by_phone, e.approved_by_role,
   e.rejection_reason, e.created_at, e.updated_at
@@ -144,6 +198,58 @@ async function fetchEventWithResponses(eventId) {
   return mapEventRow(rows[0], byEvent.get(eventId) ?? []);
 }
 
+async function resolveDisplayName(client, accountId, phone, fallback) {
+  if (!phone) return fallback;
+  if (!isUuid(accountId)) return fallback;
+
+  try {
+    const { rows } = await client.query(
+      `SELECT u.name AS name
+         FROM users u
+         JOIN members m ON m.user_id = u.id
+        WHERE m.account_id = $1
+          AND m.status     = 'active'
+          AND RIGHT(REGEXP_REPLACE(u.phone, '\\D', '', 'g'), 10) = $2
+        LIMIT 1`,
+      [accountId, phone]
+    );
+    if (rows.length && rows[0].name) return rows[0].name;
+  } catch (e) {
+    console.warn("[resolveDisplayName] members lookup failed:", e.message);
+  }
+
+  try {
+    const { rows } = await client.query(
+      `SELECT u.name AS name
+         FROM users u
+         JOIN staff s ON s.user_id = u.id
+        WHERE s.account_id = $1
+          AND s.status     = 'active'
+          AND RIGHT(REGEXP_REPLACE(u.phone, '\\D', '', 'g'), 10) = $2
+        LIMIT 1`,
+      [accountId, phone]
+    );
+    if (rows.length && rows[0].name) return rows[0].name;
+  } catch (e) {
+    console.warn("[resolveDisplayName] staff lookup failed:", e.message);
+  }
+
+  try {
+    const { rows } = await client.query(
+      `SELECT name
+         FROM users
+        WHERE RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $1
+        LIMIT 1`,
+      [phone]
+    );
+    if (rows.length && rows[0].name) return rows[0].name;
+  } catch (e) {
+    console.warn("[resolveDisplayName] users lookup failed:", e.message);
+  }
+
+  return fallback;
+}
+
 // ===========================================================================
 // LIST
 // ===========================================================================
@@ -152,28 +258,48 @@ const listEvents = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId } = req.params;
+    const month = req.query?.month;
 
     if (!userId)
       return fail(res, 401, "unauthenticated", "Authentication required");
 
+    if (!isUuid(userId))
+      return fail(res, 400, "invalid_user", "Token userId is not a valid UUID");
+
+    if (!isUuid(accountId))
+      return fail(res, 400, "invalid_account", "accountId is not a valid UUID");
+
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "forbidden", "You do not have access to this account");
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "You do not have access to this account"
+      );
 
-    const month = isValidMonth(req.query?.month) ? req.query.month : null;
+    const validMonth = isValidMonth(month) ? month : null;
 
     const params = [accountId];
     let where = `e.account_id = $1`;
 
-    if (month) {
-      params.push(`${month}-01`);
+    if (validMonth) {
+      params.push(`${validMonth}-01`);
       where += ` AND e.event_date >= $${params.length}::date
                  AND e.event_date < ($${params.length}::date + INTERVAL '1 month')`;
     }
 
-    // Rejected events are only visible to their creator.
     params.push(userId);
-    where += ` AND (e.status <> 'rejected' OR e.created_by_id = $${params.length})`;
+    const uidIdx = params.length;
+
+    params.push(isAdminLike(role));
+    const adminIdx = params.length;
+
+    where += ` AND (
+      e.status = 'approved'
+      OR e.created_by_id = $${uidIdx}
+      OR $${adminIdx}::boolean = TRUE
+    )`;
 
     const { rows } = await pool.query(
       `SELECT ${EVENT_COLS}
@@ -184,14 +310,17 @@ const listEvents = async (req, res) => {
     );
 
     const byEvent = await fetchResponses(rows.map((r) => r.id));
-    const events = rows.map((e) =>
-      mapEventRow(e, byEvent.get(e.id) ?? [])
-    );
+    const events = rows.map((e) => mapEventRow(e, byEvent.get(e.id) ?? []));
 
     return res.json(events);
   } catch (err) {
     console.error("listEvents error:", err);
-    return fail(res, 500, "server_error", "Failed to load calendar events");
+    return fail(
+      res,
+      500,
+      "server_error",
+      err.message || "Failed to load calendar events"
+    );
   }
 };
 
@@ -207,9 +336,23 @@ const getEvent = async (req, res) => {
     if (!userId)
       return fail(res, 401, "unauthenticated", "Authentication required");
 
+    if (!isUuid(userId))
+      return fail(res, 400, "invalid_user", "Token userId is not a valid UUID");
+
+    if (!isUuid(accountId))
+      return fail(res, 400, "invalid_account", "accountId is not a valid UUID");
+
+    if (!isUuid(id))
+      return fail(res, 400, "invalid_event", "event id is not a valid UUID");
+
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "forbidden", "You do not have access to this account");
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "You do not have access to this account"
+      );
 
     const { rows } = await pool.query(
       `SELECT ${EVENT_COLS}
@@ -221,20 +364,18 @@ const getEvent = async (req, res) => {
     if (!rows.length) return fail(res, 404, "not_found", "Event not found");
 
     const ev = rows[0];
-    // Rejected visible only to creator (and admins/owner — reasonable)
-    if (
-      ev.status === "rejected" &&
-      ev.created_by_id !== userId &&
-      !isAdminLike(role)
-    ) {
-      return fail(res, 404, "not_found", "Event not found");
-    }
+    const visible =
+      ev.status === "approved" ||
+      ev.created_by_id === userId ||
+      isAdminLike(role);
+
+    if (!visible) return fail(res, 404, "not_found", "Event not found");
 
     const byEvent = await fetchResponses([id]);
     return res.json(mapEventRow(ev, byEvent.get(id) ?? []));
   } catch (err) {
     console.error("getEvent error:", err);
-    return fail(res, 500, "server_error", "Failed to load event");
+    return fail(res, 500, "server_error", err.message || "Failed to load event");
   }
 };
 
@@ -252,9 +393,20 @@ const createEvent = async (req, res) => {
     if (!userId)
       return fail(res, 401, "unauthenticated", "Authentication required");
 
+    if (!isUuid(userId))
+      return fail(res, 400, "invalid_user", "Token userId is not a valid UUID");
+
+    if (!isUuid(accountId))
+      return fail(res, 400, "invalid_account", "accountId is not a valid UUID");
+
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "forbidden", "You do not have access to this account");
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "You do not have access to this account"
+      );
 
     const {
       title,
@@ -266,50 +418,51 @@ const createEvent = async (req, res) => {
       endTime = null,
       isImportant = false,
       rsvpEnabled = false,
+      attachments = [],
     } = req.body || {};
 
-    if (!title || !String(title).trim()) {
+    if (!title || !String(title).trim())
       return fail(res, 400, "invalid_input", "Title is required");
-    }
-    if (type !== "notice" && type !== "event") {
+
+    if (type !== "notice" && type !== "event")
       return fail(res, 400, "invalid_type", "Invalid type");
-    }
-    if (!isValidDateKey(date)) {
+
+    if (!isValidDateKey(date))
       return fail(res, 400, "invalid_input", "Date must be YYYY-MM-DD");
-    }
-    if (type === "event" && !resource) {
+
+    if (type === "event" && !resource)
       return fail(res, 400, "invalid_input", "Venue is required for events");
-    }
-    if (type === "notice" && !canPostNotices(role)) {
+
+    if (type === "notice" && !canPostNotices(role))
       return fail(
         res,
         403,
         "forbidden",
         "Only owners and admins can post notices"
       );
-    }
 
-    // Poster role snapshot on the event (only admin/owner/member allowed by
-    // the DB CHECK constraint). Staff are not allowed to post — treat as member.
-    const posterRole = role === "staff" ? "member" : role;
+    const safeAttachments = normalizeAttachments(attachments) ?? [];
 
-    // Poster name snapshot — try to resolve a member name from phone.
-    let posterName = posterRole === "admin" ? "Admin" : "Owner";
-    if (posterRole === "member") posterName = "Member";
-    if (userPhone) {
-      const { rows: nameRows } = await client.query(
-        `SELECT name FROM members
-          WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-          LIMIT 1`,
-        [accountId, userPhone]
-      );
-      if (nameRows.length && nameRows[0].name) {
-        posterName = nameRows[0].name;
-      }
-    }
+    // DB CHECK: created_by_role IN ('admin', 'owner', 'member').
+    // getRoleForAccount() can return 'member_visibility', 'staff_visibility',
+    // or 'staff' too. Anything not admin/owner is stored as 'member'.
+    const posterRole = normalizeCalendarRole(role);
 
-    // Admin/owner posts auto-approve; members go pending.
+    let posterName =
+      posterRole === "admin"
+        ? "Admin"
+        : posterRole === "owner"
+        ? "Owner"
+        : "Member";
+
+    posterName = await resolveDisplayName(
+      client,
+      accountId,
+      userPhone,
+      posterName
+    );
+
+    // Members' posts go to 'pending' for approval. Owner/admin auto-approve.
     const status = isAdminLike(role) ? "approved" : "pending";
 
     await client.query("BEGIN");
@@ -319,8 +472,11 @@ const createEvent = async (req, res) => {
          (account_id, title, description, type, resource,
           event_date, start_time, end_time,
           status, is_important, rsvp_enabled,
+          attachments,
           created_by_id, created_by_name, created_by_phone, created_by_role)
-       VALUES ($1,$2,$3,$4,$5,$6::date,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       VALUES ($1,$2,$3,$4,$5,$6::date,$7,$8,$9,$10,$11,
+               $12::jsonb,
+               $13,$14,$15,$16)
        RETURNING id`,
       [
         accountId,
@@ -334,9 +490,10 @@ const createEvent = async (req, res) => {
         status,
         !!isImportant,
         !!rsvpEnabled,
+        JSON.stringify(safeAttachments),
         userId,
         posterName,
-        userPhone,
+        withCountryCode(userPhone),
         posterRole,
       ]
     );
@@ -348,7 +505,7 @@ const createEvent = async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("createEvent error:", err);
-    return fail(res, 500, "server_error", "Failed to create event");
+    return fail(res, 500, "server_error", err.message || "Failed to create event");
   } finally {
     client.release();
   }
@@ -367,39 +524,48 @@ const updateEvent = async (req, res) => {
     if (!userId)
       return fail(res, 401, "unauthenticated", "Authentication required");
 
+    if (!isUuid(userId))
+      return fail(res, 400, "invalid_user", "Token userId is not a valid UUID");
+
+    if (!isUuid(accountId))
+      return fail(res, 400, "invalid_account", "accountId is not a valid UUID");
+
+    if (!isUuid(id))
+      return fail(res, 400, "invalid_event", "event id is not a valid UUID");
+
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "forbidden", "You do not have access to this account");
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "You do not have access to this account"
+      );
 
     const { rows: existingRows } = await client.query(
       `SELECT * FROM calendar_events WHERE id = $1 AND account_id = $2`,
       [id, accountId]
     );
-    if (!existingRows.length) return fail(res, 404, "not_found", "Event not found");
+    if (!existingRows.length)
+      return fail(res, 404, "not_found", "Event not found");
 
     const existing = existingRows[0];
     const isAdmin = isAdminLike(role);
     const isOwnPending =
       existing.created_by_id === userId && existing.status === "pending";
 
-    if (!isAdmin && !isOwnPending) {
+    if (!isAdmin && !isOwnPending)
       return fail(res, 403, "forbidden", "You cannot edit this event");
-    }
 
     const body = req.body || {};
 
-    // If a non-admin edits an event, only members can't change type to notice.
-    if (
-      body.type === "notice" &&
-      !canPostNotices(role)
-    ) {
+    if (body.type === "notice" && !canPostNotices(role))
       return fail(
         res,
         403,
         "forbidden",
         "Only owners and admins can post notices"
       );
-    }
 
     const allowedFields = [
       "title",
@@ -412,7 +578,6 @@ const updateEvent = async (req, res) => {
       "rsvp_enabled",
     ];
 
-    // Map frontend camelCase to snake_case.
     const incoming = {};
     if (body.title !== undefined) incoming.title = body.title;
     if (body.description !== undefined) incoming.description = body.description;
@@ -430,29 +595,38 @@ const updateEvent = async (req, res) => {
       }
     }
 
-    // Validate date separately (has a ::date cast).
+    const hasAttachmentsField = Object.prototype.hasOwnProperty.call(
+      body,
+      "attachments"
+    );
+    let attachmentsValue = null;
+    if (hasAttachmentsField) {
+      attachmentsValue = normalizeAttachments(body.attachments) ?? [];
+    }
+
     let dateValue = null;
     if (body.date !== undefined) {
-      if (!isValidDateKey(body.date)) {
+      if (!isValidDateKey(body.date))
         return fail(res, 400, "invalid_input", "Date must be YYYY-MM-DD");
-      }
       dateValue = body.date;
     }
 
-    if (Object.keys(updates).length === 0 && !dateValue) {
+    if (
+      Object.keys(updates).length === 0 &&
+      !dateValue &&
+      !hasAttachmentsField
+    ) {
       return fail(res, 400, "invalid_input", "No permitted fields to update");
     }
 
     if (updates.title !== undefined) {
-      if (!String(updates.title).trim()) {
+      if (!String(updates.title).trim())
         return fail(res, 400, "invalid_input", "Title cannot be empty");
-      }
       updates.title = String(updates.title).trim();
     }
     if (updates.type !== undefined) {
-      if (updates.type !== "notice" && updates.type !== "event") {
+      if (updates.type !== "notice" && updates.type !== "event")
         return fail(res, 400, "invalid_type", "Invalid type");
-      }
     }
     if (updates.description !== undefined)
       updates.description = toNullableString(updates.description);
@@ -463,13 +637,11 @@ const updateEvent = async (req, res) => {
     if (updates.end_time !== undefined)
       updates.end_time = toNullableString(updates.end_time);
 
-    // Event type requires a resource.
     const nextType = updates.type ?? existing.type;
     const nextResource =
       updates.resource !== undefined ? updates.resource : existing.resource;
-    if (nextType === "event" && !nextResource) {
+    if (nextType === "event" && !nextResource)
       return fail(res, 400, "invalid_input", "Venue is required for events");
-    }
 
     await client.query("BEGIN");
 
@@ -480,6 +652,11 @@ const updateEvent = async (req, res) => {
     if (dateValue) {
       values.push(dateValue);
       sets.push(`event_date = $${values.length}::date`);
+    }
+
+    if (hasAttachmentsField) {
+      values.push(JSON.stringify(attachmentsValue));
+      sets.push(`attachments = $${values.length}::jsonb`);
     }
 
     sets.push(`updated_at = NOW()`);
@@ -502,14 +679,14 @@ const updateEvent = async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("updateEvent error:", err);
-    return fail(res, 500, "server_error", "Failed to update event");
+    return fail(res, 500, "server_error", err.message || "Failed to update event");
   } finally {
     client.release();
   }
 };
 
 // ===========================================================================
-// APPROVE / REJECT
+// APPROVE / REJECT / RESEND
 // ===========================================================================
 
 const approveEvent = async (req, res) => {
@@ -521,30 +698,32 @@ const approveEvent = async (req, res) => {
     if (!userId)
       return fail(res, 401, "unauthenticated", "Authentication required");
 
+    if (!isUuid(userId))
+      return fail(res, 400, "invalid_user", "Token userId is not a valid UUID");
+
+    if (!isUuid(accountId))
+      return fail(res, 400, "invalid_account", "accountId is not a valid UUID");
+
+    if (!isUuid(id))
+      return fail(res, 400, "invalid_event", "event id is not a valid UUID");
+
     const role = await getRoleForAccount(userId, accountId);
-    if (!isAdminLike(role)) {
+    if (!isAdminLike(role))
       return fail(
         res,
         403,
         "forbidden",
         "Only owners and admins can approve events"
       );
-    }
 
-    const approverRole = role; // 'owner' | 'admin'
+    const approverRole = normalizeCalendarRole(role); // 'admin' or 'owner'
     let approverName = role === "admin" ? "Admin" : "Owner";
-    if (userPhone) {
-      const { rows: nameRows } = await pool.query(
-        `SELECT name FROM members
-          WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-          LIMIT 1`,
-        [accountId, userPhone]
-      );
-      if (nameRows.length && nameRows[0].name) {
-        approverName = nameRows[0].name;
-      }
-    }
+    approverName = await resolveDisplayName(
+      pool,
+      accountId,
+      userPhone,
+      approverName
+    );
 
     const { rows } = await pool.query(
       `UPDATE calendar_events
@@ -557,18 +736,29 @@ const approveEvent = async (req, res) => {
               updated_at = NOW()
         WHERE id = $5 AND account_id = $6 AND status = 'pending'
         RETURNING id`,
-      [userId, approverName, userPhone, approverRole, id, accountId]
+      [
+        userId,
+        approverName,
+        withCountryCode(userPhone),
+        approverRole,
+        id,
+        accountId,
+      ]
     );
 
-    if (!rows.length) {
+    if (!rows.length)
       return fail(res, 404, "not_found", "Pending event not found");
-    }
 
     const full = await fetchEventWithResponses(rows[0].id);
     return res.json(full);
   } catch (err) {
     console.error("approveEvent error:", err);
-    return fail(res, 500, "server_error", "Failed to approve event");
+    return fail(
+      res,
+      500,
+      "server_error",
+      err.message || "Failed to approve event"
+    );
   }
 };
 
@@ -582,30 +772,32 @@ const rejectEvent = async (req, res) => {
     if (!userId)
       return fail(res, 401, "unauthenticated", "Authentication required");
 
+    if (!isUuid(userId))
+      return fail(res, 400, "invalid_user", "Token userId is not a valid UUID");
+
+    if (!isUuid(accountId))
+      return fail(res, 400, "invalid_account", "accountId is not a valid UUID");
+
+    if (!isUuid(id))
+      return fail(res, 400, "invalid_event", "event id is not a valid UUID");
+
     const role = await getRoleForAccount(userId, accountId);
-    if (!isAdminLike(role)) {
+    if (!isAdminLike(role))
       return fail(
         res,
         403,
         "forbidden",
         "Only owners and admins can reject events"
       );
-    }
 
-    const approverRole = role;
+    const approverRole = normalizeCalendarRole(role);
     let approverName = role === "admin" ? "Admin" : "Owner";
-    if (userPhone) {
-      const { rows: nameRows } = await pool.query(
-        `SELECT name FROM members
-          WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-          LIMIT 1`,
-        [accountId, userPhone]
-      );
-      if (nameRows.length && nameRows[0].name) {
-        approverName = nameRows[0].name;
-      }
-    }
+    approverName = await resolveDisplayName(
+      pool,
+      accountId,
+      userPhone,
+      approverName
+    );
 
     const { rows } = await pool.query(
       `UPDATE calendar_events
@@ -621,7 +813,7 @@ const rejectEvent = async (req, res) => {
       [
         userId,
         approverName,
-        userPhone,
+        withCountryCode(userPhone),
         approverRole,
         reason,
         id,
@@ -629,15 +821,87 @@ const rejectEvent = async (req, res) => {
       ]
     );
 
-    if (!rows.length) {
+    if (!rows.length)
       return fail(res, 404, "not_found", "Pending event not found");
-    }
 
     const full = await fetchEventWithResponses(rows[0].id);
     return res.json(full);
   } catch (err) {
     console.error("rejectEvent error:", err);
-    return fail(res, 500, "server_error", "Failed to reject event");
+    return fail(res, 500, "server_error", err.message || "Failed to reject event");
+  }
+};
+
+const resendEvent = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
+
+    if (!isUuid(userId))
+      return fail(res, 400, "invalid_user", "Token userId is not a valid UUID");
+
+    if (!isUuid(accountId))
+      return fail(res, 400, "invalid_account", "accountId is not a valid UUID");
+
+    if (!isUuid(id))
+      return fail(res, 400, "invalid_event", "event id is not a valid UUID");
+
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role)
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "You do not have access to this account"
+      );
+
+    const { rows: evRows } = await pool.query(
+      `SELECT created_by_id, status FROM calendar_events
+        WHERE id = $1 AND account_id = $2`,
+      [id, accountId]
+    );
+    if (!evRows.length) return fail(res, 404, "not_found", "Event not found");
+
+    const ev = evRows[0];
+
+    if (ev.created_by_id !== userId)
+      return fail(res, 403, "forbidden", "You cannot resend this event");
+
+    if (ev.status !== "rejected")
+      return fail(
+        res,
+        400,
+        "invalid_state",
+        "Only rejected events can be resent"
+      );
+
+    const { rows } = await pool.query(
+      `UPDATE calendar_events
+          SET status = 'pending',
+              approved_by_id = NULL,
+              approved_by_name = NULL,
+              approved_by_phone = NULL,
+              approved_by_role = NULL,
+              rejection_reason = NULL,
+              updated_at = NOW()
+        WHERE id = $1 AND account_id = $2
+        RETURNING id`,
+      [id, accountId]
+    );
+
+    const full = await fetchEventWithResponses(rows[0].id);
+    return res.json(full);
+  } catch (err) {
+    console.error("resendEvent error:", err);
+    return fail(
+      res,
+      500,
+      "server_error",
+      err.message || "Failed to resend event"
+    );
   }
 };
 
@@ -653,9 +917,23 @@ const deleteEvent = async (req, res) => {
     if (!userId)
       return fail(res, 401, "unauthenticated", "Authentication required");
 
+    if (!isUuid(userId))
+      return fail(res, 400, "invalid_user", "Token userId is not a valid UUID");
+
+    if (!isUuid(accountId))
+      return fail(res, 400, "invalid_account", "accountId is not a valid UUID");
+
+    if (!isUuid(id))
+      return fail(res, 400, "invalid_event", "event id is not a valid UUID");
+
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "forbidden", "You do not have access to this account");
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "You do not have access to this account"
+      );
 
     const { rows } = await pool.query(
       `SELECT created_by_id, status FROM calendar_events
@@ -669,9 +947,8 @@ const deleteEvent = async (req, res) => {
       isAdminLike(role) ||
       (ev.created_by_id === userId && ev.status !== "approved");
 
-    if (!canDelete) {
+    if (!canDelete)
       return fail(res, 403, "forbidden", "You cannot delete this event");
-    }
 
     await pool.query(
       `DELETE FROM calendar_events WHERE id = $1 AND account_id = $2`,
@@ -681,7 +958,7 @@ const deleteEvent = async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error("deleteEvent error:", err);
-    return fail(res, 500, "server_error", "Failed to delete event");
+    return fail(res, 500, "server_error", err.message || "Failed to delete event");
   }
 };
 
@@ -700,18 +977,31 @@ const respondToEvent = async (req, res) => {
     if (!userId)
       return fail(res, 401, "unauthenticated", "Authentication required");
 
-    if (response !== "accept" && response !== "reject") {
+    if (!isUuid(userId))
+      return fail(res, 400, "invalid_user", "Token userId is not a valid UUID");
+
+    if (!isUuid(accountId))
+      return fail(res, 400, "invalid_account", "accountId is not a valid UUID");
+
+    if (!isUuid(id))
+      return fail(res, 400, "invalid_event", "event id is not a valid UUID");
+
+    if (response !== "accept" && response !== "reject")
       return fail(
         res,
         400,
         "invalid_input",
         "response must be 'accept' or 'reject'"
       );
-    }
 
     const role = await getRoleForAccount(userId, accountId);
     if (!role)
-      return fail(res, 403, "forbidden", "You do not have access to this account");
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "You do not have access to this account"
+      );
 
     const { rows: evRows } = await client.query(
       `SELECT rsvp_enabled, created_by_id
@@ -721,37 +1011,34 @@ const respondToEvent = async (req, res) => {
     );
     if (!evRows.length) return fail(res, 404, "not_found", "Event not found");
 
-    if (!evRows[0].rsvp_enabled) {
-      return fail(res, 400, "invalid_input", "RSVP is not enabled for this event");
-    }
-    if (evRows[0].created_by_id === userId) {
+    if (!evRows[0].rsvp_enabled)
+      return fail(
+        res,
+        400,
+        "invalid_input",
+        "RSVP is not enabled for this event"
+      );
+
+    if (evRows[0].created_by_id === userId)
       return fail(
         res,
         400,
         "invalid_input",
         "Posters cannot RSVP to their own event"
       );
-    }
 
-    // Resolve a display name — prefer member record, fall back to phone.
-    let displayName = userPhone ? `+91 ${userPhone.slice(0, 5)} ${userPhone.slice(5)}` : "User";
-    if (userPhone) {
-      const { rows: nameRows } = await client.query(
-        `SELECT name FROM members
-          WHERE account_id = $1
-            AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $2
-          LIMIT 1`,
-        [accountId, userPhone]
-      );
-      if (nameRows.length && nameRows[0].name) {
-        displayName = nameRows[0].name;
-      }
-    }
+    let displayName = userPhone
+      ? `+91 ${userPhone.slice(0, 5)} ${userPhone.slice(5)}`
+      : "User";
+    displayName = await resolveDisplayName(
+      client,
+      accountId,
+      userPhone,
+      displayName
+    );
 
-    const rsvpRole =
-      role === "owner" || role === "admin" || role === "member"
-        ? role
-        : "member";
+    // DB CHECK: role IN ('admin', 'owner', 'member').
+    const rsvpRole = normalizeCalendarRole(role);
 
     await client.query("BEGIN");
 
@@ -771,7 +1058,7 @@ const respondToEvent = async (req, res) => {
         id,
         userId,
         displayName,
-        userPhone,
+        withCountryCode(userPhone),
         rsvpRole,
         response,
         response === "reject" ? toNullableString(reason) : null,
@@ -786,7 +1073,12 @@ const respondToEvent = async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("respondToEvent error:", err);
-    return fail(res, 500, "server_error", "Failed to save response");
+    return fail(
+      res,
+      500,
+      "server_error",
+      err.message || "Failed to save response"
+    );
   } finally {
     client.release();
   }
@@ -801,6 +1093,7 @@ module.exports = {
   updateEvent,
   approveEvent,
   rejectEvent,
+  resendEvent,
   deleteEvent,
   respondToEvent,
 };
