@@ -8,7 +8,6 @@ const { pool } = require("../config/database");
 const getUserId = (req) =>
   req.user?.userId ?? req.user?.id ?? req.userId ?? null;
 
-// Returns the last 10 digits, used for lookups.
 const getUserPhone = (req) => {
   const raw = req.user?.phone ?? null;
   if (!raw) return null;
@@ -16,7 +15,6 @@ const getUserPhone = (req) => {
   return digits.length > 10 ? digits.slice(-10) : digits;
 };
 
-// Prefix for the phone we actually store in the DB.
 const withCountryCode = (tenDigit) =>
   tenDigit && /^[6-9]\d{9}$/.test(tenDigit) ? `91${tenDigit}` : null;
 
@@ -61,17 +59,6 @@ const isValidDateKey = (s) =>
 
 const isValidMonth = (s) =>
   typeof s === "string" && /^\d{4}-\d{2}$/.test(s);
-
-// ---------------------------------------------------------------------------
-// Role normalization for the DB CHECK constraints.
-//
-// `account_members.role` can be: 'admin', 'owner', 'member',
-// 'member_visibility', 'staff_visibility', 'staff', or anything else a future
-// migration adds. But `calendar_events.created_by_role` and
-// `calendar_event_responses.role` only accept ('admin', 'owner', 'member').
-//
-// Anything not admin/owner collapses to 'member'.
-// ---------------------------------------------------------------------------
 
 const normalizeCalendarRole = (role) =>
   role === "admin" || role === "owner" ? role : "member";
@@ -130,11 +117,13 @@ function mapEventRow(e, responses = []) {
     createdByName: e.created_by_name ?? undefined,
     createdByPhone: e.created_by_phone ?? undefined,
     createdByRole: e.created_by_role ?? undefined,
+    createdByPhoto: e.created_by_photo ?? undefined,
 
     approvedById: e.approved_by_id ?? undefined,
     approvedByName: e.approved_by_name ?? undefined,
     approvedByPhone: e.approved_by_phone ?? undefined,
     approvedByRole: e.approved_by_role ?? undefined,
+    approvedByPhoto: e.approved_by_photo ?? undefined,
     rejectionReason: e.rejection_reason ?? undefined,
 
     createdAt: e.created_at,
@@ -149,6 +138,7 @@ function mapEventRow(e, responses = []) {
       reason: r.reason ?? undefined,
       note: r.note ?? undefined,
       at: r.responded_at,
+      photo: r.photo_url ?? undefined,
     })),
   };
 }
@@ -160,11 +150,18 @@ const EVENT_COLS = `
   e.attachments,
   e.created_by_id, e.created_by_name, e.created_by_phone, e.created_by_role,
   e.approved_by_id, e.approved_by_name, e.approved_by_phone, e.approved_by_role,
-  e.rejection_reason, e.created_at, e.updated_at
+  e.rejection_reason, e.created_at, e.updated_at,
+  creator.photo_url  AS created_by_photo,
+  approver.photo_url AS approved_by_photo
 `;
 
-const RESP_COLS = `
-  user_id, name, phone, role, response, reason, note, responded_at
+const EVENT_JOINS = `
+  LEFT JOIN users creator
+         ON RIGHT(REGEXP_REPLACE(creator.phone,'\\D','','g'),10)
+          = RIGHT(REGEXP_REPLACE(e.created_by_phone,'\\D','','g'),10)
+  LEFT JOIN users approver
+         ON RIGHT(REGEXP_REPLACE(approver.phone,'\\D','','g'),10)
+          = RIGHT(REGEXP_REPLACE(e.approved_by_phone,'\\D','','g'),10)
 `;
 
 // ---------------------------------------------------------------------------
@@ -174,9 +171,15 @@ const RESP_COLS = `
 async function fetchResponses(eventIds) {
   if (!eventIds.length) return new Map();
   const { rows } = await pool.query(
-    `SELECT event_id, ${RESP_COLS}
-       FROM calendar_event_responses
-      WHERE event_id = ANY($1::uuid[])`,
+    `SELECT r.event_id,
+            r.user_id, r.name, r.phone, r.role, r.response,
+            r.reason, r.note, r.responded_at,
+            u.photo_url
+       FROM calendar_event_responses r
+       LEFT JOIN users u
+              ON RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10)
+               = RIGHT(REGEXP_REPLACE(r.phone,'\\D','','g'),10)
+      WHERE r.event_id = ANY($1::uuid[])`,
     [eventIds]
   );
   const byEvent = new Map();
@@ -190,7 +193,10 @@ async function fetchResponses(eventIds) {
 
 async function fetchEventWithResponses(eventId) {
   const { rows } = await pool.query(
-    `SELECT ${EVENT_COLS} FROM calendar_events e WHERE e.id = $1`,
+    `SELECT ${EVENT_COLS}
+       FROM calendar_events e
+       ${EVENT_JOINS}
+      WHERE e.id = $1`,
     [eventId]
   );
   if (!rows.length) return null;
@@ -304,6 +310,7 @@ const listEvents = async (req, res) => {
     const { rows } = await pool.query(
       `SELECT ${EVENT_COLS}
          FROM calendar_events e
+         ${EVENT_JOINS}
         WHERE ${where}
         ORDER BY e.event_date ASC, e.created_at ASC`,
       params
@@ -357,6 +364,7 @@ const getEvent = async (req, res) => {
     const { rows } = await pool.query(
       `SELECT ${EVENT_COLS}
          FROM calendar_events e
+         ${EVENT_JOINS}
         WHERE e.id = $1 AND e.account_id = $2`,
       [id, accountId]
     );
@@ -443,9 +451,6 @@ const createEvent = async (req, res) => {
 
     const safeAttachments = normalizeAttachments(attachments) ?? [];
 
-    // DB CHECK: created_by_role IN ('admin', 'owner', 'member').
-    // getRoleForAccount() can return 'member_visibility', 'staff_visibility',
-    // or 'staff' too. Anything not admin/owner is stored as 'member'.
     const posterRole = normalizeCalendarRole(role);
 
     let posterName =
@@ -462,7 +467,6 @@ const createEvent = async (req, res) => {
       posterName
     );
 
-    // Members' posts go to 'pending' for approval. Owner/admin auto-approve.
     const status = isAdminLike(role) ? "approved" : "pending";
 
     await client.query("BEGIN");
@@ -550,12 +554,38 @@ const updateEvent = async (req, res) => {
       return fail(res, 404, "not_found", "Event not found");
 
     const existing = existingRows[0];
-    const isAdmin = isAdminLike(role);
-    const isOwnPending =
-      existing.created_by_id === userId && existing.status === "pending";
 
-    if (!isAdmin && !isOwnPending)
-      return fail(res, 403, "forbidden", "You cannot edit this event");
+    // --- PERMISSION RULE -------------------------------------------------
+    // 1. Only the poster can edit.
+    // 2. Nobody has responded yet.
+    // 3. A member cannot edit once it is approved.
+    // ---------------------------------------------------------------------
+    const isPoster = existing.created_by_id === userId;
+    if (!isPoster) {
+      return fail(res, 403, "forbidden", "Only the poster can edit this event");
+    }
+
+    const { rows: respRows } = await client.query(
+      `SELECT 1 FROM calendar_event_responses WHERE event_id = $1 LIMIT 1`,
+      [id]
+    );
+    if (respRows.length > 0) {
+      return fail(
+        res,
+        409,
+        "responses_exist",
+        "Cannot edit after members have responded"
+      );
+    }
+
+    if (existing.status === "approved" && !isAdminLike(role)) {
+      return fail(
+        res,
+        409,
+        "invalid_state",
+        "Approved events cannot be edited by members"
+      );
+    }
 
     const body = req.body || {};
 
@@ -716,7 +746,7 @@ const approveEvent = async (req, res) => {
         "Only owners and admins can approve events"
       );
 
-    const approverRole = normalizeCalendarRole(role); // 'admin' or 'owner'
+    const approverRole = normalizeCalendarRole(role);
     let approverName = role === "admin" ? "Admin" : "Owner";
     approverName = await resolveDisplayName(
       pool,
@@ -943,12 +973,38 @@ const deleteEvent = async (req, res) => {
     if (!rows.length) return fail(res, 404, "not_found", "Event not found");
 
     const ev = rows[0];
-    const canDelete =
-      isAdminLike(role) ||
-      (ev.created_by_id === userId && ev.status !== "approved");
 
-    if (!canDelete)
-      return fail(res, 403, "forbidden", "You cannot delete this event");
+    // --- PERMISSION RULE -------------------------------------------------
+    // 1. Only the poster can delete.
+    // 2. Nobody has responded yet.
+    // 3. A member cannot delete once it is approved.
+    // ---------------------------------------------------------------------
+    const isPoster = ev.created_by_id === userId;
+    if (!isPoster) {
+      return fail(res, 403, "forbidden", "Only the poster can delete this event");
+    }
+
+    const { rows: respRows } = await pool.query(
+      `SELECT 1 FROM calendar_event_responses WHERE event_id = $1 LIMIT 1`,
+      [id]
+    );
+    if (respRows.length > 0) {
+      return fail(
+        res,
+        409,
+        "responses_exist",
+        "Cannot delete after members have responded"
+      );
+    }
+
+    if (ev.status === "approved" && !isAdminLike(role)) {
+      return fail(
+        res,
+        409,
+        "invalid_state",
+        "Approved events cannot be deleted by members"
+      );
+    }
 
     await pool.query(
       `DELETE FROM calendar_events WHERE id = $1 AND account_id = $2`,
@@ -1004,14 +1060,16 @@ const respondToEvent = async (req, res) => {
       );
 
     const { rows: evRows } = await client.query(
-      `SELECT rsvp_enabled, created_by_id
+      `SELECT rsvp_enabled, created_by_id, status
          FROM calendar_events
         WHERE id = $1 AND account_id = $2`,
       [id, accountId]
     );
     if (!evRows.length) return fail(res, 404, "not_found", "Event not found");
 
-    if (!evRows[0].rsvp_enabled)
+    const ev = evRows[0];
+
+    if (!ev.rsvp_enabled)
       return fail(
         res,
         400,
@@ -1019,7 +1077,15 @@ const respondToEvent = async (req, res) => {
         "RSVP is not enabled for this event"
       );
 
-    if (evRows[0].created_by_id === userId)
+    if (ev.status !== "approved")
+      return fail(
+        res,
+        400,
+        "invalid_state",
+        "RSVP is only available once the event is approved"
+      );
+
+    if (ev.created_by_id === userId)
       return fail(
         res,
         400,
@@ -1037,7 +1103,6 @@ const respondToEvent = async (req, res) => {
       displayName
     );
 
-    // DB CHECK: role IN ('admin', 'owner', 'member').
     const rsvpRole = normalizeCalendarRole(role);
 
     await client.query("BEGIN");
@@ -1085,6 +1150,61 @@ const respondToEvent = async (req, res) => {
 };
 
 // ===========================================================================
+// DELETE RSVP RESPONSE
+// ===========================================================================
+
+const deleteResponse = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId)
+      return fail(res, 401, "unauthenticated", "Authentication required");
+
+    if (!isUuid(userId))
+      return fail(res, 400, "invalid_user", "Token userId is not a valid UUID");
+
+    if (!isUuid(accountId))
+      return fail(res, 400, "invalid_account", "accountId is not a valid UUID");
+
+    if (!isUuid(id))
+      return fail(res, 400, "invalid_event", "event id is not a valid UUID");
+
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role)
+      return fail(
+        res,
+        403,
+        "forbidden",
+        "You do not have access to this account"
+      );
+
+    const { rowCount } = await pool.query(
+      `DELETE FROM calendar_event_responses
+        WHERE event_id = $1 AND user_id = $2
+          AND event_id IN (
+            SELECT id FROM calendar_events WHERE account_id = $3
+          )`,
+      [id, userId, accountId]
+    );
+
+    if (!rowCount)
+      return fail(res, 404, "not_found", "No response found to delete");
+
+    const full = await fetchEventWithResponses(id);
+    return res.json(full);
+  } catch (err) {
+    console.error("deleteResponse error:", err);
+    return fail(
+      res,
+      500,
+      "server_error",
+      err.message || "Failed to delete response"
+    );
+  }
+};
+
+// ===========================================================================
 
 module.exports = {
   listEvents,
@@ -1096,4 +1216,5 @@ module.exports = {
   resendEvent,
   deleteEvent,
   respondToEvent,
+  deleteResponse,
 };

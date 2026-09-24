@@ -46,5 +46,9 @@ router.post(
   "/accounts/:accountId/calendar/events/:id/respond",
   calendarController.respondToEvent
 );
+router.delete(
+  "/accounts/:accountId/calendar/events/:id/respond",
+  calendarController.deleteResponse
+);
 
 module.exports = router;
