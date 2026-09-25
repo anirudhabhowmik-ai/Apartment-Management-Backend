@@ -48,6 +48,9 @@ const isAdminLike = (role) => role === "owner" || role === "admin";
 
 const canPostNotices = (role) => role === "owner" || role === "admin";
 
+// NEW: hard cap on attachments (matches the client)
+const MAX_ATTACHMENTS = 2;
+
 const toNullableString = (v) => {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
@@ -87,7 +90,7 @@ function normalizeAttachments(raw) {
       entry.mimeType = item.mimeType.trim();
     }
     out.push(entry);
-    if (out.length >= 20) break;
+    if (out.length >= MAX_ATTACHMENTS) break;
   }
   return out;
 }
@@ -449,6 +452,15 @@ const createEvent = async (req, res) => {
         "Only owners and admins can post notices"
       );
 
+    if (Array.isArray(attachments) && attachments.length > MAX_ATTACHMENTS) {
+      return fail(
+        res,
+        400,
+        "too_many_attachments",
+        `You can attach at most ${MAX_ATTACHMENTS} files.`
+      );
+    }
+
     const safeAttachments = normalizeAttachments(attachments) ?? [];
 
     const posterRole = normalizeCalendarRole(role);
@@ -555,11 +567,6 @@ const updateEvent = async (req, res) => {
 
     const existing = existingRows[0];
 
-    // --- PERMISSION RULE -------------------------------------------------
-    // 1. Only the poster can edit.
-    // 2. Nobody has responded yet.
-    // 3. A member cannot edit once it is approved.
-    // ---------------------------------------------------------------------
     const isPoster = existing.created_by_id === userId;
     if (!isPoster) {
       return fail(res, 403, "forbidden", "Only the poster can edit this event");
@@ -631,6 +638,17 @@ const updateEvent = async (req, res) => {
     );
     let attachmentsValue = null;
     if (hasAttachmentsField) {
+      if (
+        Array.isArray(body.attachments) &&
+        body.attachments.length > MAX_ATTACHMENTS
+      ) {
+        return fail(
+          res,
+          400,
+          "too_many_attachments",
+          `You can attach at most ${MAX_ATTACHMENTS} files.`
+        );
+      }
       attachmentsValue = normalizeAttachments(body.attachments) ?? [];
     }
 
@@ -974,11 +992,6 @@ const deleteEvent = async (req, res) => {
 
     const ev = rows[0];
 
-    // --- PERMISSION RULE -------------------------------------------------
-    // 1. Only the poster can delete.
-    // 2. Nobody has responded yet.
-    // 3. A member cannot delete once it is approved.
-    // ---------------------------------------------------------------------
     const isPoster = ev.created_by_id === userId;
     if (!isPoster) {
       return fail(res, 403, "forbidden", "Only the poster can delete this event");
