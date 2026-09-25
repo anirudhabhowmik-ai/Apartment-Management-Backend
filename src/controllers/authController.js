@@ -1,21 +1,16 @@
 // src/controllers/authController.js
 const { pool } = require("../config/database");
 const jwt = require("jsonwebtoken");
+const { writeAudit } = require("./auditController");
 
 const MSG91_VERIFY_ACCESS_TOKEN_URL =
   "https://control.msg91.com/api/v5/widget/verifyAccessToken";
-
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
 
 function normalizePhone(phone) {
   if (!phone) return null;
   let value = String(phone).trim().replace(/\s+/g, "");
   if (value.startsWith("+")) value = value.substring(1);
-  if (value.startsWith("0") && value.length === 11) {
-    value = "91" + value.substring(1);
-  }
+  if (value.startsWith("0") && value.length === 11) value = "91" + value.substring(1);
   if (value.length === 10) value = "91" + value;
   return value;
 }
@@ -94,159 +89,130 @@ async function verifyMsg91AccessToken(accessToken, submittedPhone) {
   return { ok: true };
 }
 
-// -----------------------------------------------------------------------------
-// mergeUsers
-//
-// Folds sourceUserId into targetUserId (target survives), then deletes
-// the source row. Runs inside an open transaction.
-//
-// What this does, in order:
-//
-//   1. Copy the source's name / photo_url onto the target ONLY where the
-//      target is missing them. The target's own values always win.
-//
-//   2. Repoint every FK that references users(id) from source → target.
-//      This is the full set used by the other controllers in this project:
-//        members.created_by, members.user_id
-//        staff.created_by,   staff.user_id
-//        accounts.created_by           (ownership transfer)
-//        expenses.created_by
-//        staff_attendance.created_by
-//        invitations.invited_by, invitations.accepted_by
-//        account_opening_balances.updated_by
-//        member_phone_visibility.viewer_user_id
-//
-//   3. Move account_members rows from source → target, skipping rows
-//      that would collide on the UNIQUE (account_id, user_id, role).
-//      The colliding source rows are deleted after the move.
-//
-//   4. Enforce the SAME invariant the rest of the codebase uses:
-//        at most ONE active role per (account_id, user_id).
-//      This matches grantRoleWithImpliedRoles. Priority when multiple
-//      active roles end up on the same (account, user):
-//        admin > member_visibility > staff_visibility
-//      Losers are set to status='inactive' (matching deactivateAccessRole),
-//      and their invitations are marked 'revoked'.
-//
-//   5. Delete the source users row. Nothing references it any more.
-// -----------------------------------------------------------------------------
-
 async function mergeUsers(client, targetUserId, sourceUserId) {
   if (targetUserId === sourceUserId) return;
 
-  // ---- 1) Fill in target's identity from source where missing. ----
   await client.query(
     `UPDATE users AS tgt
-        SET photo_url  = COALESCE(NULLIF(tgt.photo_url, ''), src.photo_url),
-            name       = COALESCE(NULLIF(tgt.name, ''),      src.name),
+        SET photo_url = COALESCE(NULLIF(tgt.photo_url, ''), src.photo_url),
+            name = COALESCE(NULLIF(tgt.name, ''), src.name),
             updated_at = NOW()
        FROM users AS src
-      WHERE tgt.id = $1
-        AND src.id = $2
+      WHERE tgt.id=$1 AND src.id=$2
         AND (
           (tgt.photo_url IS NULL OR tgt.photo_url = '') OR
-          (tgt.name      IS NULL OR tgt.name      = '')
+          (tgt.name IS NULL OR tgt.name = '')
         )`,
-    [targetUserId, sourceUserId],
-  );
+    [targetUserId, sourceUserId]);
 
-  // ---- 2) Repoint every FK that references users(id). ----
   const simpleFkTables = [
-    { table: "members",                 column: "created_by" },
-    { table: "members",                 column: "user_id" },
-    { table: "staff",                   column: "created_by" },
-    { table: "staff",                   column: "user_id" },
-    { table: "accounts",                column: "created_by" },
-    { table: "expenses",                column: "created_by" },
-    { table: "staff_attendance",        column: "created_by" },
-    { table: "invitations",             column: "invited_by" },
-    { table: "invitations",             column: "accepted_by" },
+    { table: "members", column: "created_by" },
+    { table: "members", column: "user_id" },
+    { table: "staff", column: "created_by" },
+    { table: "staff", column: "user_id" },
+    { table: "accounts", column: "created_by" },
+    { table: "expenses", column: "created_by" },
+    { table: "staff_attendance", column: "created_by" },
+    { table: "invitations", column: "invited_by" },
+    { table: "invitations", column: "accepted_by" },
     { table: "account_opening_balances", column: "updated_by" },
-    { table: "member_phone_visibility",  column: "viewer_user_id" },
+    { table: "member_phone_visibility", column: "viewer_user_id" },
   ];
 
   for (const { table, column } of simpleFkTables) {
     await client.query(
       `UPDATE ${table} SET ${column} = $1 WHERE ${column} = $2`,
-      [targetUserId, sourceUserId],
-    );
+      [targetUserId, sourceUserId]);
   }
 
-  // ---- 3) account_members: move non-colliding source rows. ----
-  // A collision = the target already has a row with the same
-  // (account_id, role). Those source rows stay put and are deleted below.
   await client.query(
-    `
-    UPDATE account_members am
-       SET user_id = $1
+    `UPDATE account_members am SET user_id = $1
      WHERE am.user_id = $2
        AND NOT EXISTS (
          SELECT 1 FROM account_members am2
           WHERE am2.account_id = am.account_id
-            AND am2.user_id    = $1
-            AND am2.role       = am.role
-       )
-    `,
-    [targetUserId, sourceUserId],
-  );
+            AND am2.user_id = $1 AND am2.role = am.role
+       )`,
+    [targetUserId, sourceUserId]);
 
-  // ---- 3b) Delete the source's leftover colliding rows. ----
-  await client.query(
-    `DELETE FROM account_members WHERE user_id = $1`,
-    [sourceUserId],
-  );
+  await client.query(`DELETE FROM account_members WHERE user_id = $1`, [sourceUserId]);
 
-  // ---- 4) Enforce one active role per (account, user) on the target. ----
-  // Returns the (account_id, role) pairs that were just deactivated so
-  // we can mirror the change in the invitations table.
   const { rows: deactivated } = await client.query(
     `WITH ranked AS (
-       SELECT id,
-              account_id,
-              user_id,
-              role,
+       SELECT id, account_id, user_id, role,
               ROW_NUMBER() OVER (
                 PARTITION BY account_id, user_id
                 ORDER BY CASE role
-                  WHEN 'admin'             THEN 1
+                  WHEN 'admin' THEN 1
                   WHEN 'member_visibility' THEN 2
-                  WHEN 'staff_visibility'  THEN 3
-                  ELSE 4
-                END
+                  WHEN 'staff_visibility' THEN 3
+                  ELSE 4 END
               ) AS rn
          FROM account_members
-        WHERE user_id = $1
-          AND status  = 'active'
+        WHERE user_id = $1 AND status = 'active'
      )
-     UPDATE account_members
-        SET status = 'inactive', updated_at = NOW()
+     UPDATE account_members SET status='inactive', updated_at=NOW()
       WHERE id IN (SELECT id FROM ranked WHERE rn > 1)
       RETURNING account_id, role`,
-    [targetUserId],
-  );
+    [targetUserId]);
 
-  // ---- 4b) Mirror the deactivation in invitations. ----
-  // Same behaviour as deactivateAccessRole in accessSync.js.
   for (const row of deactivated) {
     await client.query(
-      `UPDATE invitations
-          SET status       = 'revoked',
-              responded_at = COALESCE(responded_at, NOW())
-        WHERE account_id  = $1
-          AND accepted_by = $2
-          AND role        = $3
-          AND status      = 'accepted'`,
-      [row.account_id, targetUserId, row.role],
-    );
+      `UPDATE invitations SET status='revoked',
+              responded_at=COALESCE(responded_at, NOW())
+        WHERE account_id=$1 AND accepted_by=$2 AND role=$3 AND status='accepted'`,
+      [row.account_id, targetUserId, row.role]);
   }
 
-  // ---- 5) Delete the source users row. ----
+  const { rows: srcAccounts } = await client.query(
+    `SELECT DISTINCT account_id FROM (
+       SELECT account_id FROM account_members WHERE user_id = $1
+       UNION
+       SELECT account_id FROM members          WHERE user_id = $1
+       UNION
+       SELECT account_id FROM staff            WHERE user_id = $1
+     ) sub`,
+    [sourceUserId]);
+
+  const { rows: srcUserRows } = await client.query(
+    `SELECT id, phone, name, photo_url FROM users WHERE id = $1`,
+    [sourceUserId]);
+  const srcSnapshot = srcUserRows[0] || null;
+
+  if (srcAccounts.length === 0) {
+    await writeAudit(client, {
+      accountId: null,
+      actorUserId: targetUserId,
+      actorRole: "system",
+      targetUserId: sourceUserId,
+      entityType: "user",
+      entityId: sourceUserId,
+      action: "merge_users",
+      before: srcSnapshot,
+      after: { id: targetUserId },
+      metadata: { reason: "phone_change_merge", noAccount: true },
+      visibility: "admin",
+    });
+  } else {
+    for (const { account_id } of srcAccounts) {
+      await writeAudit(client, {
+        accountId: account_id,
+        actorUserId: targetUserId,
+        actorRole: "system",
+        targetUserId: sourceUserId,
+        entityType: "user",
+        entityId: sourceUserId,
+        action: "merge_users",
+        before: srcSnapshot,
+        after: { id: targetUserId },
+        metadata: { reason: "phone_change_merge" },
+        visibility: "admin",
+      });
+    }
+  }
+
   await client.query(`DELETE FROM users WHERE id = $1`, [sourceUserId]);
 }
-
-// =============================================================================
-// POST /api/auth/verify-widget
-// =============================================================================
 
 async function verifyWidgetToken(req, res) {
   try {
@@ -287,8 +253,7 @@ async function verifyWidgetToken(req, res) {
          FROM users
         WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
         LIMIT 1`,
-      [ten],
-    );
+      [ten]);
 
     let user;
 
@@ -301,8 +266,7 @@ async function verifyWidgetToken(req, res) {
               AND invited_name IS NOT NULL AND invited_name <> ''
               AND status IN ('pending', 'accepted')
             ORDER BY created_at DESC LIMIT 1`,
-          [ten],
-        );
+          [ten]);
         seededName = invRows.length ? invRows[0].invited_name : null;
       }
 
@@ -311,8 +275,7 @@ async function verifyWidgetToken(req, res) {
          VALUES ($1, $2, true, NOW())
          RETURNING id, phone, name, photo_url, is_active,
                    last_login_at, last_account_id, created_at, updated_at`,
-        [normalizedPhone, seededName],
-      );
+        [normalizedPhone, seededName]);
       user = insertResult.rows[0];
     } else {
       user = userResult.rows[0];
@@ -327,15 +290,13 @@ async function verifyWidgetToken(req, res) {
                 AND invited_name IS NOT NULL AND invited_name <> ''
                 AND status IN ('pending', 'accepted')
               ORDER BY created_at DESC LIMIT 1`,
-            [ten],
-          );
+            [ten]);
           if (invRows.length && invRows[0].invited_name) {
             const updated = await pool.query(
               `UPDATE users SET name = $1, updated_at = NOW() WHERE id = $2
                RETURNING id, phone, name, photo_url, is_active,
                          last_login_at, last_account_id, created_at, updated_at`,
-              [invRows[0].invited_name, user.id],
-            );
+              [invRows[0].invited_name, user.id]);
             user = updated.rows[0];
           }
         }
@@ -345,8 +306,7 @@ async function verifyWidgetToken(req, res) {
         `UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1
          RETURNING id, phone, name, photo_url, is_active,
                    last_login_at, last_account_id, created_at, updated_at`,
-        [user.id],
-      );
+        [user.id]);
       user = updateResult.rows[0];
     }
 
@@ -366,10 +326,6 @@ async function verifyWidgetToken(req, res) {
   }
 }
 
-// =============================================================================
-// GET /me
-// =============================================================================
-
 const getMe = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -379,8 +335,7 @@ const getMe = async (req, res) => {
       `SELECT id, phone, name, photo_url, is_active,
               last_login_at, last_account_id, created_at, updated_at
          FROM users WHERE id = $1 LIMIT 1`,
-      [userId],
-    );
+      [userId]);
     if (!rows.length) return fail(res, 404, "not_found", "User not found");
     return res.json({ user: mapUserRow(rows[0]) });
   } catch (err) {
@@ -388,10 +343,6 @@ const getMe = async (req, res) => {
     return fail(res, 500, "server_error", "Failed to load profile");
   }
 };
-
-// =============================================================================
-// PUT /me
-// =============================================================================
 
 const updateMe = async (req, res) => {
   try {
@@ -403,8 +354,7 @@ const updateMe = async (req, res) => {
     const rawPhoto = Object.prototype.hasOwnProperty.call(body, "photo_url")
       ? body.photo_url
       : Object.prototype.hasOwnProperty.call(body, "photoUrl")
-        ? body.photoUrl
-        : undefined;
+        ? body.photoUrl : undefined;
     const hasPhoto = rawPhoto !== undefined;
 
     if (!hasName && !hasPhoto) {
@@ -413,15 +363,11 @@ const updateMe = async (req, res) => {
 
     const updates = {};
     if (hasName) {
-      const trimmed =
-        body.name === null || body.name === undefined
-          ? null
-          : String(body.name).trim();
+      const trimmed = body.name === null || body.name === undefined
+        ? null : String(body.name).trim();
       updates.name = trimmed ? trimmed : null;
     }
-    if (hasPhoto) {
-      updates.photo_url = rawPhoto === null ? null : String(rawPhoto);
-    }
+    if (hasPhoto) updates.photo_url = rawPhoto === null ? null : String(rawPhoto);
 
     const keys = Object.keys(updates);
     const values = keys.map((k) => updates[k]);
@@ -432,8 +378,7 @@ const updateMe = async (req, res) => {
         WHERE id = $${keys.length + 1}
         RETURNING id, phone, name, photo_url, is_active,
                   last_login_at, last_account_id, created_at, updated_at`,
-      [...values, userId],
-    );
+      [...values, userId]);
     if (!result.rowCount) return fail(res, 404, "not_found", "User not found");
     return res.json({ user: mapUserRow(result.rows[0]) });
   } catch (err) {
@@ -441,10 +386,6 @@ const updateMe = async (req, res) => {
     return fail(res, 500, "server_error", "Failed to update profile");
   }
 };
-
-// =============================================================================
-// POST /request-phone-change
-// =============================================================================
 
 const requestPhoneChange = async (req, res) => {
   try {
@@ -455,14 +396,10 @@ const requestPhoneChange = async (req, res) => {
     const raw = body.newPhone ?? body.new_phone ?? body.phone;
     const ten = normalizeTenDigit(raw);
 
-    if (!ten) {
-      return fail(res, 400, "invalid_input", "A valid 10-digit phone number is required");
-    }
+    if (!ten) return fail(res, 400, "invalid_input", "A valid 10-digit phone number is required");
 
     const { rows: currentRows } = await pool.query(
-      `SELECT phone FROM users WHERE id = $1 LIMIT 1`,
-      [userId],
-    );
+      `SELECT phone FROM users WHERE id = $1 LIMIT 1`, [userId]);
     if (!currentRows.length) return fail(res, 404, "not_found", "User not found");
 
     const currentTen = normalizeTenDigit(currentRows[0].phone);
@@ -471,19 +408,13 @@ const requestPhoneChange = async (req, res) => {
     }
 
     const { rows: targetRows } = await pool.query(
-      `SELECT id, name, phone
-         FROM users
-        WHERE RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $1
-          AND id <> $2
-        LIMIT 1`,
-      [ten, userId],
-    );
+      `SELECT id, name, phone FROM users
+        WHERE RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $1 AND id <> $2 LIMIT 1`,
+      [ten, userId]);
 
     if (!targetRows.length) {
       return res.json({
-        success: true,
-        phone: ten,
-        willMerge: false,
+        success: true, phone: ten, willMerge: false,
         message: "Verify the new number with the OTP to complete the change.",
       });
     }
@@ -492,61 +423,41 @@ const requestPhoneChange = async (req, res) => {
     const targetName = (targetRows[0].name || "").trim();
 
     const { rows: countRows } = await pool.query(
-      `SELECT COUNT(DISTINCT acc_id)::int AS account_count
-         FROM (
-           SELECT account_id AS acc_id FROM account_members
-            WHERE user_id = $1 AND status = 'active'
-           UNION
-           SELECT id AS acc_id FROM accounts
-            WHERE created_by = $1
-           UNION
-           SELECT account_id AS acc_id FROM staff
-            WHERE user_id = $1 AND status = 'active'
-           UNION
-           SELECT account_id AS acc_id FROM members
-            WHERE user_id = $1 AND status = 'active'
-         ) sub`,
-      [targetUserId],
-    );
+      `SELECT COUNT(DISTINCT acc_id)::int AS account_count FROM (
+         SELECT account_id AS acc_id FROM account_members
+          WHERE user_id = $1 AND status = 'active'
+         UNION
+         SELECT id AS acc_id FROM accounts WHERE created_by = $1
+         UNION
+         SELECT account_id AS acc_id FROM staff
+          WHERE user_id = $1 AND status = 'active'
+         UNION
+         SELECT account_id AS acc_id FROM members
+          WHERE user_id = $1 AND status = 'active'
+       ) sub`,
+      [targetUserId]);
     const accountCount = countRows[0]?.account_count ?? 0;
 
     const { rows: accountRows } = await pool.query(
       `SELECT name FROM (
-         SELECT a.name
-           FROM accounts a
-           JOIN account_members am
-             ON am.account_id = a.id
-            AND am.user_id    = $1
-            AND am.status     = 'active'
+         SELECT a.name FROM accounts a
+           JOIN account_members am ON am.account_id = a.id
+            AND am.user_id = $1 AND am.status = 'active'
          UNION
-         SELECT a.name
-           FROM accounts a
-          WHERE a.created_by = $1
+         SELECT a.name FROM accounts a WHERE a.created_by = $1
          UNION
-         SELECT a.name
-           FROM accounts a
-           JOIN staff s
-             ON s.account_id = a.id
-            AND s.user_id    = $1
-            AND s.status     = 'active'
+         SELECT a.name FROM accounts a
+           JOIN staff s ON s.account_id = a.id AND s.user_id = $1 AND s.status = 'active'
          UNION
-         SELECT a.name
-           FROM accounts a
-           JOIN members m
-             ON m.account_id = a.id
-            AND m.user_id    = $1
-            AND m.status     = 'active'
+         SELECT a.name FROM accounts a
+           JOIN members m ON m.account_id = a.id AND m.user_id = $1 AND m.status = 'active'
        ) sub
        WHERE name IS NOT NULL AND name <> ''
-       ORDER BY name
-       LIMIT 5`,
-      [targetUserId],
-    );
+       ORDER BY name LIMIT 5`,
+      [targetUserId]);
 
     return res.json({
-      success: true,
-      phone: ten,
-      willMerge: true,
+      success: true, phone: ten, willMerge: true,
       mergeTarget: {
         userId: targetUserId,
         name: targetName || null,
@@ -564,10 +475,6 @@ const requestPhoneChange = async (req, res) => {
   }
 };
 
-// =============================================================================
-// POST /confirm-phone-change
-// =============================================================================
-
 const confirmPhoneChange = async (req, res) => {
   const client = await pool.connect();
 
@@ -581,8 +488,7 @@ const confirmPhoneChange = async (req, res) => {
     const body = req.body || {};
     const raw = body.newPhone ?? body.new_phone ?? body.phone;
     const accessToken = body.accessToken ?? body.access_token ?? null;
-    const mergeConfirmed =
-      body.mergeConfirmed === true || body.merge_confirmed === true;
+    const mergeConfirmed = body.mergeConfirmed === true || body.merge_confirmed === true;
 
     const ten = normalizeTenDigit(raw);
     if (!ten) {
@@ -606,9 +512,7 @@ const confirmPhoneChange = async (req, res) => {
     await client.query("BEGIN");
 
     const { rows: currentRows } = await client.query(
-      `SELECT id, phone FROM users WHERE id = $1 FOR UPDATE`,
-      [userId],
-    );
+      `SELECT id, phone FROM users WHERE id = $1 FOR UPDATE`, [userId]);
     if (!currentRows.length) {
       await client.query("ROLLBACK");
       client.release();
@@ -626,11 +530,9 @@ const confirmPhoneChange = async (req, res) => {
 
     const { rows: targetRows } = await client.query(
       `SELECT id, phone FROM users
-        WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
-          AND id <> $2
+        WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1 AND id <> $2
         FOR UPDATE`,
-      [ten, userId],
-    );
+      [ten, userId]);
 
     const hasTarget = targetRows.length > 0 && targetRows[0].id !== current.id;
 
@@ -638,12 +540,8 @@ const confirmPhoneChange = async (req, res) => {
       if (!mergeConfirmed) {
         await client.query("ROLLBACK");
         client.release();
-        return fail(
-          res,
-          409,
-          "merge_required",
-          "This number already belongs to another login. Confirm the merge to continue.",
-        );
+        return fail(res, 409, "merge_required",
+          "This number already belongs to another login. Confirm the merge to continue.");
       }
 
       const sourceUserId = targetRows[0].id;
@@ -651,39 +549,31 @@ const confirmPhoneChange = async (req, res) => {
       const placeholder = `merged:${String(sourceUserId).slice(0, 8)}`;
       await client.query(
         `UPDATE users SET phone = $1, updated_at = NOW() WHERE id = $2`,
-        [placeholder, sourceUserId],
-      );
+        [placeholder, sourceUserId]);
 
       await mergeUsers(client, current.id, sourceUserId);
 
       await client.query(
         `UPDATE users SET phone = $1, updated_at = NOW() WHERE id = $2`,
-        [normalized, current.id],
-      );
+        [normalized, current.id]);
     } else {
       await client.query(
         `UPDATE users SET phone = $1, updated_at = NOW() WHERE id = $2`,
-        [normalized, current.id],
-      );
+        [normalized, current.id]);
     }
 
     if (currentTen) {
       await client.query(
-        `UPDATE invitations
-            SET invited_phone = $1
+        `UPDATE invitations SET invited_phone = $1
           WHERE RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $2
             AND status = 'pending'`,
-        [normalized, currentTen],
-      );
+        [normalized, currentTen]);
     }
 
     await client.query("COMMIT");
 
     return res.json({
-      success: true,
-      requiresLogout: true,
-      newPhone: ten,
-      merged: hasTarget,
+      success: true, requiresLogout: true, newPhone: ten, merged: hasTarget,
       message: hasTarget
         ? "Accounts merged. Please sign in again with the new number."
         : "Phone number updated. Please sign in again with your new number.",

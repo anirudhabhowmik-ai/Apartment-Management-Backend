@@ -1,5 +1,6 @@
 // src/controllers/calendarController.js
 const { pool } = require("../config/database");
+const { writeAudit } = require("./auditController");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -48,7 +49,6 @@ const isAdminLike = (role) => role === "owner" || role === "admin";
 
 const canPostNotices = (role) => role === "owner" || role === "admin";
 
-// NEW: hard cap on attachments (matches the client)
 const MAX_ATTACHMENTS = 2;
 
 const toNullableString = (v) => {
@@ -514,9 +514,30 @@ const createEvent = async (req, res) => {
       ]
     );
 
+    const eventId = rows[0].id;
+    const eventKind = type === "notice" ? "a notice" : "an event";
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "calendar_event",
+      entityId: eventId,
+      action: "create",
+      after: {
+        title: String(title).trim(),
+        type,
+        resource: type === "event" ? resource : null,
+        date,
+        status,
+      },
+      metadata: { kind: eventKind },
+      visibility: "public",
+    });
+
     await client.query("COMMIT");
 
-    const full = await fetchEventWithResponses(rows[0].id);
+    const full = await fetchEventWithResponses(eventId);
     return res.status(201).json(full);
   } catch (err) {
     await client.query("ROLLBACK");
@@ -720,9 +741,26 @@ const updateEvent = async (req, res) => {
       values
     );
 
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "calendar_event",
+      entityId: id,
+      action: "update",
+      before: {
+        title: existing.title,
+        type: existing.type,
+        resource: existing.resource,
+      },
+      after: { fields: Object.keys(updates) },
+      metadata: { kind: existing.type === "notice" ? "a notice" : "an event" },
+      visibility: "public",
+    });
+
     await client.query("COMMIT");
 
-    const full = await fetchEventWithResponses(rows[0].id);
+    const full = await fetchEventWithResponses(id);
     return res.json(full);
   } catch (err) {
     await client.query("ROLLBACK");
@@ -783,7 +821,7 @@ const approveEvent = async (req, res) => {
               rejection_reason = NULL,
               updated_at = NOW()
         WHERE id = $5 AND account_id = $6 AND status = 'pending'
-        RETURNING id`,
+        RETURNING id, type`,
       [
         userId,
         approverName,
@@ -797,7 +835,30 @@ const approveEvent = async (req, res) => {
     if (!rows.length)
       return fail(res, 404, "not_found", "Pending event not found");
 
-    const full = await fetchEventWithResponses(rows[0].id);
+    const kind = rows[0].type === "notice" ? "a notice" : "an event";
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await writeAudit(client, {
+        accountId,
+        actorUserId: userId,
+        actorRole: role,
+        entityType: "calendar_event",
+        entityId: id,
+        action: "approve",
+        metadata: { kind },
+        visibility: "public",
+      });
+      await client.query("COMMIT");
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch {}
+      console.warn("approveEvent: audit failed:", e.message);
+    } finally {
+      client.release();
+    }
+
+    const full = await fetchEventWithResponses(id);
     return res.json(full);
   } catch (err) {
     console.error("approveEvent error:", err);
@@ -857,7 +918,7 @@ const rejectEvent = async (req, res) => {
               rejection_reason = $5,
               updated_at = NOW()
         WHERE id = $6 AND account_id = $7 AND status = 'pending'
-        RETURNING id`,
+        RETURNING id, type`,
       [
         userId,
         approverName,
@@ -872,7 +933,30 @@ const rejectEvent = async (req, res) => {
     if (!rows.length)
       return fail(res, 404, "not_found", "Pending event not found");
 
-    const full = await fetchEventWithResponses(rows[0].id);
+    const kind = rows[0].type === "notice" ? "a notice" : "an event";
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await writeAudit(client, {
+        accountId,
+        actorUserId: userId,
+        actorRole: role,
+        entityType: "calendar_event",
+        entityId: id,
+        action: "reject",
+        metadata: { kind },
+        visibility: "public",
+      });
+      await client.query("COMMIT");
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch {}
+      console.warn("rejectEvent: audit failed:", e.message);
+    } finally {
+      client.release();
+    }
+
+    const full = await fetchEventWithResponses(id);
     return res.json(full);
   } catch (err) {
     console.error("rejectEvent error:", err);
@@ -984,7 +1068,7 @@ const deleteEvent = async (req, res) => {
       );
 
     const { rows } = await pool.query(
-      `SELECT created_by_id, status FROM calendar_events
+      `SELECT created_by_id, status, type FROM calendar_events
         WHERE id = $1 AND account_id = $2`,
       [id, accountId]
     );
@@ -1023,6 +1107,29 @@ const deleteEvent = async (req, res) => {
       `DELETE FROM calendar_events WHERE id = $1 AND account_id = $2`,
       [id, accountId]
     );
+
+    const kind = ev.type === "notice" ? "a notice" : "an event";
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await writeAudit(client, {
+        accountId,
+        actorUserId: userId,
+        actorRole: role,
+        entityType: "calendar_event",
+        entityId: id,
+        action: "delete",
+        metadata: { kind },
+        visibility: "public",
+      });
+      await client.query("COMMIT");
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch {}
+      console.warn("deleteEvent: audit failed:", e.message);
+    } finally {
+      client.release();
+    }
 
     return res.json({ success: true });
   } catch (err) {

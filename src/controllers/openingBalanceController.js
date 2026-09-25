@@ -1,5 +1,6 @@
 // src/controllers/openingBalanceController.js
 const { pool } = require("../config/database");
+const { writeAudit } = require("./auditController");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -178,6 +179,14 @@ const updateOpeningBalance = async (req, res) => {
     const value = Math.round(n * 100) / 100;
 
     await client.query("BEGIN");
+
+    const { rows: beforeRows } = await client.query(
+      `SELECT opening_balance FROM account_opening_balances
+        WHERE account_id = $1`,
+      [accountId]
+    );
+    const beforeValue = beforeRows[0]?.opening_balance ?? null;
+
     await client.query(
       `INSERT INTO account_opening_balances
          (account_id, opening_balance, updated_by)
@@ -188,6 +197,20 @@ const updateOpeningBalance = async (req, res) => {
          updated_at      = NOW()`,
       [accountId, value, userId]
     );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "opening_balance",
+      entityId: accountId,
+      action: beforeValue === null ? "create" : "update",
+      before: beforeValue === null ? null : { opening_balance: Number(beforeValue) },
+      after: { opening_balance: value },
+      metadata: {},
+      visibility: "admin",
+    });
+
     await client.query("COMMIT");
 
     const data = await loadOpeningBalance(accountId);
@@ -203,9 +226,6 @@ const updateOpeningBalance = async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // Schema-aware column detection
-//
-// Different deployments use slightly different column names. Detect what's
-// actually available once, then build queries accordingly.
 // ---------------------------------------------------------------------------
 
 async function detectColumns() {
@@ -273,8 +293,6 @@ async function detectColumns() {
 
 // ---------------------------------------------------------------------------
 // GET /opening-balance/:accountId/carried-forward?month=YYYY-MM
-//
-// carried_forward = opening_balance + SUM(prior months' paid net)
 // ---------------------------------------------------------------------------
 
 const getCarriedForward = async (req, res) => {
@@ -298,7 +316,7 @@ const getCarriedForward = async (req, res) => {
 
     const monthStart = `${month}-01`;
 
-    // -------- Opening balance (hard fail only here) --------
+    // -------- Opening balance --------
     let openingBalance = 0;
     try {
       const ob = await loadOpeningBalance(accountId);
@@ -417,7 +435,6 @@ const getCarriedForward = async (req, res) => {
     let txIncome = 0;
     let txExpense = 0;
     try {
-      // Build anchor date expression from available columns.
       const anchorParts = [];
       if (cols.expenses.paid_date) anchorParts.push("paid_date");
       if (cols.expenses.due_date) anchorParts.push("due_date");
