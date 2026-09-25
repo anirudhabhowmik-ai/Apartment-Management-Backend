@@ -462,6 +462,54 @@ const setLastAccount = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// getMyRole
+//
+// Returns the caller's current role for a specific account.
+// The highest-priority active role is returned (owner > admin > member > staff).
+// Used by the client to detect role changes without re-fetching the full
+// account list — the tab bar can then react instantly.
+// ===========================================================================
+const getMyRole = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated");
+    if (!accountId) return fail(res, 400, "invalid_input");
+
+    // 1. Owner wins.
+    const { rows: ownerRows } = await pool.query(
+      `SELECT 1 FROM accounts
+        WHERE id = $1 AND created_by = $2 AND status = 'active'`,
+      [accountId, userId],
+    );
+    if (ownerRows.length) {
+      return res.json({ role: "owner" });
+    }
+
+    // 2. Otherwise, highest-priority active role.
+    const { rows } = await pool.query(
+      `SELECT role FROM account_members
+         WHERE account_id = $1 AND user_id = $2 AND status = 'active'
+         ORDER BY CASE role
+           WHEN 'admin' THEN 1
+           WHEN 'member_visibility' THEN 2
+           WHEN 'staff_visibility' THEN 3
+           ELSE 4
+         END
+         LIMIT 1`,
+      [accountId, userId],
+    );
+
+    if (!rows.length) return res.json({ role: null });
+    return res.json({ role: rows[0].role });
+  } catch (error) {
+    console.error("getMyRole error:", error);
+    return fail(res, 500, "server_error");
+  }
+};
+
 module.exports = {
   createAccount,
   listAccounts,
@@ -470,4 +518,5 @@ module.exports = {
   deleteAccount,
   transferOwnership,
   setLastAccount,
+  getMyRole,
 };
