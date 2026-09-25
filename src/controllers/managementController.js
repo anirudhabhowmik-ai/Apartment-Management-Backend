@@ -39,23 +39,47 @@ const toNullableNote = (v) => {
   return s.length === 0 ? null : s;
 };
 
+// Hard cap on bill attachments per transaction (matches the client).
+const MAX_BILL_ATTACHMENTS = 2;
+
+const normalizeBillAttachments = (raw) => {
+  if (raw === null || raw === undefined) return [];
+  let value = raw;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const uri =
+      typeof item.uri === "string"
+        ? item.uri
+        : typeof item.url === "string"
+          ? item.url
+          : "";
+    if (!uri) continue;
+    out.push({
+      uri,
+      name:
+        typeof item.name === "string" && item.name.trim()
+          ? item.name.trim()
+          : "Bill attachment",
+      ...(typeof item.mimeType === "string" && item.mimeType.trim()
+        ? { mimeType: item.mimeType.trim() }
+        : {}),
+    });
+    if (out.length >= MAX_BILL_ATTACHMENTS) break;
+  }
+  return out;
+};
+
 // ---------------------------------------------------------------------------
 // normalizeRole
-//
-// Roles are FREE-FORM strings. Any non-empty value is accepted. The only
-// normalization we apply is:
-//   - trim outer whitespace
-//   - collapse runs of inner whitespace to a single space
-//   - drop control characters
-//   - lowercase
-//
-// This keeps create/edit round-trips stable: "Manager", "  manager  ",
-// and "MANAGER" all become "manager" everywhere.
-//
-// The DB column must NOT have a fixed-value CHECK constraint for this
-// to work. See the migration that drops `staff_role_check` /
-// `members_role_check` and replaces them with the permissive
-// `staff_role_valid` / `members_role_valid`.
 // ---------------------------------------------------------------------------
 function normalizeRole(raw) {
   if (raw === null || raw === undefined) return "";
@@ -570,7 +594,6 @@ const createMember = async (req, res) => {
       return fail(res, 400, "invalid_input", "Flat number is required");
     }
 
-    // Free-form role: any non-empty string up to 60 characters.
     const memberRole = normalizeRole(rawMemberRole);
     if (!memberRole) {
       return fail(res, 400, "invalid_input", "Member role is required");
@@ -1257,7 +1280,6 @@ const createStaff = async (req, res) => {
 
     const { role: rawStaffRole, monthly_salary = 0 } = body;
 
-    // Free-form role: any non-empty string up to 60 characters.
     const staffRole = normalizeRole(rawStaffRole);
     if (!staffRole) {
       return fail(res, 400, "invalid_input", "Role is required");
@@ -2094,6 +2116,20 @@ const createExpense = async (req, res) => {
       return fail(res, 400, "invalid_status", "Invalid status");
     }
 
+    if (
+      Array.isArray(bill_attachments) &&
+      bill_attachments.length > MAX_BILL_ATTACHMENTS
+    ) {
+      return fail(
+        res,
+        400,
+        "too_many_attachments",
+        `You can attach at most ${MAX_BILL_ATTACHMENTS} files.`,
+      );
+    }
+
+    const safeBillAttachments = normalizeBillAttachments(bill_attachments);
+
     await client.query("BEGIN");
 
     const { rows } = await client.query(
@@ -2112,7 +2148,7 @@ const createExpense = async (req, res) => {
         reminder_enabled,
         expense_date || null,
         description,
-        JSON.stringify(bill_attachments),
+        JSON.stringify(safeBillAttachments),
         userId,
       ],
     );
@@ -2153,12 +2189,25 @@ const updateExpense = async (req, res) => {
       "bill_attachments",
     ];
 
+    if (
+      Object.prototype.hasOwnProperty.call(req.body, "bill_attachments") &&
+      Array.isArray(req.body.bill_attachments) &&
+      req.body.bill_attachments.length > MAX_BILL_ATTACHMENTS
+    ) {
+      return fail(
+        res,
+        400,
+        "too_many_attachments",
+        `You can attach at most ${MAX_BILL_ATTACHMENTS} files.`,
+      );
+    }
+
     const updates = {};
     for (const key of allowedFields) {
       if (Object.prototype.hasOwnProperty.call(req.body, key)) {
         updates[key] =
           key === "bill_attachments"
-            ? JSON.stringify(req.body[key])
+            ? JSON.stringify(normalizeBillAttachments(req.body[key]))
             : req.body[key];
       }
     }
