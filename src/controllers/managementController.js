@@ -372,6 +372,29 @@ const listMembers = async (req, res) => {
 
     if (role === "owner" || role === "admin") return res.json(result);
 
+    // ---------------------------------------------------------------
+    // Phone masking for non-owner/admin callers.
+    //
+    // Exception: the account owner and any active admin always keep their
+    // phone visible. They run the society — everyone needs a way to reach
+    // them.
+    // ---------------------------------------------------------------
+    const { rows: privilegedRows } = await pool.query(
+      `SELECT a.created_by AS user_id
+         FROM accounts a
+        WHERE a.id = $1
+        UNION
+       SELECT am.user_id
+         FROM account_members am
+        WHERE am.account_id = $1
+          AND am.role = 'admin'
+          AND am.status = 'active'`,
+      [accountId],
+    );
+    const privilegedUserIds = new Set(
+      privilegedRows.map((r) => r.user_id).filter(Boolean),
+    );
+
     const callerPhone = getUserPhone(req);
     const { rows: allowed } = await pool.query(
       `SELECT member_id FROM member_phone_visibility
@@ -382,7 +405,8 @@ const listMembers = async (req, res) => {
     const masked = result.map((m) => {
       const memberPhone = (m.phone || "").replace(/\D/g, "").slice(-10);
       const isSelf = callerPhone && callerPhone === memberPhone;
-      const canSee = isSelf || allowedMemberIds.has(m.id);
+      const isPrivileged = m.user_id && privilegedUserIds.has(m.user_id);
+      const canSee = isSelf || isPrivileged || allowedMemberIds.has(m.id);
       return canSee ? m : { ...m, phone: null };
     });
 
@@ -1398,6 +1422,7 @@ const upsertStaffAttendance = async (req, res) => {
     if (!staffRows.length) return fail(res, 404, "not_found", "Staff not found");
 
     const baseSalary = Number(staffRows[0].monthly_salary) || 0;
+    const targetUserId = staffRows[0].user_id;
 
     const [y, m] = month.split("-").map(Number);
     const totalDays = new Date(y, m, 0).getDate();
@@ -1432,9 +1457,7 @@ const upsertStaffAttendance = async (req, res) => {
        RETURNING *`,
       [accountId, staffId, month, JSON.stringify(statuses), paidDays, calculatedSalary, userId]);
 
-    // NOTE: Attendance changes are intentionally NOT written to audit_log.
-    // They change frequently and would balloon the audit table.
-    // staff_attendance is the source of truth for attendance history.
+    // NOTE: Attendance is intentionally NOT written to audit_log.
 
     await client.query("COMMIT");
 
@@ -1779,7 +1802,7 @@ const createExpense = async (req, res) => {
       action: "create",
       after: rows[0],
       metadata: { category, title, amount, transaction_type },
-      visibility: "admin",
+      visibility: "public",
     });
 
     await client.query("COMMIT");
@@ -1860,7 +1883,7 @@ const updateExpense = async (req, res) => {
       before,
       after: updated.rows[0],
       metadata: { fields: keys },
-      visibility: "admin",
+      visibility: "public",
     });
 
     await client.query("COMMIT");
@@ -1911,7 +1934,7 @@ const deleteExpense = async (req, res) => {
       action: "delete",
       before,
       metadata: { category: before?.category, title: before?.title, amount: before?.amount },
-      visibility: "admin",
+      visibility: "public",
     });
 
     await client.query("COMMIT");
