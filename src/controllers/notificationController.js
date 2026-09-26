@@ -131,19 +131,19 @@ async function resolveRecipients(client, entry, audience) {
   }
 
   if (entityType === "invitation") {
-    const isAdminRole =
-      role === "admin" || role === "ownership_transfer";
-
+    // ── FIX ──
+    // Always include the invitee, for ALL roles (admin, ownership, member,
+    // staff). Owners/admins still get a copy so they know an invite went out.
     if (action === "create" || action === "delete") {
       return {
-        recipients: isAdminRole
-          ? audience.adminLike
-          : uniq(add(audience.adminLike, targetUserId)),
+        recipients: uniq(add(audience.adminLike, targetUserId)),
         category: "invitation",
         preferenceKey: "invitations",
       };
     }
     if (action === "accept") {
+      const isAdminRole =
+        role === "admin" || role === "ownership_transfer";
       return {
         recipients: isAdminRole
           ? audience.everyone
@@ -227,33 +227,22 @@ async function resolveRecipients(client, entry, audience) {
 function humanRole(raw) {
   if (!raw) return "access";
   switch (String(raw)) {
-    case "admin":
-      return "admin access";
-    case "member_visibility":
-      return "member access";
-    case "staff_visibility":
-      return "staff access";
-    case "ownership_transfer":
-      return "ownership";
-    default:
-      return String(raw).replace(/_/g, " ");
+    case "admin":              return "admin access";
+    case "member_visibility":  return "member access";
+    case "staff_visibility":   return "staff access";
+    case "ownership_transfer": return "ownership";
+    default:                   return String(raw).replace(/_/g, " ");
   }
 }
 
-// Short label for "joined as a ___" phrasing
 function joinedLabel(raw) {
-  if (!raw) return "member";
+  if (!raw) return "a member";
   switch (String(raw)) {
-    case "admin":
-      return "an admin";
-    case "member_visibility":
-      return "a member";
-    case "staff_visibility":
-      return "a staff member";
-    case "ownership_transfer":
-      return "the owner";
-    default:
-      return String(raw).replace(/_/g, " ");
+    case "admin":              return "an admin";
+    case "member_visibility":  return "a member";
+    case "staff_visibility":   return "a staff member";
+    case "ownership_transfer": return "the owner";
+    default:                   return String(raw).replace(/_/g, " ");
   }
 }
 
@@ -292,7 +281,6 @@ function buildNotificationContent(entry) {
     String(entry.targetUserId) === String(viewerUserId)
   );
 
-  // actor === target (same person did the action to themselves)
   const samePerson = !!(
     entry.actorUserId &&
     entry.targetUserId &&
