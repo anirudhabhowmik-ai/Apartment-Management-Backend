@@ -139,6 +139,7 @@ const getAccountPeople = async (req, res) => {
     const { id: accountId } = req.params;
     if (!userId) return fail(res, 401, "unauthenticated");
 
+    // Access check
     const { rows: memberRows } = await pool.query(
       `SELECT am.role FROM account_members am
          JOIN accounts a ON a.id = am.account_id
@@ -156,6 +157,7 @@ const getAccountPeople = async (req, res) => {
       return fail(res, 403, "no_account_access");
     }
 
+    // Owner
     const { rows: ownerRows } = await pool.query(
       `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM accounts a JOIN users u ON u.id = a.created_by
@@ -171,25 +173,36 @@ const getAccountPeople = async (req, res) => {
         }
       : null;
 
-    const { rows: adminRows } = await pool.query(
-      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+    // One query for all three role buckets
+    const { rows: roleRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url, am.role
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          JOIN accounts a ON a.id = am.account_id
         WHERE am.account_id = $1
-          AND am.role = 'admin' AND am.status = 'active'
+          AND am.status = 'active'
           AND u.id <> a.created_by
         ORDER BY COALESCE(u.name, '')`,
       [accountId],
     );
-    const admins = adminRows.map((r) => ({
-      user_id: r.user_id,
-      name: r.name ?? "",
-      phone: r.phone ?? null,
-      photo_url: r.photo_url ?? null,
-    }));
 
-    return res.json({ owner, admins });
+    const admins = [];
+    const members = [];
+    const staff = [];
+
+    for (const r of roleRows) {
+      const entry = {
+        user_id: r.user_id,
+        name: r.name ?? "",
+        phone: r.phone ?? null,
+        photo_url: r.photo_url ?? null,
+      };
+      if (r.role === "admin") admins.push(entry);
+      else if (r.role === "member_visibility") members.push(entry);
+      else if (r.role === "staff_visibility") staff.push(entry);
+    }
+
+    return res.json({ owner, admins, members, staff });
   } catch (error) {
     console.error("getAccountPeople error:", error);
     return fail(res, 500, "server_error");
