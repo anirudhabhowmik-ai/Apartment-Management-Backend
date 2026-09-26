@@ -1,5 +1,6 @@
 // src/controllers/auditController.js
 const { pool } = require("../config/database");
+const { projectNotifications } = require("./notificationController");
 
 // ---------------------------------------------------------------------------
 // Redaction
@@ -57,26 +58,18 @@ function buildSummary(e) {
     "account.transfer_ownership": () =>
       `${actor} transferred ownership${target ? ` to ${target}` : ""}`,
 
-    "member.create": () =>
-      `${actor} added property for ${target ?? "a member"}`,
+    "member.create": () => `${actor} added property for ${target ?? "a member"}`,
     "member.update": () => `${actor} updated ${target ?? "a member"}'s details`,
-    "member.delete": () =>
-      `${actor} removed property from ${target ?? "a member"}`,
+    "member.delete": () => `${actor} removed property from ${target ?? "a member"}`,
 
-    "staff.create": () =>
-      `${actor} added staff role for ${target ?? "a staff member"}`,
+    "staff.create": () => `${actor} added staff role for ${target ?? "a staff member"}`,
     "staff.update": () => `${actor} updated ${target ?? "a staff member"}'s details`,
-    "staff.delete": () =>
-      `${actor} removed staff role from ${target ?? "a staff member"}`,
+    "staff.delete": () => `${actor} removed staff role from ${target ?? "a staff member"}`,
 
-    "member.payment_paid": () =>
-      `${actor} marked maintenance PAID for ${target ?? "a member"}`,
-    "member.payment_due": () =>
-      `${actor} marked maintenance DUE for ${target ?? "a member"}`,
-    "staff.payment_paid": () =>
-      `${actor} marked salary PAID for ${target ?? "a staff member"}`,
-    "staff.payment_due": () =>
-      `${actor} marked salary DUE for ${target ?? "a staff member"}`,
+    "member.payment_paid": () => `${actor} marked maintenance PAID for ${target ?? "a member"}`,
+    "member.payment_due": () => `${actor} marked maintenance DUE for ${target ?? "a member"}`,
+    "staff.payment_paid": () => `${actor} marked salary PAID for ${target ?? "a staff member"}`,
+    "staff.payment_due": () => `${actor} marked salary DUE for ${target ?? "a staff member"}`,
 
     "expense.create": () => `${actor} added an expense`,
     "expense.update": () => `${actor} updated an expense`,
@@ -159,7 +152,7 @@ async function writeAudit(client, entry) {
     providedSummary ||
     buildSummary({ entityType, action, actorName, targetName, metadata });
 
-  await client.query(
+  const insert = await client.query(
     `INSERT INTO audit_log
        (account_id, actor_user_id, actor_role,
         entity_type, entity_id, action,
@@ -168,7 +161,8 @@ async function writeAudit(client, entry) {
      VALUES ($1,$2,$3,
              $4,$5,$6,
              $7,$8,$9,
-             $10,$11)`,
+             $10,$11)
+     RETURNING id`,
     [
       accountId, actorUserId, actorRole,
       entityType, entityId, action,
@@ -178,6 +172,28 @@ async function writeAudit(client, entry) {
       visibility, summary,
     ],
   );
+
+  const auditId = insert.rows[0].id;
+
+  // No try/catch — if this throws, the caller's transaction rolls back and
+  // we see the real error in the log.
+  await projectNotifications(client, {
+    auditId,
+    accountId,
+    actorUserId,
+    actorRole,
+    targetUserId,
+    entityType,
+    entityId,
+    action,
+    before,
+    after,
+    metadata,
+    visibility,
+    summary,
+    actorName,
+    targetName,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -207,14 +223,6 @@ async function getRoleForAccount(userId, accountId) {
 
 const isAdminLike = (role) => role === "owner" || role === "admin";
 
-// ---------------------------------------------------------------------------
-// Shared SELECT — JOINs users to fetch fresh name/phone/photo.
-//
-// Target resolution order:
-//   1. account_member / user → entity_id IS the user id
-//   2. member / staff       → entity_id → join table → user_id
-//   3. invitation           → after.phone OR after.acceptedBy
-// ---------------------------------------------------------------------------
 const HISTORY_SELECT = `
   SELECT
     al.id,
@@ -242,7 +250,6 @@ const HISTORY_SELECT = `
   FROM audit_log al
   LEFT JOIN users au ON au.id = al.actor_user_id
   LEFT JOIN LATERAL (
-    -- 1. account_member / user → entity_id IS the user id
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM users u
      WHERE al.entity_type = 'account_member' AND u.id = al.entity_id
@@ -250,8 +257,6 @@ const HISTORY_SELECT = `
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM users u
      WHERE al.entity_type = 'user' AND u.id = al.entity_id
-
-    -- 2. member / staff → resolve via their join tables
     UNION ALL
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM members m JOIN users u ON u.id = m.user_id
@@ -260,8 +265,6 @@ const HISTORY_SELECT = `
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM staff s JOIN users u ON u.id = s.user_id
      WHERE al.entity_type = 'staff' AND s.id = al.entity_id
-
-    -- 3. invitation → match on after.phone or acceptedBy user id
     UNION ALL
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM users u
@@ -275,19 +278,14 @@ const HISTORY_SELECT = `
          OR (al.after->>'acceptedBy' IS NOT NULL
              AND u.id = (al.after->>'acceptedBy')::uuid)
        )
-
     LIMIT 1
   ) tu ON TRUE
 `;
 
-// ---------------------------------------------------------------------------
-// GET /history — OWNER / ADMIN only. Full account history.
-// ---------------------------------------------------------------------------
 const getAccountHistory = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId } = req.params;
-
     if (!userId) return fail(res, 401, "unauthenticated");
 
     const role = await getRoleForAccount(userId, accountId);
@@ -331,21 +329,10 @@ const getAccountHistory = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// GET /history/me — MEMBER or STAFF.
-//
-// Visibility rules:
-//   * visibility = 'public' → everyone sees it (account events, invitations,
-//     calendar, admin grants)
-//   * visibility IN ('self','participants') → only if the caller is the
-//     actor or the target
-//   * member / staff entity rows → always visible to the person themselves
-// ---------------------------------------------------------------------------
 const getMyHistory = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId } = req.params;
-
     if (!userId) return fail(res, 401, "unauthenticated");
 
     const role = await getRoleForAccount(userId, accountId);
@@ -353,14 +340,10 @@ const getMyHistory = async (req, res) => {
 
     const before = req.query.before || null;
     const limit  = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
-
     const params = [accountId, userId];
 
     let where = `al.account_id = $1 AND (
-      -- 1. Everyone in the account sees public events.
       al.visibility = 'public'
-
-      -- 2. Row-specific events: caller is actor or target.
       OR al.actor_user_id = $2
       OR (al.entity_type IN ('account_member','user') AND al.entity_id = $2)
       OR (al.entity_type = 'member' AND al.entity_id IN (
@@ -369,8 +352,6 @@ const getMyHistory = async (req, res) => {
       OR (al.entity_type = 'staff' AND al.entity_id IN (
             SELECT id FROM staff WHERE user_id = $2
           ))
-
-      -- 3. Participant/self events where caller is actor or target.
       OR (
         al.visibility IN ('self','participants')
         AND (
@@ -407,9 +388,6 @@ const getMyHistory = async (req, res) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// POST /history/sensitive-view
-// ---------------------------------------------------------------------------
 const logSensitiveView = async (req, res) => {
   const client = await pool.connect();
   try {

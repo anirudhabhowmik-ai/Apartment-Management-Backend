@@ -469,11 +469,14 @@ const setLastAccount = async (req, res) => {
 // The highest-priority active role is returned (owner > admin > member > staff).
 // Used by the client to detect role changes without re-fetching the full
 // account list — the tab bar can then react instantly.
+//
+// NOTE: the route is declared as `/:id/my-role` in accountRoutes.js, so we
+// read `req.params.id` (renamed to accountId locally).
 // ===========================================================================
 const getMyRole = async (req, res) => {
   try {
     const userId = getUserId(req);
-    const { accountId } = req.params;
+    const { id: accountId } = req.params;
 
     if (!userId) return fail(res, 401, "unauthenticated");
     if (!accountId) return fail(res, 400, "invalid_input");

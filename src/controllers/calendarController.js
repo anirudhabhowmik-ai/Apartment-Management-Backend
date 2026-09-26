@@ -531,7 +531,7 @@ const createEvent = async (req, res) => {
         date,
         status,
       },
-      metadata: { kind: eventKind },
+      metadata: { kind: eventKind, type, created_by_id: userId },
       visibility: "public",
     });
 
@@ -754,7 +754,11 @@ const updateEvent = async (req, res) => {
         resource: existing.resource,
       },
       after: { fields: Object.keys(updates) },
-      metadata: { kind: existing.type === "notice" ? "a notice" : "an event" },
+      metadata: {
+        kind: existing.type === "notice" ? "a notice" : "an event",
+        type: existing.type,
+        created_by_id: existing.created_by_id,
+      },
       visibility: "public",
     });
 
@@ -821,7 +825,7 @@ const approveEvent = async (req, res) => {
               rejection_reason = NULL,
               updated_at = NOW()
         WHERE id = $5 AND account_id = $6 AND status = 'pending'
-        RETURNING id, type`,
+        RETURNING id, type, created_by_id`,
       [
         userId,
         approverName,
@@ -836,6 +840,7 @@ const approveEvent = async (req, res) => {
       return fail(res, 404, "not_found", "Pending event not found");
 
     const kind = rows[0].type === "notice" ? "a notice" : "an event";
+    const posterId = rows[0].created_by_id;
 
     const client = await pool.connect();
     try {
@@ -847,7 +852,8 @@ const approveEvent = async (req, res) => {
         entityType: "calendar_event",
         entityId: id,
         action: "approve",
-        metadata: { kind },
+        before: { created_by_id: posterId },
+        metadata: { kind, type: rows[0].type, created_by_id: posterId },
         visibility: "public",
       });
       await client.query("COMMIT");
@@ -918,7 +924,7 @@ const rejectEvent = async (req, res) => {
               rejection_reason = $5,
               updated_at = NOW()
         WHERE id = $6 AND account_id = $7 AND status = 'pending'
-        RETURNING id, type`,
+        RETURNING id, type, created_by_id`,
       [
         userId,
         approverName,
@@ -934,6 +940,7 @@ const rejectEvent = async (req, res) => {
       return fail(res, 404, "not_found", "Pending event not found");
 
     const kind = rows[0].type === "notice" ? "a notice" : "an event";
+    const posterId = rows[0].created_by_id;
 
     const client = await pool.connect();
     try {
@@ -945,7 +952,8 @@ const rejectEvent = async (req, res) => {
         entityType: "calendar_event",
         entityId: id,
         action: "reject",
-        metadata: { kind },
+        before: { created_by_id: posterId },
+        metadata: { kind, type: rows[0].type, created_by_id: posterId },
         visibility: "public",
       });
       await client.query("COMMIT");
@@ -1120,7 +1128,8 @@ const deleteEvent = async (req, res) => {
         entityType: "calendar_event",
         entityId: id,
         action: "delete",
-        metadata: { kind },
+        before: { created_by_id: ev.created_by_id, type: ev.type },
+        metadata: { kind, type: ev.type, created_by_id: ev.created_by_id },
         visibility: "public",
       });
       await client.query("COMMIT");
