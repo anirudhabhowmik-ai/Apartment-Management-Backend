@@ -1,6 +1,7 @@
 // src/controllers/auditController.js
 const { pool } = require("../config/database");
 const { projectNotifications } = require("./notificationController");
+const { getSubscriptionForAccount } = require("../utils/subscription");
 
 // ---------------------------------------------------------------------------
 // Redaction
@@ -25,6 +26,24 @@ function scrubForAudit(obj) {
 }
 
 const VALID_VISIBILITY = new Set(["admin", "public", "self", "participants"]);
+
+// ---------------------------------------------------------------------------
+// Plan gate — history is a paid feature.
+//
+// During the 90-day trial → effectivePlanId = "pro", so isTrial === true and
+// access is allowed. After trial ends with no paid plan → effectivePlanId
+// becomes "free" and isTrial becomes false, so access is denied.
+// ---------------------------------------------------------------------------
+async function canAccessHistory(accountId) {
+  try {
+    const sub = await getSubscriptionForAccount(pool, accountId);
+    return sub.effectivePlanId !== "free" || sub.isTrial === true;
+  } catch (err) {
+    console.warn("canAccessHistory failed:", err);
+    // Fail closed — no history if we can't determine the plan.
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Friendly role label
@@ -54,10 +73,6 @@ function joinedLabel(role) {
 
 // ---------------------------------------------------------------------------
 // Human-readable summary builder
-//
-// History is a shared feed, so we never use "You" here. We use reflexive
-// pronouns when the actor is also the target ("Archana granted themselves
-// member access" instead of "Archana granted member access to Archana").
 // ---------------------------------------------------------------------------
 function buildSummary(e) {
   const actor = e.actorName || "Someone";
@@ -254,10 +269,6 @@ async function writeAudit(client, entry) {
 
   const auditId = insert.rows[0].id;
 
-  // Project the audit entry into per-user notifications.
-  // Runs in the same transaction as the audit insert.
-  // Failures here must never break the audit trail or the caller's
-  // transaction, so we log and continue.
   try {
     await projectNotifications(client, {
       auditId,
@@ -338,7 +349,6 @@ const HISTORY_SELECT = `
   FROM audit_log al
   LEFT JOIN users au ON au.id = al.actor_user_id
   LEFT JOIN LATERAL (
-    -- 1. account_member / user → entity_id IS the user id
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM users u
      WHERE al.entity_type = 'account_member' AND u.id = al.entity_id
@@ -347,7 +357,6 @@ const HISTORY_SELECT = `
       FROM users u
      WHERE al.entity_type = 'user' AND u.id = al.entity_id
 
-    -- 2. member / staff → resolve via their join tables
     UNION ALL
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM members m JOIN users u ON u.id = m.user_id
@@ -357,7 +366,6 @@ const HISTORY_SELECT = `
       FROM staff s JOIN users u ON u.id = s.user_id
      WHERE al.entity_type = 'staff' AND s.id = al.entity_id
 
-    -- 3. invitation → match on after.phone or acceptedBy user id
     UNION ALL
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM users u
@@ -378,6 +386,7 @@ const HISTORY_SELECT = `
 
 // ---------------------------------------------------------------------------
 // GET /history — OWNER / ADMIN only. Full account history.
+// Requires a paid plan (or active trial).
 // ---------------------------------------------------------------------------
 const getAccountHistory = async (req, res) => {
   try {
@@ -389,6 +398,17 @@ const getAccountHistory = async (req, res) => {
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden");
     if (!isAdminLike(role)) return fail(res, 403, "forbidden");
+
+    // History is a paid feature.
+    const allowed = await canAccessHistory(accountId);
+    if (!allowed) {
+      return fail(
+        res,
+        403,
+        "history_requires_plan",
+        "History is available on paid plans. Upgrade to view history.",
+      );
+    }
 
     const entityType = req.query.entityType || null;
     const entityId   = req.query.entityId   || null;
@@ -429,6 +449,7 @@ const getAccountHistory = async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // GET /history/me — MEMBER or STAFF.
+// Requires a paid plan (or active trial).
 // ---------------------------------------------------------------------------
 const getMyHistory = async (req, res) => {
   try {
@@ -439,6 +460,17 @@ const getMyHistory = async (req, res) => {
 
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden");
+
+    // History is a paid feature.
+    const allowed = await canAccessHistory(accountId);
+    if (!allowed) {
+      return fail(
+        res,
+        403,
+        "history_requires_plan",
+        "History is available on paid plans. Upgrade to view history.",
+      );
+    }
 
     const before = req.query.before || null;
     const limit  = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
