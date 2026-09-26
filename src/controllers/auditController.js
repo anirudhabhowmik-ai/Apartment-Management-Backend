@@ -30,74 +30,145 @@ const VALID_VISIBILITY = new Set(["admin", "public", "self", "participants"]);
 // Friendly role label
 // ---------------------------------------------------------------------------
 function humanRole(role) {
-  if (!role) return "a role";
-  switch (role) {
-    case "owner":              return "Owner";
-    case "admin":              return "Admin";
-    case "member_visibility":  return "Member";
-    case "staff_visibility":   return "Staff";
-    case "ownership_transfer": return "Ownership Transfer";
-    default:                   return role;
+  if (!role) return "access";
+  switch (String(role)) {
+    case "owner":              return "owner access";
+    case "admin":              return "admin access";
+    case "member_visibility":  return "member access";
+    case "staff_visibility":   return "staff access";
+    case "ownership_transfer": return "ownership";
+    default:                   return String(role).replace(/_/g, " ");
+  }
+}
+
+function joinedLabel(role) {
+  if (!role) return "a member";
+  switch (String(role)) {
+    case "admin":              return "an admin";
+    case "member_visibility":  return "a member";
+    case "staff_visibility":   return "a staff member";
+    case "ownership_transfer": return "the owner";
+    default:                   return String(role).replace(/_/g, " ");
   }
 }
 
 // ---------------------------------------------------------------------------
 // Human-readable summary builder
+//
+// History is a shared feed, so we never use "You" here. We use reflexive
+// pronouns when the actor is also the target ("Archana granted themselves
+// member access" instead of "Archana granted member access to Archana").
 // ---------------------------------------------------------------------------
 function buildSummary(e) {
   const actor = e.actorName || "Someone";
   const target = e.targetName || null;
+
   const role = e.metadata?.role;
   const kind = e.metadata?.kind;
   const k = `${e.entityType}.${e.action}`;
 
+  const isSamePerson =
+    !!e.actorUserId &&
+    !!e.targetUserId &&
+    String(e.actorUserId) === String(e.targetUserId);
+
+  const targetForBody = target ?? "someone";
+
+  const roleLabel = humanRole(role);
+
   const map = {
+    // ---- Account ----
     "account.create": () => `${actor} created the account`,
     "account.update": () => `${actor} updated the account`,
     "account.delete": () => `${actor} deleted the account`,
     "account.transfer_ownership": () =>
-      `${actor} transferred ownership${target ? ` to ${target}` : ""}`,
+      target
+        ? `${actor} transferred ownership to ${target}`
+        : `${actor} transferred ownership`,
 
-    "member.create": () => `${actor} added property for ${target ?? "a member"}`,
-    "member.update": () => `${actor} updated ${target ?? "a member"}'s details`,
-    "member.delete": () => `${actor} removed property from ${target ?? "a member"}`,
+    // ---- Members ----
+    "member.create": () =>
+      `${actor} added property for ${targetForBody}`,
+    "member.update": () =>
+      isSamePerson
+        ? `${actor} updated their own details`
+        : `${actor} updated ${targetForBody}'s details`,
+    "member.delete": () =>
+      isSamePerson
+        ? `${actor} removed their own property`
+        : `${actor} removed property from ${targetForBody}`,
 
-    "staff.create": () => `${actor} added staff role for ${target ?? "a staff member"}`,
-    "staff.update": () => `${actor} updated ${target ?? "a staff member"}'s details`,
-    "staff.delete": () => `${actor} removed staff role from ${target ?? "a staff member"}`,
+    // ---- Staff ----
+    "staff.create": () =>
+      `${actor} added staff role for ${targetForBody}`,
+    "staff.update": () =>
+      isSamePerson
+        ? `${actor} updated their own details`
+        : `${actor} updated ${targetForBody}'s details`,
+    "staff.delete": () =>
+      isSamePerson
+        ? `${actor} removed their own staff role`
+        : `${actor} removed staff role from ${targetForBody}`,
 
-    "member.payment_paid": () => `${actor} marked maintenance PAID for ${target ?? "a member"}`,
-    "member.payment_due": () => `${actor} marked maintenance DUE for ${target ?? "a member"}`,
-    "staff.payment_paid": () => `${actor} marked salary PAID for ${target ?? "a staff member"}`,
-    "staff.payment_due": () => `${actor} marked salary DUE for ${target ?? "a staff member"}`,
+    // ---- Payments ----
+    "member.payment_paid": () =>
+      isSamePerson
+        ? `${actor} marked their own maintenance as PAID`
+        : `${actor} marked maintenance PAID for ${targetForBody}`,
+    "member.payment_due": () =>
+      isSamePerson
+        ? `${actor} marked their own maintenance as DUE`
+        : `${actor} marked maintenance DUE for ${targetForBody}`,
+    "staff.payment_paid": () =>
+      isSamePerson
+        ? `${actor} marked their own salary as PAID`
+        : `${actor} marked salary PAID for ${targetForBody}`,
+    "staff.payment_due": () =>
+      isSamePerson
+        ? `${actor} marked their own salary as DUE`
+        : `${actor} marked salary DUE for ${targetForBody}`,
 
+    // ---- Expenses ----
     "expense.create": () => `${actor} added an expense`,
     "expense.update": () => `${actor} updated an expense`,
     "expense.delete": () => `${actor} deleted an expense`,
 
+    // ---- Account member role changes ----
     "account_member.role_granted": () =>
-      `${actor} granted ${humanRole(role)} access to ${target ?? "a user"}`,
+      isSamePerson
+        ? `${actor} granted themselves ${roleLabel}`
+        : `${actor} granted ${roleLabel} to ${targetForBody}`,
     "account_member.role_revoked": () =>
-      `${actor} removed ${humanRole(role)} access from ${target ?? "a user"}`,
+      isSamePerson
+        ? `${actor} revoked their own ${roleLabel}`
+        : `${actor} removed ${roleLabel} from ${targetForBody}`,
 
+    // ---- Invitations ----
     "invitation.create": () =>
-      `${actor} invited ${target ?? "a user"} for ${humanRole(role)} access`,
+      `${actor} invited ${targetForBody} for ${roleLabel}`,
     "invitation.delete": () =>
-      `${actor} cancelled invitation for ${target ?? "a user"}`,
+      `${actor} cancelled invitation for ${targetForBody}`,
     "invitation.reject": () =>
-      `${target ?? "A user"} rejected the invitation`,
+      isSamePerson
+        ? `${actor} rejected the invitation`
+        : `${targetForBody} rejected the invitation`,
     "invitation.accept": () =>
-      `${target ?? actor} accepted invitation for ${humanRole(role)} access`,
+      isSamePerson
+        ? `${actor} accepted the invitation for ${roleLabel}`
+        : `${targetForBody} accepted the invitation for ${roleLabel}`,
 
+    // ---- Calendar ----
     "calendar_event.create":  () => `${actor} posted ${kind ?? "an event"}`,
     "calendar_event.update":  () => `${actor} updated ${kind ?? "an event"}`,
     "calendar_event.approve": () => `${actor} approved ${kind ?? "an event"}`,
     "calendar_event.reject":  () => `${actor} rejected ${kind ?? "an event"}`,
     "calendar_event.delete":  () => `${actor} deleted ${kind ?? "an event"}`,
 
+    // ---- Opening balance ----
     "opening_balance.update": () => `${actor} updated opening balance`,
     "opening_balance.create": () => `${actor} added opening balance`,
 
+    // ---- User ----
     "user.merge_users": () => `${actor} merged accounts`,
     "user.phone_changed": () => `${actor} changed their phone number`,
   };
@@ -150,7 +221,15 @@ async function writeAudit(client, entry) {
 
   const summary =
     providedSummary ||
-    buildSummary({ entityType, action, actorName, targetName, metadata });
+    buildSummary({
+      entityType,
+      action,
+      actorName,
+      targetName,
+      actorUserId,
+      targetUserId,
+      metadata,
+    });
 
   const insert = await client.query(
     `INSERT INTO audit_log
@@ -175,25 +254,31 @@ async function writeAudit(client, entry) {
 
   const auditId = insert.rows[0].id;
 
-  // No try/catch — if this throws, the caller's transaction rolls back and
-  // we see the real error in the log.
-  await projectNotifications(client, {
-    auditId,
-    accountId,
-    actorUserId,
-    actorRole,
-    targetUserId,
-    entityType,
-    entityId,
-    action,
-    before,
-    after,
-    metadata,
-    visibility,
-    summary,
-    actorName,
-    targetName,
-  });
+  // Project the audit entry into per-user notifications.
+  // Runs in the same transaction as the audit insert.
+  // Failures here must never break the audit trail or the caller's
+  // transaction, so we log and continue.
+  try {
+    await projectNotifications(client, {
+      auditId,
+      accountId,
+      actorUserId,
+      actorRole,
+      targetUserId,
+      entityType,
+      entityId,
+      action,
+      before,
+      after,
+      metadata,
+      visibility,
+      summary,
+      actorName,
+      targetName,
+    });
+  } catch (err) {
+    console.warn("writeAudit: projectNotifications failed:", err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +308,9 @@ async function getRoleForAccount(userId, accountId) {
 
 const isAdminLike = (role) => role === "owner" || role === "admin";
 
+// ---------------------------------------------------------------------------
+// Shared SELECT — JOINs users to fetch fresh name/phone/photo.
+// ---------------------------------------------------------------------------
 const HISTORY_SELECT = `
   SELECT
     al.id,
@@ -250,6 +338,7 @@ const HISTORY_SELECT = `
   FROM audit_log al
   LEFT JOIN users au ON au.id = al.actor_user_id
   LEFT JOIN LATERAL (
+    -- 1. account_member / user → entity_id IS the user id
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM users u
      WHERE al.entity_type = 'account_member' AND u.id = al.entity_id
@@ -257,6 +346,8 @@ const HISTORY_SELECT = `
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM users u
      WHERE al.entity_type = 'user' AND u.id = al.entity_id
+
+    -- 2. member / staff → resolve via their join tables
     UNION ALL
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM members m JOIN users u ON u.id = m.user_id
@@ -265,6 +356,8 @@ const HISTORY_SELECT = `
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM staff s JOIN users u ON u.id = s.user_id
      WHERE al.entity_type = 'staff' AND s.id = al.entity_id
+
+    -- 3. invitation → match on after.phone or acceptedBy user id
     UNION ALL
     SELECT u.id, u.name, u.phone, u.photo_url
       FROM users u
@@ -278,14 +371,19 @@ const HISTORY_SELECT = `
          OR (al.after->>'acceptedBy' IS NOT NULL
              AND u.id = (al.after->>'acceptedBy')::uuid)
        )
+
     LIMIT 1
   ) tu ON TRUE
 `;
 
+// ---------------------------------------------------------------------------
+// GET /history — OWNER / ADMIN only. Full account history.
+// ---------------------------------------------------------------------------
 const getAccountHistory = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId } = req.params;
+
     if (!userId) return fail(res, 401, "unauthenticated");
 
     const role = await getRoleForAccount(userId, accountId);
@@ -329,10 +427,14 @@ const getAccountHistory = async (req, res) => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// GET /history/me — MEMBER or STAFF.
+// ---------------------------------------------------------------------------
 const getMyHistory = async (req, res) => {
   try {
     const userId = getUserId(req);
     const { accountId } = req.params;
+
     if (!userId) return fail(res, 401, "unauthenticated");
 
     const role = await getRoleForAccount(userId, accountId);
@@ -340,6 +442,7 @@ const getMyHistory = async (req, res) => {
 
     const before = req.query.before || null;
     const limit  = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+
     const params = [accountId, userId];
 
     let where = `al.account_id = $1 AND (
@@ -388,6 +491,9 @@ const getMyHistory = async (req, res) => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// POST /history/sensitive-view
+// ---------------------------------------------------------------------------
 const logSensitiveView = async (req, res) => {
   const client = await pool.connect();
   try {

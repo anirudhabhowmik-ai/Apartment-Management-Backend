@@ -120,7 +120,6 @@ async function resolveRecipients(client, entry, audience) {
     }
 
     if (action === "update") {
-      // Poster + admin-like see their own event edit; everyone sees nothing
       const posterId =
         after?.created_by_id || before?.created_by_id || actorUserId || null;
       return {
@@ -223,6 +222,42 @@ async function resolveRecipients(client, entry, audience) {
 }
 
 // ---------------------------------------------------------------------------
+// Human-readable role labels
+// ---------------------------------------------------------------------------
+function humanRole(raw) {
+  if (!raw) return "access";
+  switch (String(raw)) {
+    case "admin":
+      return "admin access";
+    case "member_visibility":
+      return "member access";
+    case "staff_visibility":
+      return "staff access";
+    case "ownership_transfer":
+      return "ownership";
+    default:
+      return String(raw).replace(/_/g, " ");
+  }
+}
+
+// Short label for "joined as a ___" phrasing
+function joinedLabel(raw) {
+  if (!raw) return "member";
+  switch (String(raw)) {
+    case "admin":
+      return "an admin";
+    case "member_visibility":
+      return "a member";
+    case "staff_visibility":
+      return "a staff member";
+    case "ownership_transfer":
+      return "the owner";
+    default:
+      return String(raw).replace(/_/g, " ");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Name resolution — returns "You" when the id matches the viewer
 // ---------------------------------------------------------------------------
 function nameFor(rawName, subjectUserId, viewerUserId) {
@@ -233,15 +268,11 @@ function nameFor(rawName, subjectUserId, viewerUserId) {
   ) {
     return "You";
   }
-  return rawName || "Someone";
+  return rawName || "someone";
 }
 
 // ---------------------------------------------------------------------------
 // Notification content (title/body) — personalized per viewer
-//
-// IMPORTANT: this function ONLY uses entry.actorName / entry.targetName,
-// which are re-resolved fresh in projectNotifications from user_id.
-// It never reads names out of entry.metadata — that's the whole point.
 // ---------------------------------------------------------------------------
 function buildNotificationContent(entry) {
   const viewerUserId = entry.viewerUserId ?? null;
@@ -249,66 +280,98 @@ function buildNotificationContent(entry) {
   const actor = nameFor(entry.actorName, entry.actorUserId, viewerUserId);
   const target = nameFor(entry.targetName, entry.targetUserId, viewerUserId);
 
+  const actorIsViewer = !!(
+    entry.actorUserId &&
+    viewerUserId &&
+    String(entry.actorUserId) === String(viewerUserId)
+  );
+
+  const targetIsViewer = !!(
+    entry.targetUserId &&
+    viewerUserId &&
+    String(entry.targetUserId) === String(viewerUserId)
+  );
+
+  // actor === target (same person did the action to themselves)
+  const samePerson = !!(
+    entry.actorUserId &&
+    entry.targetUserId &&
+    String(entry.actorUserId) === String(entry.targetUserId)
+  );
+
   const k = `${entry.entityType}.${entry.action}`;
   const meta = entry.metadata || {};
   const kind = meta.kind ?? "an event";
-
-  // Special-case for self-actions on payments so the message reads naturally
-  const isSelfActor = (() => {
-    if (!entry.actorUserId || !entry.viewerUserId) return false;
-    return String(entry.actorUserId) === String(entry.viewerUserId);
-  })();
-
-  const isSelfTarget = (() => {
-    if (!entry.targetUserId || !entry.viewerUserId) return false;
-    return String(entry.targetUserId) === String(entry.viewerUserId);
-  })();
+  const role = humanRole(meta.role);
+  const roleJoin = joinedLabel(meta.role);
 
   const map = {
+    // ---- Payments ----
     "member.payment_paid": () =>
-      isSelfActor && isSelfTarget
+      samePerson && actorIsViewer
         ? {
             title: "Maintenance paid",
             body: "You marked your own maintenance as PAID.",
           }
-        : {
-            title: "Maintenance paid",
-            body: `${actor} marked maintenance PAID for ${target}.`,
-          },
+        : samePerson
+          ? {
+              title: "Maintenance paid",
+              body: `${actor} marked their own maintenance as PAID.`,
+            }
+          : {
+              title: "Maintenance paid",
+              body: `${actor} marked maintenance PAID for ${target}.`,
+            },
 
     "member.payment_due": () =>
-      isSelfActor && isSelfTarget
+      samePerson && actorIsViewer
         ? {
             title: "Maintenance due",
             body: "You marked your own maintenance as DUE.",
           }
-        : {
-            title: "Maintenance due",
-            body: `${actor} marked maintenance DUE for ${target}.`,
-          },
+        : samePerson
+          ? {
+              title: "Maintenance due",
+              body: `${actor} marked their own maintenance as DUE.`,
+            }
+          : {
+              title: "Maintenance due",
+              body: `${actor} marked maintenance DUE for ${target}.`,
+            },
 
     "staff.payment_paid": () =>
-      isSelfActor && isSelfTarget
+      samePerson && actorIsViewer
         ? {
             title: "Salary paid",
             body: "You marked your own salary as PAID.",
           }
-        : {
-            title: "Salary paid",
-            body: `${actor} marked salary PAID for ${target}.`,
-          },
+        : samePerson
+          ? {
+              title: "Salary paid",
+              body: `${actor} marked their own salary as PAID.`,
+            }
+          : {
+              title: "Salary paid",
+              body: `${actor} marked salary PAID for ${target}.`,
+            },
 
     "staff.payment_due": () =>
-      isSelfActor && isSelfTarget
+      samePerson && actorIsViewer
         ? {
             title: "Salary due",
             body: "You marked your own salary as DUE.",
           }
-        : {
-            title: "Salary due",
-            body: `${actor} marked salary DUE for ${target}.`,
-          },
+        : samePerson
+          ? {
+              title: "Salary due",
+              body: `${actor} marked their own salary as DUE.`,
+            }
+          : {
+              title: "Salary due",
+              body: `${actor} marked salary DUE for ${target}.`,
+            },
 
+    // ---- Calendar events ----
     "calendar_event.create": () => {
       const isNotice = meta.kind === "a notice" || meta.type === "notice";
       return {
@@ -335,37 +398,109 @@ function buildNotificationContent(entry) {
       body: `${actor} deleted ${kind}.`,
     }),
 
-    "invitation.create": () => ({
-      title: "New invitation",
-      body: `${actor} invited someone for ${meta.role ?? "access"}.`,
-    }),
-    "invitation.accept": () => ({
-      title: "Invitation accepted",
-      body: `${target} joined as ${meta.role ?? "a member"}.`,
-    }),
-    "invitation.reject": () => ({
-      title: "Invitation rejected",
-      body: `${target} rejected the invitation.`,
-    }),
+    // ---- Invitations ----
+    "invitation.create": () =>
+      targetIsViewer
+        ? {
+            title: "New invitation",
+            body: `${actor} invited you for ${role}.`,
+          }
+        : {
+            title: "New invitation",
+            body: `${actor} invited ${target} for ${role}.`,
+          },
+
+    "invitation.accept": () =>
+      targetIsViewer
+        ? {
+            title: "Invitation accepted",
+            body: `You joined as ${roleJoin}.`,
+          }
+        : {
+            title: "Invitation accepted",
+            body: `${target} joined as ${roleJoin}.`,
+          },
+
+    "invitation.reject": () =>
+      targetIsViewer
+        ? {
+            title: "Invitation rejected",
+            body: "You rejected the invitation.",
+          }
+        : {
+            title: "Invitation rejected",
+            body: `${target} rejected the invitation.`,
+          },
+
     "invitation.delete": () => ({
       title: "Invitation cancelled",
       body: `${actor} cancelled an invitation.`,
     }),
 
-    "account_member.role_granted": () => ({
-      title: "Access granted",
-      body: `${actor} granted ${meta.role ?? "access"} to ${target}.`,
-    }),
-    "account_member.role_revoked": () => ({
-      title: "Access removed",
-      body: `${actor} removed ${meta.role ?? "access"} from ${target}.`,
-    }),
+    // ---- Account member role changes ----
+    "account_member.role_granted": () => {
+      if (samePerson && actorIsViewer) {
+        return {
+          title: "Access granted",
+          body: `You granted yourself ${role}.`,
+        };
+      }
+      if (samePerson) {
+        return {
+          title: "Access granted",
+          body: `${actor} granted themselves ${role}.`,
+        };
+      }
+      if (targetIsViewer) {
+        return {
+          title: "Access granted",
+          body: `${actor} granted you ${role}.`,
+        };
+      }
+      return {
+        title: "Access granted",
+        body: `${actor} granted ${role} to ${target}.`,
+      };
+    },
 
-    "account.transfer_ownership": () => ({
-      title: "Ownership transferred",
-      body: `${actor} transferred ownership to ${target}.`,
-    }),
+    "account_member.role_revoked": () => {
+      if (samePerson && actorIsViewer) {
+        return {
+          title: "Access removed",
+          body: `You revoked your ${role}.`,
+        };
+      }
+      if (samePerson) {
+        return {
+          title: "Access removed",
+          body: `${actor} revoked their ${role}.`,
+        };
+      }
+      if (targetIsViewer) {
+        return {
+          title: "Access removed",
+          body: `${actor} removed your ${role}.`,
+        };
+      }
+      return {
+        title: "Access removed",
+        body: `${actor} removed ${role} from ${target}.`,
+      };
+    },
 
+    // ---- Ownership ----
+    "account.transfer_ownership": () =>
+      targetIsViewer
+        ? {
+            title: "Ownership transferred",
+            body: `${actor} transferred ownership to you.`,
+          }
+        : {
+            title: "Ownership transferred",
+            body: `${actor} transferred ownership to ${target}.`,
+          },
+
+    // ---- Roster ----
     "member.create": () => ({
       title: "Member added",
       body: `${actor} added ${target}.`,
@@ -391,6 +526,7 @@ function buildNotificationContent(entry) {
       body: `${actor} removed ${target}.`,
     }),
 
+    // ---- Expenses ----
     "expense.create": () => ({
       title: "Expense added",
       body: `${actor} added an expense.`,
