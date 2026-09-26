@@ -1,4 +1,6 @@
-
+// src/services/push.js
+//
+// Everything push-notification-related in one place.
 
 const cron = require("node-cron");
 const { Expo } = require("expo-server-sdk");
@@ -39,7 +41,6 @@ async function deletePushToken(userId, token) {
 
 // ============================================================================
 // 2. DELIVERY WORKER
-//    Finds notifications with pushed_at IS NULL, sends via Expo, marks sent.
 // ============================================================================
 
 async function deliverPendingNotifications() {
@@ -64,9 +65,17 @@ async function deliverPendingNotifications() {
 
     const userIds = [...new Set(pending.map((n) => n.user_id))];
 
+    // Only fetch tokens for users who haven't turned push off.
     const { rows: tokenRows } = await client.query(
-      `SELECT user_id, token FROM user_push_tokens
-        WHERE user_id = ANY($1::uuid[])`,
+      `SELECT t.user_id, t.token
+         FROM user_push_tokens t
+        WHERE t.user_id = ANY($1::uuid[])
+          AND NOT EXISTS (
+            SELECT 1 FROM notification_preferences np
+             WHERE np.user_id = t.user_id
+               AND np.preference_key = 'push_enabled'
+               AND np.enabled = FALSE
+          )`,
       [userIds],
     );
 
@@ -146,16 +155,9 @@ async function deliverPendingNotifications() {
 
 // ============================================================================
 // 3. REMINDER RUNNER
-//
-//    Fires due reminders by writing an audit row (which becomes a notification
-//    via writeAudit → projectNotifications, and gets delivered by the push
-//    worker cron). Then reschedules the reminder for +24h while the expense
-//    is still 'due'.
 // ============================================================================
 
 function computeDefaultRemindAt(expenseDateStr) {
-  // First reminder: 09:00 the day before the due date.
-  // If that time has passed, fire 60s from now.
   const base = expenseDateStr
     ? new Date(`${expenseDateStr}T09:00:00`)
     : new Date();
@@ -199,7 +201,6 @@ async function runDueReminders() {
       const p = r.payload || {};
       const isIncome = p.transaction_type === "income";
 
-      // Proper text — NOT "Someone performed expense.expense_reminder".
       const title = isIncome ? "Income reminder" : "Payment due reminder";
       const summary = isIncome
         ? `Income pending: ${p.title || "Income"} (₹${p.amount ?? 0})`
@@ -219,24 +220,19 @@ async function runDueReminders() {
             title,
             summary,
             isIncome,
-            // Explicit override so notificationController uses this text
-            // instead of the default "X performed expense.expense_reminder".
             notificationTitle: title,
             notificationBody: summary,
           },
-          visibility: "admin",   // → only owner + admins
-          summary,               // explicit audit summary
+          visibility: "admin",
+          summary,
         });
 
-        // ─── Reschedule for tomorrow 9 AM while the expense is still 'due'.
-        //     Stop scheduling once the expense is 'paid' OR after 7 days.
         const { rows: statusRows } = await client.query(
           `SELECT status FROM expenses WHERE id = $1`,
           [r.entity_id],
         );
         const stillDue = statusRows[0]?.status === "due";
 
-        // Count how many days we've reminded by checking today's audit rows.
         const { rows: countRows } = await client.query(
           `SELECT COUNT(*)::int AS c
              FROM audit_log
@@ -249,7 +245,6 @@ async function runDueReminders() {
         const remindersSent = countRows[0]?.c ?? 0;
 
         if (stillDue && remindersSent < MAX_REMINDER_DAYS) {
-          // Fire again tomorrow at 9 AM
           await client.query(
             `UPDATE scheduled_reminders
                 SET remind_at = $2,
@@ -258,7 +253,6 @@ async function runDueReminders() {
             [r.id, tomorrowNineAM()],
           );
         } else {
-          // Paid, or hit the cap → stop forever
           await client.query(
             `UPDATE scheduled_reminders
                 SET sent_at = NOW(),
@@ -269,7 +263,6 @@ async function runDueReminders() {
         }
       } catch (inner) {
         console.error("[push] reminder failed id=", r.id, inner.message);
-        // Leave sent_at NULL so it retries next tick
       }
     }
 
@@ -285,7 +278,7 @@ async function runDueReminders() {
 }
 
 // ============================================================================
-// 4. SCHEDULING HELPERS (used by managementController)
+// 4. SCHEDULING HELPERS
 // ============================================================================
 
 async function upsertExpenseReminder(client, {
@@ -296,10 +289,6 @@ async function upsertExpenseReminder(client, {
 }) {
   const remindAt = computeDefaultRemindAt(expenseDate);
   await client.query(
-    // NOTE: do NOT reset sent_at here. That field is the "this reminder is
-    // done forever" marker. It's only set when the cron decides the reminder
-    // has finished (paid, or hit the daily cap). Resetting it here would
-    // cause the every-minute-fire loop.
     `INSERT INTO scheduled_reminders
        (account_id, entity_type, entity_id, remind_at, payload, updated_at)
      VALUES ($1, 'expense', $2, $3, $4::jsonb, NOW())
@@ -329,14 +318,12 @@ function startPushWorker() {
   if (started) return;
   started = true;
 
-  // Deliver queued notifications every 1 minute
   cron.schedule("*/1 * * * *", () => {
     deliverPendingNotifications().catch((e) =>
       console.error("[push] delivery cron error:", e),
     );
   });
 
-  // Check for due reminders every 1 minute
   cron.schedule("*/1 * * * *", () => {
     runDueReminders().catch((e) =>
       console.error("[push] reminder cron error:", e),
