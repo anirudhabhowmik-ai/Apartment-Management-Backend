@@ -1,5 +1,7 @@
+// src/server.js
 const app = require("./app");
 const { pool } = require("./config/database");
+const { startPushWorker } = require("./services/push");
 
 const PORT = process.env.PORT || 5000;
 
@@ -43,6 +45,12 @@ pool.connect((err, client, release) => {
           "development"
         }`,
       );
+
+      // ─── Start the push notification worker ───────────────
+      // Runs two cron jobs every minute:
+      //   1. Fires due reminders from scheduled_reminders
+      //   2. Delivers undelivered notifications via Expo Push
+      startPushWorker();
     },
   );
 });

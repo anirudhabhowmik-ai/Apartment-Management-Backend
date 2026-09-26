@@ -17,6 +17,7 @@ const manageAccountProfileRoutes = require("./routes/manageAccountProfileRoutes"
 const billRoutes = require("./routes/billRoutes");
 const auditRoutes = require("./routes/auditRoutes");
 const notificationsRoutes = require("./routes/notificationsRoutes");
+const pushRoutes = require("./routes/pushRoutes");
 
 
 const app = express();
@@ -69,6 +70,7 @@ app.use("/api", calendarRoutes);
 app.use("/api/accounts/:accountId/bills", billRoutes);
 app.use("/api", auditRoutes);
 app.use("/api/notifications", notificationsRoutes);
+app.use("/api/push", pushRoutes);
 
 app.use((req, res) => {
     res.status(404).json({ success: false, message: 'Route not found' });

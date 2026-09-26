@@ -6,6 +6,10 @@ const {
   deactivateAccessRole,
 } = require("../utils/accessSync");
 const { writeAudit } = require("./auditController");
+const {
+  upsertExpenseReminder,
+  cancelExpenseReminder,
+} = require("../services/push");
 
 const getUserId = (req) =>
   req.user?.userId ?? req.user?.id ?? req.userId ?? null;
@@ -372,13 +376,6 @@ const listMembers = async (req, res) => {
 
     if (role === "owner" || role === "admin") return res.json(result);
 
-    // ---------------------------------------------------------------
-    // Phone masking for non-owner/admin callers.
-    //
-    // Exception: the account owner and any active admin always keep their
-    // phone visible. They run the society — everyone needs a way to reach
-    // them.
-    // ---------------------------------------------------------------
     const { rows: privilegedRows } = await pool.query(
       `SELECT a.created_by AS user_id
          FROM accounts a
@@ -1805,6 +1802,24 @@ const createExpense = async (req, res) => {
       visibility: "public",
     });
 
+    // ─── PUSH: schedule / cancel reminder ──────────────────────────────────
+    if (rows[0].reminder_enabled && rows[0].status === "due") {
+      await upsertExpenseReminder(client, {
+        accountId,
+        expenseId: rows[0].id,
+        expenseDate: rows[0].expense_date,
+        payload: {
+          title: rows[0].title,
+          amount: Number(rows[0].amount),
+          transaction_type: rows[0].transaction_type,
+          category: rows[0].category,
+        },
+      });
+    } else {
+      await cancelExpenseReminder(client, rows[0].id);
+    }
+    // ─── END PUSH ──────────────────────────────────────────────────────────
+
     await client.query("COMMIT");
     return res.status(201).json(rows[0]);
   } catch (err) {
@@ -1886,6 +1901,25 @@ const updateExpense = async (req, res) => {
       visibility: "public",
     });
 
+    // ─── PUSH: reschedule / cancel reminder ────────────────────────────────
+    const after = updated.rows[0];
+    if (after.reminder_enabled && after.status === "due") {
+      await upsertExpenseReminder(client, {
+        accountId,
+        expenseId: after.id,
+        expenseDate: after.expense_date,
+        payload: {
+          title: after.title,
+          amount: Number(after.amount),
+          transaction_type: after.transaction_type,
+          category: after.category,
+        },
+      });
+    } else {
+      await cancelExpenseReminder(client, after.id);
+    }
+    // ─── END PUSH ──────────────────────────────────────────────────────────
+
     await client.query("COMMIT");
     return res.json(updated.rows[0]);
   } catch (err) {
@@ -1924,6 +1958,10 @@ const deleteExpense = async (req, res) => {
       await client.query("ROLLBACK");
       return fail(res, 404, "not_found", "Expense not found");
     }
+
+    // ─── PUSH: cancel any pending reminder ─────────────────────────────────
+    await cancelExpenseReminder(client, id);
+    // ─── END PUSH ──────────────────────────────────────────────────────────
 
     await writeAudit(client, {
       accountId,
