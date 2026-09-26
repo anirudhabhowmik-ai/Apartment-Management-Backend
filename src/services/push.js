@@ -1,17 +1,4 @@
-// src/services/push.js
-//
-// Everything push-notification-related in one place:
-//   • savePushToken / deletePushToken   — called from the route
-//   • deliverPendingNotifications       — finds unsent notifications, sends via Expo
-//   • runDueReminders                   — reads scheduled_reminders, fires audit → notifications
-//   • startPushWorker                   — starts both cron loops (call from server.js)
-//
-// Notes on design:
-//   • We do NOT insert into `notifications` directly. The existing
-//     writeAudit() → projectNotifications() pipeline does that for us.
-//     We only:
-//       1) deliver notifications rows that have pushed_at IS NULL
-//       2) create the audit row that triggers them (for scheduled reminders)
+
 
 const cron = require("node-cron");
 const { Expo } = require("expo-server-sdk");
@@ -19,6 +6,9 @@ const { pool } = require("../config/database");
 const { writeAudit } = require("../controllers/auditController");
 
 const expo = new Expo();
+
+// How many days in a row to remind while an expense is still 'due'.
+const MAX_REMINDER_DAYS = 7;
 
 // ============================================================================
 // 1. PUSH TOKENS
@@ -57,7 +47,6 @@ async function deliverPendingNotifications() {
   try {
     await client.query("BEGIN");
 
-    // Claim up to 200 unsent notifications
     const { rows: pending } = await client.query(
       `SELECT id, user_id, title, body, data, entity_type, entity_id, action
          FROM notifications
@@ -110,7 +99,6 @@ async function deliverPendingNotifications() {
       }
     }
 
-    // Fire Expo in chunks (their limit is 100 per request)
     const deadTokens = new Set();
     if (messages.length > 0) {
       const chunks = expo.chunkPushNotifications(messages);
@@ -139,8 +127,6 @@ async function deliverPendingNotifications() {
       );
     }
 
-    // Mark all claimed rows as pushed (whether or not the user had a token —
-    // we don't want to retry forever for users without devices).
     await client.query(
       `UPDATE notifications SET pushed_at = NOW()
         WHERE id = ANY($1::uuid[])`,
@@ -160,21 +146,33 @@ async function deliverPendingNotifications() {
 
 // ============================================================================
 // 3. REMINDER RUNNER
-//    Fires due scheduled_reminders by writing an audit row.
-//    writeAudit() auto-projects notifications → delivery worker picks them up.
+//
+//    Fires due reminders by writing an audit row (which becomes a notification
+//    via writeAudit → projectNotifications, and gets delivered by the push
+//    worker cron). Then reschedules the reminder for +24h while the expense
+//    is still 'due'.
 // ============================================================================
 
 function computeDefaultRemindAt(expenseDateStr) {
-  // 24 hours before expense_date at 09:00 local; if past, schedule 60s out.
+  // First reminder: 09:00 the day before the due date.
+  // If that time has passed, fire 60s from now.
   const base = expenseDateStr
     ? new Date(`${expenseDateStr}T09:00:00`)
     : new Date();
   if (isNaN(base.getTime())) return new Date(Date.now() + 60 * 1000);
+
   const remindAt = new Date(base.getTime() - 24 * 60 * 60 * 1000);
   if (remindAt.getTime() <= Date.now()) {
     return new Date(Date.now() + 60 * 1000);
   }
   return remindAt;
+}
+
+function tomorrowNineAM() {
+  const t = new Date();
+  t.setDate(t.getDate() + 1);
+  t.setHours(9, 0, 0, 0);
+  return t;
 }
 
 async function runDueReminders() {
@@ -183,7 +181,7 @@ async function runDueReminders() {
     await client.query("BEGIN");
 
     const { rows: due } = await client.query(
-      `SELECT id, account_id, entity_type, entity_id, payload
+      `SELECT id, account_id, entity_type, entity_id, payload, remind_at
          FROM scheduled_reminders
         WHERE sent_at IS NULL
           AND remind_at <= NOW()
@@ -200,10 +198,12 @@ async function runDueReminders() {
     for (const r of due) {
       const p = r.payload || {};
       const isIncome = p.transaction_type === "income";
+
+      // Proper text — NOT "Someone performed expense.expense_reminder".
       const title = isIncome ? "Income reminder" : "Payment due reminder";
       const summary = isIncome
-        ? `${p.title || "Income"} • ₹${p.amount ?? 0} expected`
-        : `${p.title || "Expense"} • ₹${p.amount ?? 0} due`;
+        ? `Income pending: ${p.title || "Income"} (₹${p.amount ?? 0})`
+        : `Payment due: ${p.title || "Expense"} (₹${p.amount ?? 0})`;
 
       try {
         await writeAudit(client, {
@@ -219,15 +219,54 @@ async function runDueReminders() {
             title,
             summary,
             isIncome,
+            // Explicit override so notificationController uses this text
+            // instead of the default "X performed expense.expense_reminder".
+            notificationTitle: title,
+            notificationBody: summary,
           },
-          visibility: "admin",
+          visibility: "admin",   // → only owner + admins
+          summary,               // explicit audit summary
         });
 
-        await client.query(
-          `UPDATE scheduled_reminders SET sent_at = NOW(), updated_at = NOW()
-            WHERE id = $1`,
-          [r.id],
+        // ─── Reschedule for tomorrow 9 AM while the expense is still 'due'.
+        //     Stop scheduling once the expense is 'paid' OR after 7 days.
+        const { rows: statusRows } = await client.query(
+          `SELECT status FROM expenses WHERE id = $1`,
+          [r.entity_id],
         );
+        const stillDue = statusRows[0]?.status === "due";
+
+        // Count how many days we've reminded by checking today's audit rows.
+        const { rows: countRows } = await client.query(
+          `SELECT COUNT(*)::int AS c
+             FROM audit_log
+            WHERE entity_type = 'expense'
+              AND entity_id = $1
+              AND action = 'expense_reminder'
+              AND created_at > NOW() - INTERVAL '${MAX_REMINDER_DAYS} days'`,
+          [r.entity_id],
+        );
+        const remindersSent = countRows[0]?.c ?? 0;
+
+        if (stillDue && remindersSent < MAX_REMINDER_DAYS) {
+          // Fire again tomorrow at 9 AM
+          await client.query(
+            `UPDATE scheduled_reminders
+                SET remind_at = $2,
+                    updated_at = NOW()
+              WHERE id = $1`,
+            [r.id, tomorrowNineAM()],
+          );
+        } else {
+          // Paid, or hit the cap → stop forever
+          await client.query(
+            `UPDATE scheduled_reminders
+                SET sent_at = NOW(),
+                    updated_at = NOW()
+              WHERE id = $1`,
+            [r.id],
+          );
+        }
       } catch (inner) {
         console.error("[push] reminder failed id=", r.id, inner.message);
         // Leave sent_at NULL so it retries next tick
@@ -257,13 +296,16 @@ async function upsertExpenseReminder(client, {
 }) {
   const remindAt = computeDefaultRemindAt(expenseDate);
   await client.query(
+    // NOTE: do NOT reset sent_at here. That field is the "this reminder is
+    // done forever" marker. It's only set when the cron decides the reminder
+    // has finished (paid, or hit the daily cap). Resetting it here would
+    // cause the every-minute-fire loop.
     `INSERT INTO scheduled_reminders
        (account_id, entity_type, entity_id, remind_at, payload, updated_at)
      VALUES ($1, 'expense', $2, $3, $4::jsonb, NOW())
      ON CONFLICT (entity_type, entity_id)
      DO UPDATE SET remind_at = EXCLUDED.remind_at,
                    payload   = EXCLUDED.payload,
-                   sent_at   = NULL,
                    updated_at = NOW()`,
     [accountId, expenseId, remindAt, JSON.stringify(payload)],
   );
@@ -305,15 +347,11 @@ function startPushWorker() {
 }
 
 module.exports = {
-  // tokens (used by route)
   savePushToken,
   deletePushToken,
-  // worker (used by cron + tests)
   deliverPendingNotifications,
   runDueReminders,
-  // scheduling helpers (used by managementController)
   upsertExpenseReminder,
   cancelExpenseReminder,
-  // startup
   startPushWorker,
 };
