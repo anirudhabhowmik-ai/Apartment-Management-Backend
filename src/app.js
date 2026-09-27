@@ -18,7 +18,8 @@ const billRoutes = require("./routes/billRoutes");
 const auditRoutes = require("./routes/auditRoutes");
 const notificationsRoutes = require("./routes/notificationsRoutes");
 const pushRoutes = require("./routes/pushRoutes");
-const subscriptionRoutes = require("./routes/subscriptionRoutes"); // NEW
+const subscriptionRoutes = require("./routes/subscriptionRoutes");
+const revenueCatWebhookRoutes = require("./routes/revenueCatWebhookRoutes"); // NEW
 
 const app = express();
 const isDevelopment = process.env.NODE_ENV === 'development';
@@ -71,7 +72,8 @@ app.use("/api/accounts/:accountId/bills", billRoutes);
 app.use("/api", auditRoutes);
 app.use("/api/notifications", notificationsRoutes);
 app.use("/api/push", pushRoutes);
-app.use("/api", subscriptionRoutes); // NEW — adds /api/accounts/:id/subscription + /api/payment/*
+app.use("/api", subscriptionRoutes);
+app.use("/api/webhooks", revenueCatWebhookRoutes); // NEW — adds /api/webhooks/revenuecat
 
 app.use((req, res) => {
     res.status(404).json({ success: false, message: 'Route not found' });

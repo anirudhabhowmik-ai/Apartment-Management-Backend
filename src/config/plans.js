@@ -16,8 +16,8 @@ const PLANS = {
   pro: {
     id: "pro",
     name: "Pro",
-    monthlyPrice: 199,
-    yearlyPrice: 1990,
+    monthlyPrice: 249,
+    yearlyPrice: 2490,
     limits: { members: 30, admins: 2, staff: 2 },
     features: [
       "Up to 30 properties",
@@ -30,8 +30,8 @@ const PLANS = {
   business: {
     id: "business",
     name: "Business",
-    monthlyPrice: 999,
-    yearlyPrice: 8990,
+    monthlyPrice: 1049,
+    yearlyPrice: 9490,
     limits: { members: Infinity, admins: Infinity, staff: Infinity },
     features: [
       "Unlimited properties",
@@ -47,7 +47,7 @@ const PLANS = {
 };
 
 const TRIAL_DAYS = 90;
-const TRIAL_PLAN_ID = "pro"; // trial grants Pro-level limits
+const TRIAL_PLAN_ID = "pro";
 
 function planPrice(planId, period) {
   const p = PLANS[planId];
