@@ -19,11 +19,19 @@ const auditRoutes = require("./routes/auditRoutes");
 const notificationsRoutes = require("./routes/notificationsRoutes");
 const pushRoutes = require("./routes/pushRoutes");
 const subscriptionRoutes = require("./routes/subscriptionRoutes");
-const revenueCatWebhookRoutes = require("./routes/revenueCatWebhookRoutes"); // NEW
+const revenueCatWebhookRoutes = require("./routes/revenueCatWebhookRoutes");
 
 const app = express();
-const isDevelopment = process.env.NODE_ENV === 'development';
 
+// IMPORTANT: Trust proxy (Render/Railway/Fly/Nginx) so req.ip, secure cookies work correctly
+app.set('trust proxy', 1);
+
+const isDevelopment = process.env.NODE_ENV === 'development';
+const isProduction = process.env.NODE_ENV === 'production';
+
+/* -----------------------------------------------------------
+   SECURITY HEADERS
+----------------------------------------------------------- */
 app.use(
     helmet({
         crossOriginResourcePolicy: { policy: 'cross-origin' },
@@ -32,56 +40,110 @@ app.use(
     })
 );
 
+/* -----------------------------------------------------------
+   CORS
+   - Mobile apps (no Origin header) are ALWAYS allowed.
+   - Web browsers are only allowed if their Origin matches FRONTEND_URL.
+   - In development, all origins are allowed for convenience.
+----------------------------------------------------------- */
 const allowedOrigins = process.env.FRONTEND_URL
-    ? process.env.FRONTEND_URL.split(',').map((url) => url.trim())
-    : ['http://localhost:8081'];
+    ? process.env.FRONTEND_URL
+          .split(',')
+          .map((url) => url.trim())
+          .filter(Boolean)
+    : [];
 
 app.use(
     cors({
         origin: function (origin, callback) {
+            // 1) No Origin → mobile app, Postman, server-to-server → allow
             if (!origin) return callback(null, true);
+
+            // 2) Dev mode → allow everything for local testing
             if (isDevelopment) return callback(null, true);
-            if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
+
+            // 3) Production → check whitelist
+            if (allowedOrigins.includes(origin)) return callback(null, true);
+
             console.log('Blocked origin:', origin);
             return callback(new Error('Not allowed by CORS'));
         },
         credentials: true,
         methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
         allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+        exposedHeaders: ['Set-Cookie'],
     })
 );
 
+/* -----------------------------------------------------------
+   BODY PARSING
+   NOTE: RevenueCat webhook needs the RAW body to verify signatures.
+   Mount its raw parser BEFORE express.json() if your webhook route
+   verifies signatures. Otherwise this order is fine.
+----------------------------------------------------------- */
 app.use(compression());
-app.use(morgan('dev'));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(morgan(isProduction ? 'combined' : 'dev'));
+
+// If your RevenueCat webhook verifies signatures, keep this block:
+app.use(
+    '/api/webhooks/revenuecat',
+    express.raw({ type: 'application/json' })
+);
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
 
+/* -----------------------------------------------------------
+   HEALTH CHECK
+----------------------------------------------------------- */
 app.get('/health', (req, res) => {
-    res.json({ status: 'OK', timestamp: new Date().toISOString() });
+    res.json({
+        status: 'OK',
+        env: process.env.NODE_ENV,
+        timestamp: new Date().toISOString(),
+    });
 });
 
+/* -----------------------------------------------------------
+   ROUTES
+----------------------------------------------------------- */
 app.use('/api/auth', authRoutes);
 app.use('/api', invitationRoutes);
-app.use("/api", manageAccountProfileRoutes);
-app.use("/api/accounts", accountRoutes);
-app.use("/api/management", managementRoutes);
-app.use("/api/opening-balance", openingBalanceRoutes);
-app.use("/api", calendarRoutes);
-app.use("/api/accounts/:accountId/bills", billRoutes);
-app.use("/api", auditRoutes);
-app.use("/api/notifications", notificationsRoutes);
-app.use("/api/push", pushRoutes);
-app.use("/api", subscriptionRoutes);
-app.use("/api/webhooks", revenueCatWebhookRoutes); // NEW — adds /api/webhooks/revenuecat
+app.use('/api', manageAccountProfileRoutes);
+app.use('/api/accounts', accountRoutes);
+app.use('/api/management', managementRoutes);
+app.use('/api/opening-balance', openingBalanceRoutes);
+app.use('/api', calendarRoutes);
+app.use('/api/accounts/:accountId/bills', billRoutes);
+app.use('/api', auditRoutes);
+app.use('/api/notifications', notificationsRoutes);
+app.use('/api/push', pushRoutes);
+app.use('/api', subscriptionRoutes);
+app.use('/api/webhooks', revenueCatWebhookRoutes);
 
+/* -----------------------------------------------------------
+   404 HANDLER
+----------------------------------------------------------- */
 app.use((req, res) => {
     res.status(404).json({ success: false, message: 'Route not found' });
 });
 
+/* -----------------------------------------------------------
+   GLOBAL ERROR HANDLER
+----------------------------------------------------------- */
 app.use((err, req, res, next) => {
     console.error('Error:', err.stack);
-    res.status(500).json({ success: false, message: 'Something went wrong!' });
+
+    // CORS error
+    if (err.message === 'Not allowed by CORS') {
+        return res.status(403).json({ success: false, message: 'CORS blocked' });
+    }
+
+    res.status(err.status || 500).json({
+        success: false,
+        message: isProduction ? 'Something went wrong!' : err.message,
+    });
 });
 
 module.exports = app;
