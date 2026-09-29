@@ -31,17 +31,6 @@ const isDevelopment = process.env.NODE_ENV === 'development';
 const isProduction = process.env.NODE_ENV === 'production';
 
 /* -----------------------------------------------------------
-   DEBUG VERSION MARKER (remove after debugging)
------------------------------------------------------------ */
-app.get('/__v', (req, res) => {
-    res.json({
-        v: 'V3-public-pages-debug',
-        time: new Date().toISOString(),
-        env: process.env.NODE_ENV,
-    });
-});
-
-/* -----------------------------------------------------------
    SECURITY HEADERS
 ----------------------------------------------------------- */
 app.use(
