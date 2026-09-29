@@ -9,10 +9,6 @@ const MSG91_VERIFY_ACCESS_TOKEN_URL =
 // ================================================================
 // REVIEWER BACKDOOR (Google Play / App Store review)
 // ================================================================
-// Only active when both env vars are set on the server.
-// If either is missing, the endpoint returns 404 (looks like it
-// doesn't exist).
-// ================================================================
 
 const REVIEWER_PHONE = process.env.REVIEWER_PHONE || null; // "9999999999"
 const REVIEWER_OTP = process.env.REVIEWER_OTP || null;     // "739184"
@@ -38,6 +34,14 @@ function createAppToken(user) {
     { userId: user.id, id: user.id, phone: user.phone },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || "7d" },
+  );
+}
+
+function createRecoveryToken(userId) {
+  return jwt.sign(
+    { userId, purpose: "account_recovery" },
+    process.env.JWT_SECRET,
+    { expiresIn: "15m" },
   );
 }
 
@@ -290,9 +294,21 @@ async function verifyWidgetToken(req, res) {
       user = insertResult.rows[0];
     } else {
       user = userResult.rows[0];
+
+      // If the account was deleted, signal recovery with a signed token.
+      // Do NOT re-verify MSG91 — the OTP is already verified at this point.
       if (!user.is_active) {
-        return res.status(403).json({ success: false, message: "This account is inactive." });
+        const recoveryToken = createRecoveryToken(user.id);
+        return res.status(200).json({
+          success: false,
+          code: "account_deleted",
+          phone: ten,
+          recoveryToken,
+          message:
+            "This account was deleted. You can recover it to start fresh with the same number.",
+        });
       }
+
       if (!user.name || String(user.name).trim() === "") {
         if (ten) {
           const { rows: invRows } = await pool.query(
@@ -337,19 +353,8 @@ async function verifyWidgetToken(req, res) {
   }
 }
 
-// ================================================================
-// REVIEWER LOGIN
-// ================================================================
-// Purpose: Let Google Play / App Store reviewers sign in without
-// needing a real phone or SMS.
-//
-// Active only when REVIEWER_PHONE and REVIEWER_OTP env vars are
-// both set. Otherwise returns 404.
-// ================================================================
-
 const reviewerLogin = async (req, res) => {
   try {
-    // Feature disabled if env vars are missing
     if (!REVIEWER_PHONE || !REVIEWER_OTP) {
       return res.status(404).json({
         success: false,
@@ -361,7 +366,6 @@ const reviewerLogin = async (req, res) => {
     const ten = normalizeTenDigit(body.phone ?? body.newPhone ?? body.new_phone);
     const otp = String(body.otp ?? body.code ?? "").trim();
 
-    // Generic error message — never reveal whether the phone exists
     const reject = () =>
       res.status(401).json({
         success: false,
@@ -380,7 +384,6 @@ const reviewerLogin = async (req, res) => {
 
     const normalizedPhone = `91${ten}`;
 
-    // Find or create the reviewer user
     const userResult = await pool.query(
       `SELECT id, phone, name, photo_url, is_active,
               last_login_at, last_account_id, created_at, updated_at
@@ -403,22 +406,25 @@ const reviewerLogin = async (req, res) => {
       user = userResult.rows[0];
 
       if (!user.is_active) {
-        return res.status(403).json({
-          success: false,
-          message: "This account is inactive.",
-        });
+        const updateResult = await pool.query(
+          `UPDATE users
+              SET is_active = true, last_login_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, phone, name, photo_url, is_active,
+                      last_login_at, last_account_id, created_at, updated_at`,
+          [user.id]);
+        user = updateResult.rows[0];
+      } else {
+        const updateResult = await pool.query(
+          `UPDATE users SET last_login_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, phone, name, photo_url, is_active,
+                      last_login_at, last_account_id, created_at, updated_at`,
+          [user.id]);
+        user = updateResult.rows[0];
       }
-
-      const updateResult = await pool.query(
-        `UPDATE users SET last_login_at = NOW(), updated_at = NOW()
-          WHERE id = $1
-          RETURNING id, phone, name, photo_url, is_active,
-                    last_login_at, last_account_id, created_at, updated_at`,
-        [user.id]);
-      user = updateResult.rows[0];
     }
 
-    // Audit trail — every reviewer login gets logged
     console.log(
       `[REVIEWER LOGIN] userId=${user.id} phone=${ten} at=${new Date().toISOString()}`,
     );
@@ -700,9 +706,225 @@ const confirmPhoneChange = async (req, res) => {
   }
 };
 
+// ================================================================
+// DELETE MY ACCOUNT
+// ================================================================
+
+const deleteMe = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const userId = getUserId(req);
+    if (!userId) {
+      client.release();
+      return fail(res, 401, "unauthenticated", "Authentication required");
+    }
+
+    await client.query("BEGIN");
+
+    const { rows: userRows } = await client.query(
+      `SELECT id, is_active FROM users WHERE id = $1 FOR UPDATE`,
+      [userId],
+    );
+    if (!userRows.length) {
+      await client.query("ROLLBACK");
+      client.release();
+      return fail(res, 404, "not_found", "User not found");
+    }
+    if (!userRows[0].is_active) {
+      await client.query("ROLLBACK");
+      client.release();
+      return res.json({
+        success: true,
+        message: "Account already deleted.",
+      });
+    }
+
+    // 1. Cascade-delete owned accounts
+    const { rowCount: deletedAccounts } = await client.query(
+      `DELETE FROM accounts WHERE created_by = $1`,
+      [userId],
+    );
+
+    // 2. Remove memberships in other people's accounts
+    await client.query(
+      `DELETE FROM account_members WHERE user_id = $1`,
+      [userId],
+    );
+
+    // 3. Unlink user from members/staff rows in others' accounts
+    await client.query(
+      `UPDATE members SET user_id = NULL, updated_at = NOW() WHERE user_id = $1`,
+      [userId],
+    );
+    await client.query(
+      `UPDATE staff SET user_id = NULL, updated_at = NOW() WHERE user_id = $1`,
+      [userId],
+    );
+
+    // 4. Delete phone-visibility grants
+    await client.query(
+      `DELETE FROM member_phone_visibility WHERE viewer_user_id = $1`,
+      [userId],
+    );
+
+    // 5. Delete push tokens
+    await client.query(
+      `DELETE FROM user_push_tokens WHERE user_id = $1`,
+      [userId],
+    );
+
+    // 6. Clear stale last_account_id
+    await client.query(
+      `UPDATE users SET last_account_id = NULL WHERE id = $1`,
+      [userId],
+    );
+
+    // 7. Disable login
+    await client.query(
+      `UPDATE users SET is_active = false, updated_at = NOW() WHERE id = $1`,
+      [userId],
+    );
+
+    await client.query("COMMIT");
+
+    console.log(
+      `[deleteMe] User ${userId} deactivated, ${deletedAccounts} owned account(s) deleted`,
+    );
+
+    return res.json({
+      success: true,
+      message:
+        deletedAccounts > 0
+          ? `Account deleted. ${deletedAccounts} propert${
+              deletedAccounts === 1 ? "y" : "ies"
+            } you owned were also removed.`
+          : "Account deleted. You can recover it later by logging in again with the same number.",
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("deleteMe error:", err);
+    return fail(res, 500, "server_error", "Failed to delete account");
+  } finally {
+    client.release();
+  }
+};
+
+// ================================================================
+// RECOVER ACCOUNT
+// ================================================================
+// Accepts a short-lived recoveryToken (signed by verifyWidgetToken).
+// No MSG91 re-verification needed — the OTP was already verified.
+// ================================================================
+
+const recoverAccount = async (req, res) => {
+  try {
+    const body = req.body || {};
+    const recoveryToken = body.recoveryToken ?? body.recovery_token ?? null;
+
+    if (!recoveryToken) {
+      return res.status(400).json({
+        success: false,
+        message: "Recovery token is required.",
+      });
+    }
+
+    if (!process.env.JWT_SECRET) {
+      return res.status(500).json({
+        success: false,
+        message: "JWT is not configured on the server.",
+      });
+    }
+
+    // Verify the recovery token
+    let decoded;
+    try {
+      decoded = jwt.verify(recoveryToken, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({
+        success: false,
+        message: "Recovery token is invalid or expired. Please start again.",
+      });
+    }
+
+    if (decoded.purpose !== "account_recovery" || !decoded.userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid recovery token.",
+      });
+    }
+
+    const userId = decoded.userId;
+
+    // Fetch user
+    const { rows: userRows } = await pool.query(
+      `SELECT id, phone, name, photo_url, is_active,
+              last_login_at, last_account_id, created_at, updated_at
+         FROM users WHERE id = $1 LIMIT 1`,
+      [userId],
+    );
+    if (!userRows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Account not found.",
+      });
+    }
+
+    const user = userRows[0];
+
+    if (user.is_active) {
+      const token = createAppToken(user);
+      return res.status(200).json({
+        success: true,
+        message: "Account is already active.",
+        token,
+        user: mapUserRow(user),
+      });
+    }
+
+    // Reactivate with a fresh identity
+    const { rows: updatedRows } = await pool.query(
+      `UPDATE users
+          SET is_active = true,
+              name = NULL,
+              photo_url = NULL,
+              last_login_at = NOW(),
+              updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, phone, name, photo_url, is_active,
+                  last_login_at, last_account_id, created_at, updated_at`,
+      [user.id],
+    );
+
+    const recoveredUser = updatedRows[0];
+    const token = createAppToken(recoveredUser);
+
+    console.log(
+      `[recoverAccount] User ${recoveredUser.id} recovered at ${new Date().toISOString()}`,
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Account recovered. You can start fresh.",
+      token,
+      user: mapUserRow(recoveredUser),
+    });
+  } catch (err) {
+    console.error("recoverAccount error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Something went wrong during recovery.",
+    });
+  }
+};
+
 module.exports = {
   verifyWidgetToken,
   reviewerLogin,
+  recoverAccount,
+  deleteMe,
   getMe,
   updateMe,
   requestPhoneChange,
