@@ -20,6 +20,7 @@ const notificationsRoutes = require("./routes/notificationsRoutes");
 const pushRoutes = require("./routes/pushRoutes");
 const subscriptionRoutes = require("./routes/subscriptionRoutes");
 const revenueCatWebhookRoutes = require("./routes/revenueCatWebhookRoutes");
+const publicPagesRoutes = require("./routes/publicPagesRoutes");
 
 const app = express();
 
@@ -56,15 +57,9 @@ const allowedOrigins = process.env.FRONTEND_URL
 app.use(
     cors({
         origin: function (origin, callback) {
-            // 1) No Origin → mobile app, Postman, server-to-server → allow
             if (!origin) return callback(null, true);
-
-            // 2) Dev mode → allow everything for local testing
             if (isDevelopment) return callback(null, true);
-
-            // 3) Production → check whitelist
             if (allowedOrigins.includes(origin)) return callback(null, true);
-
             console.log('Blocked origin:', origin);
             return callback(new Error('Not allowed by CORS'));
         },
@@ -77,14 +72,11 @@ app.use(
 
 /* -----------------------------------------------------------
    BODY PARSING
-   NOTE: RevenueCat webhook needs the RAW body to verify signatures.
-   Mount its raw parser BEFORE express.json() if your webhook route
-   verifies signatures. Otherwise this order is fine.
 ----------------------------------------------------------- */
 app.use(compression());
 app.use(morgan(isProduction ? 'combined' : 'dev'));
 
-// If your RevenueCat webhook verifies signatures, keep this block:
+// RevenueCat webhook needs raw body to verify signatures
 app.use(
     '/api/webhooks/revenuecat',
     express.raw({ type: 'application/json' })
@@ -106,7 +98,13 @@ app.get('/health', (req, res) => {
 });
 
 /* -----------------------------------------------------------
-   ROUTES
+   PUBLIC PAGES (landing, privacy, terms, refund)
+   For Razorpay verification + Google Play privacy URL
+----------------------------------------------------------- */
+app.use('/', publicPagesRoutes);
+
+/* -----------------------------------------------------------
+   API ROUTES
 ----------------------------------------------------------- */
 app.use('/api/auth', authRoutes);
 app.use('/api', invitationRoutes);
@@ -124,6 +122,7 @@ app.use('/api/webhooks', revenueCatWebhookRoutes);
 
 /* -----------------------------------------------------------
    404 HANDLER
+   IMPORTANT: must come AFTER public pages, so /privacy etc. work.
 ----------------------------------------------------------- */
 app.use((req, res) => {
     res.status(404).json({ success: false, message: 'Route not found' });
@@ -135,7 +134,6 @@ app.use((req, res) => {
 app.use((err, req, res, next) => {
     console.error('Error:', err.stack);
 
-    // CORS error
     if (err.message === 'Not allowed by CORS') {
         return res.status(403).json({ success: false, message: 'CORS blocked' });
     }
