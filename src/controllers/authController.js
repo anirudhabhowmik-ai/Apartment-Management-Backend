@@ -6,6 +6,17 @@ const { writeAudit } = require("./auditController");
 const MSG91_VERIFY_ACCESS_TOKEN_URL =
   "https://control.msg91.com/api/v5/widget/verifyAccessToken";
 
+// ================================================================
+// REVIEWER BACKDOOR (Google Play / App Store review)
+// ================================================================
+// Only active when both env vars are set on the server.
+// If either is missing, the endpoint returns 404 (looks like it
+// doesn't exist).
+// ================================================================
+
+const REVIEWER_PHONE = process.env.REVIEWER_PHONE || null; // "9999999999"
+const REVIEWER_OTP = process.env.REVIEWER_OTP || null;     // "739184"
+
 function normalizePhone(phone) {
   if (!phone) return null;
   let value = String(phone).trim().replace(/\s+/g, "");
@@ -326,6 +337,108 @@ async function verifyWidgetToken(req, res) {
   }
 }
 
+// ================================================================
+// REVIEWER LOGIN
+// ================================================================
+// Purpose: Let Google Play / App Store reviewers sign in without
+// needing a real phone or SMS.
+//
+// Active only when REVIEWER_PHONE and REVIEWER_OTP env vars are
+// both set. Otherwise returns 404.
+// ================================================================
+
+const reviewerLogin = async (req, res) => {
+  try {
+    // Feature disabled if env vars are missing
+    if (!REVIEWER_PHONE || !REVIEWER_OTP) {
+      return res.status(404).json({
+        success: false,
+        message: "Not found.",
+      });
+    }
+
+    const body = req.body || {};
+    const ten = normalizeTenDigit(body.phone ?? body.newPhone ?? body.new_phone);
+    const otp = String(body.otp ?? body.code ?? "").trim();
+
+    // Generic error message — never reveal whether the phone exists
+    const reject = () =>
+      res.status(401).json({
+        success: false,
+        message: "Invalid credentials.",
+      });
+
+    if (!ten || ten !== REVIEWER_PHONE) return reject();
+    if (!otp || otp !== REVIEWER_OTP) return reject();
+
+    if (!process.env.JWT_SECRET) {
+      return res.status(500).json({
+        success: false,
+        message: "JWT is not configured on the server.",
+      });
+    }
+
+    const normalizedPhone = `91${ten}`;
+
+    // Find or create the reviewer user
+    const userResult = await pool.query(
+      `SELECT id, phone, name, photo_url, is_active,
+              last_login_at, last_account_id, created_at, updated_at
+         FROM users
+        WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
+        LIMIT 1`,
+      [ten]);
+
+    let user;
+
+    if (userResult.rows.length === 0) {
+      const insertResult = await pool.query(
+        `INSERT INTO users (phone, name, is_active, last_login_at)
+         VALUES ($1, $2, true, NOW())
+         RETURNING id, phone, name, photo_url, is_active,
+                   last_login_at, last_account_id, created_at, updated_at`,
+        [normalizedPhone, "Google Reviewer"]);
+      user = insertResult.rows[0];
+    } else {
+      user = userResult.rows[0];
+
+      if (!user.is_active) {
+        return res.status(403).json({
+          success: false,
+          message: "This account is inactive.",
+        });
+      }
+
+      const updateResult = await pool.query(
+        `UPDATE users SET last_login_at = NOW(), updated_at = NOW()
+          WHERE id = $1
+          RETURNING id, phone, name, photo_url, is_active,
+                    last_login_at, last_account_id, created_at, updated_at`,
+        [user.id]);
+      user = updateResult.rows[0];
+    }
+
+    // Audit trail — every reviewer login gets logged
+    console.log(
+      `[REVIEWER LOGIN] userId=${user.id} phone=${ten} at=${new Date().toISOString()}`,
+    );
+
+    const token = createAppToken(user);
+    return res.status(200).json({
+      success: true,
+      message: "Login successful.",
+      token,
+      user: mapUserRow(user),
+    });
+  } catch (error) {
+    console.error("reviewerLogin error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Something went wrong during authentication.",
+    });
+  }
+};
+
 const getMe = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -589,6 +702,7 @@ const confirmPhoneChange = async (req, res) => {
 
 module.exports = {
   verifyWidgetToken,
+  reviewerLogin,
   getMe,
   updateMe,
   requestPhoneChange,
