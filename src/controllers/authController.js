@@ -295,8 +295,6 @@ async function verifyWidgetToken(req, res) {
     } else {
       user = userResult.rows[0];
 
-      // If the account was deleted, signal recovery with a signed token.
-      // Do NOT re-verify MSG91 — the OTP is already verified at this point.
       if (!user.is_active) {
         const recoveryToken = createRecoveryToken(user.id);
         return res.status(200).json({
@@ -709,6 +707,25 @@ const confirmPhoneChange = async (req, res) => {
 // ================================================================
 // DELETE MY ACCOUNT
 // ================================================================
+// Behavior depends on what the user OWNS vs. what they BELONG to.
+//
+//  • If they OWN accounts:
+//      - Those accounts (and everything inside) are cascade-deleted.
+//      - Non-cascaded tables for those accounts are cleaned manually:
+//        audit_log, notifications, ownership_transfers.
+//
+//  • Regardless of ownership:
+//      - Memberships in OTHER people's accounts → status = 'inactive'
+//      - Rows in members/staff tables are NOT unlinked (owner keeps history)
+//      - Phone-visibility grants they made → deleted
+//      - Their user-scoped rows in audit_log / notifications /
+//        notification_preferences / user_push_tokens → deleted
+//      - Their user row → is_active = false
+//
+// The users row is NEVER hard-deleted because:
+//   accounts.created_by, members.created_by, staff.created_by,
+//   calendar_events.created_by_id are all ON DELETE RESTRICT.
+// ================================================================
 
 const deleteMe = async (req, res) => {
   const client = await pool.connect();
@@ -722,6 +739,7 @@ const deleteMe = async (req, res) => {
 
     await client.query("BEGIN");
 
+    // Lock the user row
     const { rows: userRows } = await client.query(
       `SELECT id, is_active FROM users WHERE id = $1 FOR UPDATE`,
       [userId],
@@ -740,47 +758,80 @@ const deleteMe = async (req, res) => {
       });
     }
 
-    // 1. Cascade-delete owned accounts
-    const { rowCount: deletedAccounts } = await client.query(
-      `DELETE FROM accounts WHERE created_by = $1`,
+    // ── Step 1: Find owned accounts (before cascade) ─────────────
+    const { rows: ownedRows } = await client.query(
+      `SELECT id FROM accounts WHERE created_by = $1`,
       [userId],
     );
+    const ownedAccountIds = ownedRows.map((r) => r.id);
+    const hasOwned = ownedAccountIds.length > 0;
 
-    // 2. Remove memberships in other people's accounts
-    await client.query(
-      `DELETE FROM account_members WHERE user_id = $1`,
-      [userId],
-    );
+    // ── Step 2: Manually clean non-cascaded tables for owned accounts ──
+    if (hasOwned) {
+      await client.query(
+        `DELETE FROM audit_log WHERE account_id = ANY($1::uuid[])`,
+        [ownedAccountIds],
+      );
+      await client.query(
+        `DELETE FROM notifications WHERE account_id = ANY($1::uuid[])`,
+        [ownedAccountIds],
+      );
+      await client.query(
+        `DELETE FROM ownership_transfers WHERE account_id = ANY($1::uuid[])`,
+        [ownedAccountIds],
+      );
+    }
 
-    // 3. Unlink user from members/staff rows in others' accounts
+    // ── Step 3: Clean user-scoped rows (this user's own data) ──
+    // These reference the user directly, not an account.
     await client.query(
-      `UPDATE members SET user_id = NULL, updated_at = NOW() WHERE user_id = $1`,
+      `DELETE FROM audit_log WHERE actor_user_id = $1`,
       [userId],
     );
     await client.query(
-      `UPDATE staff SET user_id = NULL, updated_at = NOW() WHERE user_id = $1`,
+      `DELETE FROM notifications WHERE user_id = $1`,
       [userId],
     );
-
-    // 4. Delete phone-visibility grants
     await client.query(
-      `DELETE FROM member_phone_visibility WHERE viewer_user_id = $1`,
+      `DELETE FROM notification_preferences WHERE user_id = $1`,
       [userId],
     );
-
-    // 5. Delete push tokens
     await client.query(
       `DELETE FROM user_push_tokens WHERE user_id = $1`,
       [userId],
     );
 
-    // 6. Clear stale last_account_id
+    // ── Step 4: Delete owned accounts (cascades children) ──
+    let deletedAccounts = 0;
+    if (hasOwned) {
+      const result = await client.query(
+        `DELETE FROM accounts WHERE created_by = $1`,
+        [userId],
+      );
+      deletedAccounts = result.rowCount;
+    }
+
+    // ── Step 5: Deactivate memberships in OTHER people's accounts ──
+    await client.query(
+      `UPDATE account_members
+          SET status = 'inactive', updated_at = NOW()
+        WHERE user_id = $1 AND status = 'active'`,
+      [userId],
+    );
+
+    // ── Step 6: Remove phone-visibility grants they made ──
+    await client.query(
+      `DELETE FROM member_phone_visibility WHERE viewer_user_id = $1`,
+      [userId],
+    );
+
+    // ── Step 7: Clear stale last_account_id ──
     await client.query(
       `UPDATE users SET last_account_id = NULL WHERE id = $1`,
       [userId],
     );
 
-    // 7. Disable login
+    // ── Step 8: Deactivate the login ──
     await client.query(
       `UPDATE users SET is_active = false, updated_at = NOW() WHERE id = $1`,
       [userId],
@@ -858,7 +909,6 @@ const recoverAccount = async (req, res) => {
 
     const userId = decoded.userId;
 
-    // Fetch user
     const { rows: userRows } = await pool.query(
       `SELECT id, phone, name, photo_url, is_active,
               last_login_at, last_account_id, created_at, updated_at
@@ -884,7 +934,6 @@ const recoverAccount = async (req, res) => {
       });
     }
 
-    // Reactivate with a fresh identity
     const { rows: updatedRows } = await pool.query(
       `UPDATE users
           SET is_active = true,
