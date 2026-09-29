@@ -3,7 +3,7 @@ const app = require("./app");
 const { pool } = require("./config/database");
 const { startPushWorker } = require("./services/push");
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8000;
 
 // Test database connection before starting server
 pool.connect((err, client, release) => {
