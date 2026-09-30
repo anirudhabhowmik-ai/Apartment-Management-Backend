@@ -29,10 +29,6 @@ const VALID_VISIBILITY = new Set(["admin", "public", "self", "participants"]);
 
 // ---------------------------------------------------------------------------
 // Plan gate — history is a paid feature.
-//
-// During the 90-day trial → effectivePlanId = "pro", so isTrial === true and
-// access is allowed. After trial ends with no paid plan → effectivePlanId
-// becomes "free" and isTrial becomes false, so access is denied.
 // ---------------------------------------------------------------------------
 async function canAccessHistory(accountId) {
   try {
@@ -40,31 +36,33 @@ async function canAccessHistory(accountId) {
     return sub.effectivePlanId !== "free" || sub.isTrial === true;
   } catch (err) {
     console.warn("canAccessHistory failed:", err);
-    // Fail closed — no history if we can't determine the plan.
     return false;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Friendly role label
+// Friendly role label — tenant-aware
+//
+//   On a personal "home" account, `member_visibility` reads as
+//   "tenant access". Everywhere else it stays "member access".
 // ---------------------------------------------------------------------------
-function humanRole(role) {
+function humanRole(role, isHome = false) {
   if (!role) return "access";
   switch (String(role)) {
     case "owner":              return "owner access";
     case "admin":              return "admin access";
-    case "member_visibility":  return "member access";
+    case "member_visibility":  return isHome ? "tenant access" : "member access";
     case "staff_visibility":   return "staff access";
     case "ownership_transfer": return "ownership";
     default:                   return String(role).replace(/_/g, " ");
   }
 }
 
-function joinedLabel(role) {
+function joinedLabel(role, isHome = false) {
   if (!role) return "a member";
   switch (String(role)) {
     case "admin":              return "an admin";
-    case "member_visibility":  return "a member";
+    case "member_visibility":  return isHome ? "a tenant" : "a member";
     case "staff_visibility":   return "a staff member";
     case "ownership_transfer": return "the owner";
     default:                   return String(role).replace(/_/g, " ");
@@ -72,9 +70,13 @@ function joinedLabel(role) {
 }
 
 // ---------------------------------------------------------------------------
-// Human-readable summary builder
+// Human-readable summary builder — tenant-aware
+//
+//   • Role words: "member access" → "tenant access" on home accounts.
+//   • Unit noun: on home accounts a member's unit is a "room" (a tenant
+//     rents a room); on apartment accounts it stays "property".
 // ---------------------------------------------------------------------------
-function buildSummary(e) {
+function buildSummary(e, isHome = false) {
   const actor = e.actorName || "Someone";
   const target = e.targetName || null;
 
@@ -89,7 +91,8 @@ function buildSummary(e) {
 
   const targetForBody = target ?? "someone";
 
-  const roleLabel = humanRole(role);
+  const roleLabel = humanRole(role, isHome);
+  const memberNoun = isHome ? "room" : "property";
 
   const map = {
     // ---- Account ----
@@ -101,17 +104,19 @@ function buildSummary(e) {
         ? `${actor} transferred ownership to ${target}`
         : `${actor} transferred ownership`,
 
-    // ---- Members ----
+    // ---- Members (unit noun is "room" on homes) ----
     "member.create": () =>
-      `${actor} added property for ${targetForBody}`,
+      isSamePerson
+        ? `${actor} added their own ${memberNoun}`
+        : `${actor} added ${memberNoun} for ${targetForBody}`,
     "member.update": () =>
       isSamePerson
-        ? `${actor} updated their own details`
-        : `${actor} updated ${targetForBody}'s details`,
+        ? `${actor} updated their own ${memberNoun} details`
+        : `${actor} updated ${targetForBody}'s ${memberNoun} details`,
     "member.delete": () =>
       isSamePerson
-        ? `${actor} removed their own property`
-        : `${actor} removed property from ${targetForBody}`,
+        ? `${actor} removed their own ${memberNoun}`
+        : `${actor} removed ${memberNoun} from ${targetForBody}`,
 
     // ---- Staff ----
     "staff.create": () =>
@@ -192,7 +197,7 @@ function buildSummary(e) {
 }
 
 // ---------------------------------------------------------------------------
-// Resolve a user's name — used only for composing the summary string.
+// Resolve a user's name
 // ---------------------------------------------------------------------------
 async function resolveUserName(client, userId) {
   if (!userId) return null;
@@ -201,6 +206,22 @@ async function resolveUserName(client, userId) {
     [userId],
   );
   return rows[0]?.name ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Look up account type once per writeAudit call
+// ---------------------------------------------------------------------------
+async function resolveIsHomeAccount(client, accountId) {
+  if (!accountId) return false;
+  try {
+    const { rows } = await client.query(
+      `SELECT type FROM accounts WHERE id = $1`,
+      [accountId],
+    );
+    return String(rows[0]?.type ?? "").toLowerCase() === "home";
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,17 +255,23 @@ async function writeAudit(client, entry) {
     ? await resolveUserName(client, targetUserId)
     : null;
 
+  // Tenant-aware summary: look up account type once, pass through.
+  const isHome = await resolveIsHomeAccount(client, accountId);
+
   const summary =
     providedSummary ||
-    buildSummary({
-      entityType,
-      action,
-      actorName,
-      targetName,
-      actorUserId,
-      targetUserId,
-      metadata,
-    });
+    buildSummary(
+      {
+        entityType,
+        action,
+        actorName,
+        targetName,
+        actorUserId,
+        targetUserId,
+        metadata,
+      },
+      isHome,
+    );
 
   const insert = await client.query(
     `INSERT INTO audit_log
@@ -286,6 +313,7 @@ async function writeAudit(client, entry) {
       summary,
       actorName,
       targetName,
+      isHome,
     });
   } catch (err) {
     console.warn("writeAudit: projectNotifications failed:", err.message);
@@ -320,7 +348,7 @@ async function getRoleForAccount(userId, accountId) {
 const isAdminLike = (role) => role === "owner" || role === "admin";
 
 // ---------------------------------------------------------------------------
-// Shared SELECT — JOINs users to fetch fresh name/phone/photo.
+// Shared SELECT
 // ---------------------------------------------------------------------------
 const HISTORY_SELECT = `
   SELECT
@@ -385,8 +413,7 @@ const HISTORY_SELECT = `
 `;
 
 // ---------------------------------------------------------------------------
-// GET /history — OWNER / ADMIN only. Full account history.
-// Requires a paid plan (or active trial).
+// GET /history — OWNER / ADMIN only
 // ---------------------------------------------------------------------------
 const getAccountHistory = async (req, res) => {
   try {
@@ -399,7 +426,6 @@ const getAccountHistory = async (req, res) => {
     if (!role) return fail(res, 403, "forbidden");
     if (!isAdminLike(role)) return fail(res, 403, "forbidden");
 
-    // History is a paid feature.
     const allowed = await canAccessHistory(accountId);
     if (!allowed) {
       return fail(
@@ -448,8 +474,12 @@ const getAccountHistory = async (req, res) => {
 };
 
 // ---------------------------------------------------------------------------
-// GET /history/me — MEMBER or STAFF.
-// Requires a paid plan (or active trial).
+// GET /history/me — MEMBER or STAFF. Tenant-aware.
+//
+//   On a home account, a `member_visibility` caller is a TENANT. Tenants
+//   must NOT see property finance (expenses, opening balance, subscription,
+//   or other members' payments). They can still see their OWN member/staff
+//   payment rows.
 // ---------------------------------------------------------------------------
 const getMyHistory = async (req, res) => {
   try {
@@ -461,7 +491,6 @@ const getMyHistory = async (req, res) => {
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "forbidden");
 
-    // History is a paid feature.
     const allowed = await canAccessHistory(accountId);
     if (!allowed) {
       return fail(
@@ -471,6 +500,14 @@ const getMyHistory = async (req, res) => {
         "History is available on paid plans. Upgrade to view history.",
       );
     }
+
+    const { rows: acctRows } = await pool.query(
+      `SELECT type FROM accounts WHERE id = $1`,
+      [accountId],
+    );
+    const accountType = String(acctRows[0]?.type ?? "").toLowerCase();
+    const isHome = accountType === "home";
+    const isTenantViewer = isHome && role === "member_visibility";
 
     const before = req.query.before || null;
     const limit  = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
@@ -501,6 +538,32 @@ const getMyHistory = async (req, res) => {
         )
       )
     )`;
+
+    if (isTenantViewer) {
+      params.push(userId);
+      const uidIdx = params.length;
+      where += ` AND (
+        al.entity_type NOT IN (
+          'expense',
+          'opening_balance',
+          'subscription'
+        )
+        AND NOT (
+          al.entity_type = 'member'
+          AND al.action LIKE 'payment_%'
+          AND al.entity_id NOT IN (
+            SELECT id FROM members WHERE user_id = $${uidIdx}
+          )
+        )
+        AND NOT (
+          al.entity_type = 'staff'
+          AND al.action LIKE 'payment_%'
+          AND al.entity_id NOT IN (
+            SELECT id FROM staff WHERE user_id = $${uidIdx}
+          )
+        )
+      )`;
+    }
 
     if (before) {
       params.push(before);

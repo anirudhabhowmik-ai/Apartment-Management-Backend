@@ -11,13 +11,18 @@ const fail = (res, status, code, message) =>
   res.status(status).json({ code, message });
 
 // ---------------------------------------------------------------------------
-// Who is who in an account
+// Who is who in an account (tenant-aware)
 // ---------------------------------------------------------------------------
 async function getAccountAudience(client, accountId) {
-  const { rows: owners } = await client.query(
-    `SELECT created_by AS user_id FROM accounts WHERE id = $1`,
+  const { rows: acctRows } = await client.query(
+    `SELECT created_by AS user_id, type FROM accounts WHERE id = $1`,
     [accountId],
   );
+
+  const ownerIds = acctRows.map((r) => r.user_id).filter(Boolean);
+  const accountType = String(acctRows[0]?.type ?? "").toLowerCase();
+  const isHome = accountType === "home";
+
   const { rows: admins } = await client.query(
     `SELECT user_id FROM account_members
       WHERE account_id = $1 AND role = 'admin' AND status = 'active'`,
@@ -34,20 +39,30 @@ async function getAccountAudience(client, accountId) {
     [accountId],
   );
 
-  const ownerIds = owners.map((r) => r.user_id).filter(Boolean);
   const adminIds = admins.map((r) => r.user_id).filter(Boolean);
   const memberIds = members.map((r) => r.user_id).filter(Boolean);
   const staffIds = staff.map((r) => r.user_id).filter(Boolean);
+
+  const adminLike = [...new Set([...ownerIds, ...adminIds])];
+  const everyone = [
+    ...new Set([...ownerIds, ...adminIds, ...memberIds, ...staffIds]),
+  ];
+
+  const tenants = isHome ? memberIds : [];
+  const everyoneExceptTenants = everyone.filter(
+    (id) => !tenants.includes(id),
+  );
 
   return {
     owners: ownerIds,
     admins: adminIds,
     members: memberIds,
     staff: staffIds,
-    adminLike: [...new Set([...ownerIds, ...adminIds])],
-    everyone: [
-      ...new Set([...ownerIds, ...adminIds, ...memberIds, ...staffIds]),
-    ],
+    tenants,
+    isHome,
+    adminLike,
+    everyone,
+    everyoneExceptTenants,
   };
 }
 
@@ -189,7 +204,6 @@ async function resolveRecipients(client, entry, audience) {
     };
   }
 
-  // ── Expense reminder (fired by cron) → owner + admins only ──
   if (entityType === "expense" && action === "expense_reminder") {
     return {
       recipients: audience.adminLike,
@@ -200,8 +214,16 @@ async function resolveRecipients(client, entry, audience) {
 
   if (entityType === "expense") {
     return {
-      recipients: audience.everyone,
+      recipients: audience.everyoneExceptTenants,
       category: "expense",
+      preferenceKey: "expenses",
+    };
+  }
+
+  if (entityType === "opening_balance") {
+    return {
+      recipients: audience.adminLike,
+      category: "finance",
       preferenceKey: "expenses",
     };
   }
@@ -228,24 +250,24 @@ async function resolveRecipients(client, entry, audience) {
 }
 
 // ---------------------------------------------------------------------------
-// Human-readable role labels
+// Role labels — tenant-aware
 // ---------------------------------------------------------------------------
-function humanRole(raw) {
+function humanRole(raw, isHome = false) {
   if (!raw) return "access";
   switch (String(raw)) {
     case "admin":              return "admin access";
-    case "member_visibility":  return "member access";
+    case "member_visibility":  return isHome ? "tenant access" : "member access";
     case "staff_visibility":   return "staff access";
     case "ownership_transfer": return "ownership";
     default:                   return String(raw).replace(/_/g, " ");
   }
 }
 
-function joinedLabel(raw) {
+function joinedLabel(raw, isHome = false) {
   if (!raw) return "a member";
   switch (String(raw)) {
     case "admin":              return "an admin";
-    case "member_visibility":  return "a member";
+    case "member_visibility":  return isHome ? "a tenant" : "a member";
     case "staff_visibility":   return "a staff member";
     case "ownership_transfer": return "the owner";
     default:                   return String(raw).replace(/_/g, " ");
@@ -267,10 +289,11 @@ function nameFor(rawName, subjectUserId, viewerUserId) {
 }
 
 // ---------------------------------------------------------------------------
-// Notification content (title/body) — personalized per viewer
+// Notification content builder — tenant-aware, self-aware
 // ---------------------------------------------------------------------------
 function buildNotificationContent(entry) {
   const viewerUserId = entry.viewerUserId ?? null;
+  const isHome = !!entry.isHome;
 
   const actor = nameFor(entry.actorName, entry.actorUserId, viewerUserId);
   const target = nameFor(entry.targetName, entry.targetUserId, viewerUserId);
@@ -296,8 +319,8 @@ function buildNotificationContent(entry) {
   const k = `${entry.entityType}.${entry.action}`;
   const meta = entry.metadata || {};
   const kind = meta.kind ?? "an event";
-  const role = humanRole(meta.role);
-  const roleJoin = joinedLabel(meta.role);
+  const role = humanRole(meta.role, isHome);
+  const roleJoin = joinedLabel(meta.role, isHome);
 
   const map = {
     // ---- Payments ----
@@ -396,6 +419,17 @@ function buildNotificationContent(entry) {
     "expense.update": () => ({ title: "Expense updated", body: `${actor} updated an expense.` }),
     "expense.delete": () => ({ title: "Expense deleted", body: `${actor} deleted an expense.` }),
 
+    // ---- Opening balance (self-aware) ----
+    "opening_balance.create": () =>
+      actorIsViewer
+        ? { title: "Opening balance added", body: "You added an opening balance." }
+        : { title: "Opening balance added", body: `${actor} added an opening balance.` },
+
+    "opening_balance.update": () =>
+      actorIsViewer
+        ? { title: "Opening balance updated", body: "You updated the opening balance." }
+        : { title: "Opening balance updated", body: `${actor} updated the opening balance.` },
+
     // ---- Expense reminder (fired by the cron) ----
     "expense.expense_reminder": () => ({
       title: meta.notificationTitle || "Payment due reminder",
@@ -413,7 +447,7 @@ function buildNotificationContent(entry) {
 }
 
 // ---------------------------------------------------------------------------
-// Freshly resolve a user's display name from the DB
+// Fresh name lookup
 // ---------------------------------------------------------------------------
 async function freshUserName(client, userId) {
   if (!userId) return null;
@@ -443,7 +477,6 @@ async function projectNotifications(client, entry) {
 
   if (!recipients || recipients.length === 0) return;
 
-  // Preferences filter (best effort)
   let finalRecipients = recipients;
   try {
     const { rows: optedOut } = await client.query(
@@ -461,7 +494,6 @@ async function projectNotifications(client, entry) {
 
   if (finalRecipients.length === 0) return;
 
-  // Resolve fresh names from the DB — never trust anything in metadata.
   const actorName = await freshUserName(client, entry.actorUserId);
   const targetName = await freshUserName(client, entry.targetUserId);
 
@@ -473,9 +505,13 @@ async function projectNotifications(client, entry) {
     metadata: entry.metadata,
   };
 
+  const isHome =
+    typeof entry.isHome === "boolean" ? entry.isHome : !!audience.isHome;
+
   for (const userId of finalRecipients) {
     const { title, body } = buildNotificationContent({
       ...entry,
+      isHome,
       actorName,
       targetName,
       viewerUserId: userId,
