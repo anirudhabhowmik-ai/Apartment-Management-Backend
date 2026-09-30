@@ -290,6 +290,11 @@ function nameFor(rawName, subjectUserId, viewerUserId) {
 
 // ---------------------------------------------------------------------------
 // Notification content builder — tenant-aware, self-aware
+//
+//   paymentNoun:
+//     home  → "rent"          (a tenant pays rent, not maintenance)
+//     apt   → "maintenance"
+//   Staff payments are always "salary".
 // ---------------------------------------------------------------------------
 function buildNotificationContent(entry) {
   const viewerUserId = entry.viewerUserId ?? null;
@@ -321,22 +326,23 @@ function buildNotificationContent(entry) {
   const kind = meta.kind ?? "an event";
   const role = humanRole(meta.role, isHome);
   const roleJoin = joinedLabel(meta.role, isHome);
+  const paymentNoun = isHome ? "rent" : "maintenance";
 
   const map = {
-    // ---- Payments ----
+    // ---- Payments (uses paymentNoun for member payments) ----
     "member.payment_paid": () =>
       samePerson && actorIsViewer
-        ? { title: "Maintenance paid", body: "You marked your own maintenance as PAID." }
+        ? { title: `${capitalize(paymentNoun)} paid`, body: `You marked your own ${paymentNoun} as PAID.` }
         : samePerson
-          ? { title: "Maintenance paid", body: `${actor} marked their own maintenance as PAID.` }
-          : { title: "Maintenance paid", body: `${actor} marked maintenance PAID for ${target}.` },
+          ? { title: `${capitalize(paymentNoun)} paid`, body: `${actor} marked their own ${paymentNoun} as PAID.` }
+          : { title: `${capitalize(paymentNoun)} paid`, body: `${actor} marked ${paymentNoun} PAID for ${target}.` },
 
     "member.payment_due": () =>
       samePerson && actorIsViewer
-        ? { title: "Maintenance due", body: "You marked your own maintenance as DUE." }
+        ? { title: `${capitalize(paymentNoun)} due`, body: `You marked your own ${paymentNoun} as DUE.` }
         : samePerson
-          ? { title: "Maintenance due", body: `${actor} marked their own maintenance as DUE.` }
-          : { title: "Maintenance due", body: `${actor} marked maintenance DUE for ${target}.` },
+          ? { title: `${capitalize(paymentNoun)} due`, body: `${actor} marked their own ${paymentNoun} as DUE.` }
+          : { title: `${capitalize(paymentNoun)} due`, body: `${actor} marked ${paymentNoun} DUE for ${target}.` },
 
     "staff.payment_paid": () =>
       samePerson && actorIsViewer
@@ -430,7 +436,7 @@ function buildNotificationContent(entry) {
         ? { title: "Opening balance updated", body: "You updated the opening balance." }
         : { title: "Opening balance updated", body: `${actor} updated the opening balance.` },
 
-    // ---- Expense reminder (fired by the cron) ----
+    // ---- Expense reminder ----
     "expense.expense_reminder": () => ({
       title: meta.notificationTitle || "Payment due reminder",
       body: meta.notificationBody || meta.summary || "A payment is due soon.",
@@ -444,6 +450,14 @@ function buildNotificationContent(entry) {
       body: entry.summary || `${actor} performed ${k}.`,
     }
   );
+}
+
+// ---------------------------------------------------------------------------
+// Small utility — first letter uppercase
+// ---------------------------------------------------------------------------
+function capitalize(s) {
+  if (!s) return "";
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 // ---------------------------------------------------------------------------

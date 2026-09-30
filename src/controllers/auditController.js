@@ -42,9 +42,6 @@ async function canAccessHistory(accountId) {
 
 // ---------------------------------------------------------------------------
 // Friendly role label — tenant-aware
-//
-//   On a personal "home" account, `member_visibility` reads as
-//   "tenant access". Everywhere else it stays "member access".
 // ---------------------------------------------------------------------------
 function humanRole(role, isHome = false) {
   if (!role) return "access";
@@ -73,8 +70,12 @@ function joinedLabel(role, isHome = false) {
 // Human-readable summary builder — tenant-aware
 //
 //   • Role words: "member access" → "tenant access" on home accounts.
-//   • Unit noun: on home accounts a member's unit is a "room" (a tenant
-//     rents a room); on apartment accounts it stays "property".
+//   • Member unit noun:
+//       home  → "room rent"     (a tenant rents a room)
+//       apt   → "property"
+//   • Payment noun:
+//       home  → "rent"          (a tenant pays rent, not maintenance)
+//       apt   → "maintenance"
 // ---------------------------------------------------------------------------
 function buildSummary(e, isHome = false) {
   const actor = e.actorName || "Someone";
@@ -92,7 +93,8 @@ function buildSummary(e, isHome = false) {
   const targetForBody = target ?? "someone";
 
   const roleLabel = humanRole(role, isHome);
-  const memberNoun = isHome ? "room" : "property";
+  const memberNoun = isHome ? "room rent" : "property";
+  const paymentNoun = isHome ? "rent" : "maintenance";
 
   const map = {
     // ---- Account ----
@@ -104,7 +106,7 @@ function buildSummary(e, isHome = false) {
         ? `${actor} transferred ownership to ${target}`
         : `${actor} transferred ownership`,
 
-    // ---- Members (unit noun is "room" on homes) ----
+    // ---- Members ----
     "member.create": () =>
       isSamePerson
         ? `${actor} added their own ${memberNoun}`
@@ -130,15 +132,15 @@ function buildSummary(e, isHome = false) {
         ? `${actor} removed their own staff role`
         : `${actor} removed staff role from ${targetForBody}`,
 
-    // ---- Payments ----
+    // ---- Payments (uses paymentNoun) ----
     "member.payment_paid": () =>
       isSamePerson
-        ? `${actor} marked their own maintenance as PAID`
-        : `${actor} marked maintenance PAID for ${targetForBody}`,
+        ? `${actor} marked their own ${paymentNoun} as PAID`
+        : `${actor} marked ${paymentNoun} PAID for ${targetForBody}`,
     "member.payment_due": () =>
       isSamePerson
-        ? `${actor} marked their own maintenance as DUE`
-        : `${actor} marked maintenance DUE for ${targetForBody}`,
+        ? `${actor} marked their own ${paymentNoun} as DUE`
+        : `${actor} marked ${paymentNoun} DUE for ${targetForBody}`,
     "staff.payment_paid": () =>
       isSamePerson
         ? `${actor} marked their own salary as PAID`
@@ -255,7 +257,6 @@ async function writeAudit(client, entry) {
     ? await resolveUserName(client, targetUserId)
     : null;
 
-  // Tenant-aware summary: look up account type once, pass through.
   const isHome = await resolveIsHomeAccount(client, accountId);
 
   const summary =
@@ -475,11 +476,6 @@ const getAccountHistory = async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // GET /history/me — MEMBER or STAFF. Tenant-aware.
-//
-//   On a home account, a `member_visibility` caller is a TENANT. Tenants
-//   must NOT see property finance (expenses, opening balance, subscription,
-//   or other members' payments). They can still see their OWN member/staff
-//   payment rows.
 // ---------------------------------------------------------------------------
 const getMyHistory = async (req, res) => {
   try {
