@@ -68,14 +68,6 @@ function joinedLabel(role, isHome = false) {
 
 // ---------------------------------------------------------------------------
 // Human-readable summary builder — tenant-aware
-//
-//   • Role words: "member access" → "tenant access" on home accounts.
-//   • Member unit noun:
-//       home  → "room rent"     (a tenant rents a room)
-//       apt   → "property"
-//   • Payment noun:
-//       home  → "rent"          (a tenant pays rent, not maintenance)
-//       apt   → "maintenance"
 // ---------------------------------------------------------------------------
 function buildSummary(e, isHome = false) {
   const actor = e.actorName || "Someone";
@@ -97,7 +89,6 @@ function buildSummary(e, isHome = false) {
   const paymentNoun = isHome ? "rent" : "maintenance";
 
   const map = {
-    // ---- Account ----
     "account.create": () => `${actor} created the account`,
     "account.update": () => `${actor} updated the account`,
     "account.delete": () => `${actor} deleted the account`,
@@ -106,7 +97,6 @@ function buildSummary(e, isHome = false) {
         ? `${actor} transferred ownership to ${target}`
         : `${actor} transferred ownership`,
 
-    // ---- Members ----
     "member.create": () =>
       isSamePerson
         ? `${actor} added their own ${memberNoun}`
@@ -120,7 +110,6 @@ function buildSummary(e, isHome = false) {
         ? `${actor} removed their own ${memberNoun}`
         : `${actor} removed ${memberNoun} from ${targetForBody}`,
 
-    // ---- Staff ----
     "staff.create": () =>
       `${actor} added staff role for ${targetForBody}`,
     "staff.update": () =>
@@ -132,7 +121,6 @@ function buildSummary(e, isHome = false) {
         ? `${actor} removed their own staff role`
         : `${actor} removed staff role from ${targetForBody}`,
 
-    // ---- Payments (uses paymentNoun) ----
     "member.payment_paid": () =>
       isSamePerson
         ? `${actor} marked their own ${paymentNoun} as PAID`
@@ -150,12 +138,10 @@ function buildSummary(e, isHome = false) {
         ? `${actor} marked their own salary as DUE`
         : `${actor} marked salary DUE for ${targetForBody}`,
 
-    // ---- Expenses ----
     "expense.create": () => `${actor} added an expense`,
     "expense.update": () => `${actor} updated an expense`,
     "expense.delete": () => `${actor} deleted an expense`,
 
-    // ---- Account member role changes ----
     "account_member.role_granted": () =>
       isSamePerson
         ? `${actor} granted themselves ${roleLabel}`
@@ -165,7 +151,6 @@ function buildSummary(e, isHome = false) {
         ? `${actor} revoked their own ${roleLabel}`
         : `${actor} removed ${roleLabel} from ${targetForBody}`,
 
-    // ---- Invitations ----
     "invitation.create": () =>
       `${actor} invited ${targetForBody} for ${roleLabel}`,
     "invitation.delete": () =>
@@ -179,18 +164,15 @@ function buildSummary(e, isHome = false) {
         ? `${actor} accepted the invitation for ${roleLabel}`
         : `${targetForBody} accepted the invitation for ${roleLabel}`,
 
-    // ---- Calendar ----
     "calendar_event.create":  () => `${actor} posted ${kind ?? "an event"}`,
     "calendar_event.update":  () => `${actor} updated ${kind ?? "an event"}`,
     "calendar_event.approve": () => `${actor} approved ${kind ?? "an event"}`,
     "calendar_event.reject":  () => `${actor} rejected ${kind ?? "an event"}`,
     "calendar_event.delete":  () => `${actor} deleted ${kind ?? "an event"}`,
 
-    // ---- Opening balance ----
     "opening_balance.update": () => `${actor} updated opening balance`,
     "opening_balance.create": () => `${actor} added opening balance`,
 
-    // ---- User ----
     "user.merge_users": () => `${actor} merged accounts`,
     "user.phone_changed": () => `${actor} changed their phone number`,
   };
@@ -350,6 +332,14 @@ const isAdminLike = (role) => role === "owner" || role === "admin";
 
 // ---------------------------------------------------------------------------
 // Shared SELECT
+//
+// NOTE: `audit_log` does NOT have a `target_user_id` column. The target user
+// is resolved at query time via the `tu` lateral join and aliased as
+// `tu.id AS target_user_id` in the SELECT list.
+//
+// This means we cannot reference `al.target_user_id` anywhere. Any filter
+// that needs the resolved target user must reference `tu.id` instead — which
+// works because PostgreSQL allows lateral-join aliases in the WHERE clause.
 // ---------------------------------------------------------------------------
 const HISTORY_SELECT = `
   SELECT
@@ -414,6 +404,38 @@ const HISTORY_SELECT = `
 `;
 
 // ---------------------------------------------------------------------------
+// SQL fragment: hide self-service role grants that duplicate an
+// invitation.accept row.
+//
+// When someone accepts an invitation, the backend writes BOTH:
+//   1. invitation.accept           → "X accepted invitation for tenant access"
+//   2. account_member.role_granted → "X granted themselves tenant access"
+//
+// We suppress the self-grant on the server so every client gets clean data.
+//
+// IMPORTANT: audit_log has NO target_user_id column. The resolved target
+// user id comes from the lateral join alias `tu.id` — which is why we
+// reference `tu.id` here, NOT `al.target_user_id`.
+//
+// Self-grant detection:
+//   • actor_user_id equals the resolved target user id (tu.id), OR
+//   • actor_user_id equals the user_id stored in the `after` JSONB
+//     (used as a fallback when the lateral join couldn't resolve tu.id).
+// ---------------------------------------------------------------------------
+const SELF_GRANT_FILTER = `
+  NOT (
+    al.entity_type = 'account_member'
+    AND al.action = 'role_granted'
+    AND al.actor_user_id IS NOT NULL
+    AND (
+      (tu.id IS NOT NULL AND al.actor_user_id = tu.id)
+      OR (al.after->>'user_id' IS NOT NULL
+          AND al.actor_user_id::text = al.after->>'user_id')
+    )
+  )
+`;
+
+// ---------------------------------------------------------------------------
 // GET /history — OWNER / ADMIN only
 // ---------------------------------------------------------------------------
 const getAccountHistory = async (req, res) => {
@@ -444,6 +466,9 @@ const getAccountHistory = async (req, res) => {
 
     const params = [accountId];
     let where = `al.account_id = $1`;
+
+    // Hide duplicate self-service role grants.
+    where += ` AND ${SELF_GRANT_FILTER}`;
 
     if (entityType) {
       params.push(entityType);
@@ -534,6 +559,9 @@ const getMyHistory = async (req, res) => {
         )
       )
     )`;
+
+    // Hide duplicate self-service role grants.
+    where += ` AND ${SELF_GRANT_FILTER}`;
 
     if (isTenantViewer) {
       params.push(userId);
