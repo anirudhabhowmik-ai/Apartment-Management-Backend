@@ -1,4 +1,22 @@
 // src/controllers/subscriptionController.js
+//
+// ⚠️⚠️⚠️  WEB-ONLY CONTROLLER  ⚠️⚠️⚠️
+//
+// This controller uses Razorpay for WEB-BASED subscription payments.
+// The Android / iOS mobile apps MUST NOT call these endpoints for
+// digital subscription purchases — Google Play policy requires that
+// in-app digital subscriptions use Google Play Billing (via RevenueCat).
+//
+// Mobile subscription flow:
+//   Mobile App → RevenueCat SDK → Google Play Billing → RevenueCat
+//   → POST /api/webhooks/revenuecat (see revenueCatWebhookController.js)
+//
+// These Razorpay endpoints remain available for a future WEB version of
+// the product, where Razorpay checkout is allowed.
+//
+// To enforce this, mobile clients send the header `x-app-platform: mobile`
+// on all API requests. Calls from mobile are rejected below.
+//
 const crypto = require("crypto");
 const Razorpay = require("razorpay");
 const { pool } = require("../config/database");
@@ -17,6 +35,22 @@ const getUserId = (req) =>
   req.user?.userId ?? req.user?.id ?? req.userId ?? null;
 const fail = (res, s, code, msg) => res.status(s).json({ code, message: msg });
 
+// ─── Mobile guard ────────────────────────────────────────────────────────────
+// Reject Razorpay endpoints when the caller identifies as the mobile app.
+const isMobileCaller = (req) => {
+  const platform = (req.headers["x-app-platform"] || "").toLowerCase();
+  return platform === "mobile" || platform === "android" || platform === "ios";
+};
+
+const rejectMobile = (res) =>
+  fail(
+    res,
+    403,
+    "mobile_not_allowed",
+    "Mobile subscriptions must use Google Play Billing via RevenueCat. " +
+      "This endpoint is for web payments only.",
+  );
+
 async function getRoleForAccount(userId, accountId) {
   const { rows: o } = await pool.query(
     `SELECT 1 FROM accounts WHERE id = $1 AND created_by = $2`,
@@ -33,6 +67,7 @@ async function getRoleForAccount(userId, accountId) {
 
 // ===========================================================================
 // GET /api/accounts/:accountId/subscription
+// (Safe on mobile — read-only. Mobile clients use this to display state.)
 // ===========================================================================
 const getSubscription = async (req, res) => {
   try {
@@ -43,7 +78,6 @@ const getSubscription = async (req, res) => {
     const role = await getRoleForAccount(userId, accountId);
     if (!role) return fail(res, 403, "no_account_access", "No access");
 
-    // Staff cannot see subscription
     if (role === "staff_visibility") {
       return fail(res, 403, "forbidden", "Staff cannot view subscription");
     }
@@ -104,8 +138,11 @@ const getSubscription = async (req, res) => {
 
 // ===========================================================================
 // POST /api/accounts/:accountId/subscription
+// ⚠️ WEB-ONLY (Razorpay). Mobile apps must NOT call this.
 // ===========================================================================
 const updateSubscription = async (req, res) => {
+  if (isMobileCaller(req)) return rejectMobile(res);
+
   const client = await pool.connect();
   try {
     const userId = getUserId(req);
@@ -126,7 +163,6 @@ const updateSubscription = async (req, res) => {
       return fail(res, 400, "invalid_period", "Invalid period");
     }
 
-    // Free plan: no payment needed
     if (plan_id === "free") {
       await client.query("BEGIN");
       await client.query(
@@ -147,13 +183,13 @@ const updateSubscription = async (req, res) => {
       await writeAudit(client, {
         accountId, actorUserId: userId, actorRole: role,
         entityType: "subscription", entityId: accountId, action: "cancelled",
-        metadata: { plan_id: "free", billing_period }, visibility: "public",
+        metadata: { plan_id: "free", billing_period, source: "web" },
+        visibility: "public",
       });
       await client.query("COMMIT");
       return res.json({ success: true, plan_id: "free", billing_period });
     }
 
-    // Paid plan: verify payment signature
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return fail(res, 400, "payment_required", "Payment details required");
     }
@@ -191,7 +227,7 @@ const updateSubscription = async (req, res) => {
       accountId, actorUserId: userId, actorRole: role,
       entityType: "subscription", entityId: accountId, action: "plan_changed",
       after: { plan_id, billing_period },
-      metadata: { plan_id, billing_period, amount, razorpay_payment_id },
+      metadata: { plan_id, billing_period, amount, razorpay_payment_id, source: "web" },
       visibility: "public",
     });
     await client.query("COMMIT");
@@ -214,8 +250,11 @@ const updateSubscription = async (req, res) => {
 
 // ===========================================================================
 // POST /api/payment/create-order
+// ⚠️ WEB-ONLY (Razorpay). Mobile apps must NOT call this.
 // ===========================================================================
 const createOrder = async (req, res) => {
+  if (isMobileCaller(req)) return rejectMobile(res);
+
   try {
     const userId = getUserId(req);
     const { accountId, plan_id, billing_period } = req.body || {};
@@ -243,7 +282,7 @@ const createOrder = async (req, res) => {
       amount: Math.round(amount * 100),
       currency: "INR",
       receipt: `acc_${accountId}_${Date.now()}`,
-      notes: { accountId, plan_id, billing_period, userId },
+      notes: { accountId, plan_id, billing_period, userId, source: "web" },
     });
 
     return res.json({
@@ -260,8 +299,11 @@ const createOrder = async (req, res) => {
 
 // ===========================================================================
 // POST /api/payment/verify
+// ⚠️ WEB-ONLY (Razorpay). Mobile apps must NOT call this.
 // ===========================================================================
 const verifyPayment = async (req, res) => {
+  if (isMobileCaller(req)) return rejectMobile(res);
+
   try {
     const {
       razorpay_order_id, razorpay_payment_id, razorpay_signature,
