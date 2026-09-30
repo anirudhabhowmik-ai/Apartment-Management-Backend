@@ -778,6 +778,7 @@ const listMyInvitations = async (req, res) => {
     const { rows } = await pool.query(
       `SELECT i.id, i.account_id, i.role, i.status, i.invited_name, i.created_at,
          a.name AS account_name, a.photo_url AS account_photo_url,
+         a.type AS account_type,
          u.phone AS invited_by_phone,
          (SELECT am.role FROM account_members am
             WHERE am.account_id=i.account_id AND am.user_id=$2 AND am.status='active'
