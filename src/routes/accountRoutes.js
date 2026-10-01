@@ -31,6 +31,8 @@ const {
   getMyRole,
 } = require("../controllers/accountController");
 
+const { dismissInvitation } = require("../controllers/invitationController");
+
 // ---------------------------------------------------------------------------
 // Create + list
 // ---------------------------------------------------------------------------
@@ -51,8 +53,16 @@ router.patch("/me/last-account", authMiddleware, setLastAccount);
 // role changes without a full logout/login).
 router.get("/:id/my-role", authMiddleware, getMyRole);
 
-// People for a specific account (owner + admins).
+// People for a specific account (owner + admins + members + staff).
 router.get("/:id/people", authMiddleware, getAccountPeople);
+
+// Dismiss an accepted member/staff invitation so the card is hidden from
+// the "People With Access" list on the account profile screen.
+router.post(
+  "/:id/invitations/:invitationId/dismiss",
+  authMiddleware,
+  dismissInvitation,
+);
 
 // ---------------------------------------------------------------------------
 // Generic "/:id" routes — must come LAST so they don't shadow the specific

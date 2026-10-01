@@ -139,7 +139,7 @@ const getAccountPeople = async (req, res) => {
     const { id: accountId } = req.params;
     if (!userId) return fail(res, 401, "unauthenticated");
 
-    // Access check
+    // ---- Access check ----
     const { rows: memberRows } = await pool.query(
       `SELECT am.role FROM account_members am
          JOIN accounts a ON a.id = am.account_id
@@ -157,7 +157,7 @@ const getAccountPeople = async (req, res) => {
       return fail(res, 403, "no_account_access");
     }
 
-    // Owner
+    // ---- Owner ----
     const { rows: ownerRows } = await pool.query(
       `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM accounts a JOIN users u ON u.id = a.created_by
@@ -170,39 +170,158 @@ const getAccountPeople = async (req, res) => {
           name: ownerRows[0].name ?? "",
           phone: ownerRows[0].phone ?? null,
           photo_url: ownerRows[0].photo_url ?? null,
+          kind: "owner",
+          invitation_id: null,
+          can_dismiss: false,
         }
       : null;
 
-    // One query for all three role buckets
-    const { rows: roleRows } = await pool.query(
-      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url, am.role
+    // ---- Admins (never dismissible) ----
+    const { rows: adminRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          JOIN accounts a ON a.id = am.account_id
         WHERE am.account_id = $1
+          AND am.role = 'admin'
           AND am.status = 'active'
           AND u.id <> a.created_by
         ORDER BY COALESCE(u.name, '')`,
       [accountId],
     );
+    const admins = adminRows.map((r) => ({
+      user_id: r.user_id,
+      name: r.name ?? "",
+      phone: r.phone ?? null,
+      photo_url: r.photo_url ?? null,
+      kind: "admin",
+      invitation_id: null,
+      can_dismiss: false,
+    }));
 
-    const admins = [];
-    const members = [];
-    const staff = [];
+    // ---- Members (People card) ----
+    // INNER JOIN LATERAL + dismissed_at IS NULL: once the owner dismisses
+    // the invitation, the card disappears from the People list.
+    const { rows: memberListRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url,
+              i.id AS invitation_id
+         FROM account_members am
+         JOIN users u ON u.id = am.user_id
+         JOIN accounts a ON a.id = am.account_id
+         INNER JOIN LATERAL (
+           SELECT inv.id
+             FROM invitations inv
+            WHERE inv.account_id  = am.account_id
+              AND inv.accepted_by = am.user_id
+              AND inv.role        = 'member_visibility'
+              AND inv.status      = 'accepted'
+              AND inv.dismissed_at IS NULL
+            ORDER BY inv.responded_at DESC NULLS LAST, inv.created_at DESC
+            LIMIT 1
+         ) i ON TRUE
+        WHERE am.account_id = $1
+          AND am.role        = 'member_visibility'
+          AND am.status      = 'active'
+          AND u.id <> a.created_by
+        ORDER BY COALESCE(u.name, '')`,
+      [accountId],
+    );
+    const members = memberListRows.map((r) => ({
+      user_id: r.user_id,
+      name: r.name ?? "",
+      phone: r.phone ?? null,
+      photo_url: r.photo_url ?? null,
+      kind: "member",
+      invitation_id: r.invitation_id ?? null,
+      can_dismiss: true,
+    }));
 
-    for (const r of roleRows) {
-      const entry = {
-        user_id: r.user_id,
-        name: r.name ?? "",
-        phone: r.phone ?? null,
-        photo_url: r.photo_url ?? null,
-      };
-      if (r.role === "admin") admins.push(entry);
-      else if (r.role === "member_visibility") members.push(entry);
-      else if (r.role === "staff_visibility") staff.push(entry);
-    }
+    // ---- Staff (People card) ----
+    const { rows: staffListRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url,
+              i.id AS invitation_id
+         FROM account_members am
+         JOIN users u ON u.id = am.user_id
+         JOIN accounts a ON a.id = am.account_id
+         INNER JOIN LATERAL (
+           SELECT inv.id
+             FROM invitations inv
+            WHERE inv.account_id  = am.account_id
+              AND inv.accepted_by = am.user_id
+              AND inv.role        = 'staff_visibility'
+              AND inv.status      = 'accepted'
+              AND inv.dismissed_at IS NULL
+            ORDER BY inv.responded_at DESC NULLS LAST, inv.created_at DESC
+            LIMIT 1
+         ) i ON TRUE
+        WHERE am.account_id = $1
+          AND am.role        = 'staff_visibility'
+          AND am.status      = 'active'
+          AND u.id <> a.created_by
+        ORDER BY COALESCE(u.name, '')`,
+      [accountId],
+    );
+    const staff = staffListRows.map((r) => ({
+      user_id: r.user_id,
+      name: r.name ?? "",
+      phone: r.phone ?? null,
+      photo_url: r.photo_url ?? null,
+      kind: "staff",
+      invitation_id: r.invitation_id ?? null,
+      can_dismiss: true,
+    }));
 
-    return res.json({ owner, admins, members, staff });
+    // ---- Revoke lists (Revoke Access modal) ----
+    // No dismissed_at filter here — dismiss only affects card visibility.
+    // These lists reflect who actually has active access.
+    const { rows: revokeMemberRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+         FROM account_members am
+         JOIN users u ON u.id = am.user_id
+         JOIN accounts a ON a.id = am.account_id
+        WHERE am.account_id = $1
+          AND am.role        = 'member_visibility'
+          AND am.status      = 'active'
+          AND u.id <> a.created_by
+        ORDER BY COALESCE(u.name, '')`,
+      [accountId],
+    );
+    const revokeMembers = revokeMemberRows.map((r) => ({
+      user_id: r.user_id,
+      name: r.name ?? "",
+      phone: r.phone ?? null,
+      photo_url: r.photo_url ?? null,
+      kind: "member",
+    }));
+
+    const { rows: revokeStaffRows } = await pool.query(
+      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+         FROM account_members am
+         JOIN users u ON u.id = am.user_id
+         JOIN accounts a ON a.id = am.account_id
+        WHERE am.account_id = $1
+          AND am.role        = 'staff_visibility'
+          AND am.status      = 'active'
+          AND u.id <> a.created_by
+        ORDER BY COALESCE(u.name, '')`,
+      [accountId],
+    );
+    const revokeStaff = revokeStaffRows.map((r) => ({
+      user_id: r.user_id,
+      name: r.name ?? "",
+      phone: r.phone ?? null,
+      photo_url: r.photo_url ?? null,
+      kind: "staff",
+    }));
+
+    return res.json({
+      owner,
+      admins,
+      members,
+      staff,
+      revokeMembers,
+      revokeStaff,
+    });
   } catch (error) {
     console.error("getAccountPeople error:", error);
     return fail(res, 500, "server_error");
