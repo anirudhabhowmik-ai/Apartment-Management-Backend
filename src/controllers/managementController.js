@@ -79,7 +79,7 @@ function normalizeRole(raw) {
   return s.replace(/\s+/g, " ").replace(/[\u0000-\u001F]/g, "").toLowerCase();
 }
 
-// ─── NEW: vehicle helpers ─────────────────────────────────────────────────
+// ─── Vehicle helpers ──────────────────────────────────────────────────────
 const VALID_VEHICLE_TYPES = new Set(["car", "bike", "other"]);
 
 function normalizeVehicleNumber(raw) {
@@ -95,8 +95,6 @@ function normalizeVehicleType(raw) {
 /**
  * Validate + clean a client-provided vehicles array.
  * Returns { ok: true, value: [...] } or { ok: false, error: "..." }.
- *
- * Each entry becomes: { id?: uuid, number: "KA01AB1234", type: "car"|"bike"|"other" }
  */
 function normalizeVehiclesInput(raw) {
   if (raw === null || raw === undefined) return { ok: true, value: [] };
@@ -143,9 +141,6 @@ function normalizeVehiclesInput(raw) {
   return { ok: true, value: out };
 }
 
-/**
- * Load active vehicles for a member, shaped the way the frontend expects.
- */
 async function loadVehiclesForMember(client, memberId) {
   const { rows } = await client.query(
     `SELECT id, vehicle_number, vehicle_type, owner_name, flat_number, wing,
@@ -167,17 +162,6 @@ async function loadVehiclesForMember(client, memberId) {
   }));
 }
 
-/**
- * Replace the vehicles list for a member.
- *
- * Rules:
- *   - vehicles[] with an `id` that already belongs to this member → UPDATE.
- *   - vehicles[] without an `id` → INSERT.
- *   - Any active vehicle for this member that is NOT in the incoming list →
- *     soft-delete (status='inactive').
- *
- * Caller must be inside a transaction.
- */
 async function replaceMemberVehicles(
   client,
   accountId,
@@ -196,7 +180,6 @@ async function replaceMemberVehicles(
     vehicles.map((v) => v.id).filter((x) => typeof x === "string" && x.length > 0),
   );
 
-  // Soft-delete vehicles that disappeared
   const toDeactivate = existing
     .filter((r) => !incomingIds.has(r.id))
     .map((r) => r.id);
@@ -210,7 +193,6 @@ async function replaceMemberVehicles(
 
   for (const v of vehicles) {
     if (v.id && existingById.has(v.id)) {
-      // UPDATE — keep the row but refresh number/type + denormalized identity
       await client.query(
         `UPDATE vehicles SET
            vehicle_number = $1,
@@ -235,8 +217,6 @@ async function replaceMemberVehicles(
         ],
       );
     } else {
-      // INSERT — new vehicle, but watch for an account-wide number conflict
-      // (someone else already registered this plate).
       const { rows: clash } = await client.query(
         `SELECT id, member_id FROM vehicles
           WHERE account_id = $1 AND vehicle_number = $2
@@ -284,7 +264,6 @@ async function replaceMemberVehicles(
     }
   }
 }
-// ─── END NEW helpers ──────────────────────────────────────────────────────
 
 const fail = (res, status, code, message) =>
   res.status(status).json({ code, message });
@@ -333,7 +312,6 @@ function shapeMemberRow(row, payment) {
     area_sqft: row.area_sqft ?? null,
     parking_available: !!row.parking_available,
     maintenance_amount: Number(row.maintenance_amount) || 0,
-    // ─── NEW: vehicle list (populated by listMembers/getMember) ─────────
     vehicles: Array.isArray(row.vehicles) ? row.vehicles : [],
     status: row.status,
     created_by: row.created_by,
@@ -569,7 +547,6 @@ const listMembers = async (req, res) => {
         ORDER BY m.flat_number, u.name`,
       [accountId]);
 
-    // ─── NEW: batch-load vehicles for all members in one query ──────────
     const memberIds = rows.map((r) => r.id);
     const vehiclesByMember = new Map();
     if (memberIds.length > 0) {
@@ -684,7 +661,6 @@ const getMember = async (req, res) => {
 
     if (!rows.length) return fail(res, 404, "not_found", "Member not found");
 
-    // ─── NEW: load vehicles for this member ─────────────────────────────
     const vehicles = await loadVehiclesForMember({ query: pool.query.bind(pool) }, id);
     const member = shapeMemberRow({ ...rows[0], vehicles }, null);
 
@@ -738,7 +714,6 @@ const createMember = async (req, res) => {
     if (!memberRole) return fail(res, 400, "invalid_input", "Member role is required");
     if (memberRole.length > 60) return fail(res, 400, "invalid_input", "Member role is too long");
 
-    // ─── NEW: validate vehicles up-front so we don't open a transaction ─
     const vehiclesCheck = normalizeVehiclesInput(body.vehicles);
     if (!vehiclesCheck.ok) {
       return fail(res, 400, "invalid_input", vehiclesCheck.error);
@@ -808,7 +783,6 @@ const createMember = async (req, res) => {
 
     const memberId = rows[0].id;
 
-    // ─── NEW: persist vehicles if parking_available ─────────────────────
     if (parking_available && incomingVehicles.length > 0) {
       try {
         await replaceMemberVehicles(
@@ -869,7 +843,6 @@ const createMember = async (req, res) => {
 
     await client.query("COMMIT");
 
-    // Return the final shape (with vehicles) using the same connection pool
     const vehicles = await loadVehiclesForMember(
       { query: pool.query.bind(pool) },
       memberId,
@@ -940,7 +913,6 @@ const updateMember = async (req, res) => {
       updates.role = roleStr;
     }
 
-    // ─── NEW: parse incoming vehicles once ──────────────────────────────
     const hasVehiclesField = Object.prototype.hasOwnProperty.call(req.body, "vehicles");
     let incomingVehicles = [];
     if (hasVehiclesField) {
@@ -1012,9 +984,7 @@ const updateMember = async (req, res) => {
         [id, accountId]);
     }
 
-    // ─── NEW: sync vehicles if the client sent a vehicles[] array ──────
     if (hasVehiclesField) {
-      // Determine the effective parking state
       const effectiveParking =
         updates.parking_available !== undefined
           ? !!updates.parking_available
@@ -1031,7 +1001,6 @@ const updateMember = async (req, res) => {
           "Add at least one vehicle number since parking is available");
       }
 
-      // Identity for denormalized fields (fall back to current row)
       const identity = {
         name: newName ?? beforeSnapshot?.name ?? "",
         flatNumber:
@@ -1116,6 +1085,7 @@ const updateMember = async (req, res) => {
   }
 };
 
+// ─── FIXED: no `RETURNING name` on members (name lives on users) ─────────
 const deleteMember = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1130,25 +1100,40 @@ const deleteMember = async (req, res) => {
 
     await client.query("BEGIN");
 
+    // Fetch user_id + name from the JOIN before updating.
+    const { rows: existing } = await client.query(
+      `SELECT m.user_id, u.name
+         FROM members m
+         LEFT JOIN users u ON u.id = m.user_id
+        WHERE m.id = $1 AND m.account_id = $2 AND m.status = 'active'`,
+      [id, accountId],
+    );
+
+    if (!existing.length) {
+      await client.query("ROLLBACK");
+      return fail(res, 404, "not_found", "Member not found");
+    }
+
+    const targetUserId = existing[0].user_id ?? null;
+    const targetName = existing[0].name ?? null;
+
     const updated = await client.query(
       `UPDATE members SET status='inactive', updated_at=NOW()
-        WHERE id=$1 AND account_id=$2 AND status='active'
-        RETURNING user_id, name`,
-      [id, accountId]);
+        WHERE id=$1 AND account_id=$2 AND status='active'`,
+      [id, accountId],
+    );
 
     if (updated.rowCount === 0) {
       await client.query("ROLLBACK");
       return fail(res, 404, "not_found", "Member not found");
     }
 
-    // ─── NEW: soft-delete the member's vehicles too ────────────────────
+    // Soft-delete the member's vehicles too.
     await client.query(
       `UPDATE vehicles SET status='inactive', updated_at=NOW()
         WHERE account_id=$1 AND member_id=$2 AND status='active'`,
       [accountId, id],
     );
-
-    const targetUserId = updated.rows[0]?.user_id;
 
     if (targetUserId) {
       const { rows: stillMember } = await client.query(
@@ -1178,7 +1163,7 @@ const deleteMember = async (req, res) => {
       entityType: "member",
       entityId: id,
       action: "delete",
-      after: { status: "inactive", name: updated.rows[0].name },
+      after: { status: "inactive", name: targetName },
       metadata: { softDelete: true },
       visibility: "participants",
     });
@@ -1665,6 +1650,7 @@ const updateStaff = async (req, res) => {
   }
 };
 
+// ─── FIXED: no `RETURNING name` on staff (name lives on users) ───────────
 const deleteStaff = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1679,18 +1665,32 @@ const deleteStaff = async (req, res) => {
 
     await client.query("BEGIN");
 
+    const { rows: existing } = await client.query(
+      `SELECT s.user_id, u.name
+         FROM staff s
+         LEFT JOIN users u ON u.id = s.user_id
+        WHERE s.id = $1 AND s.account_id = $2 AND s.status = 'active'`,
+      [id, accountId],
+    );
+
+    if (!existing.length) {
+      await client.query("ROLLBACK");
+      return fail(res, 404, "not_found", "Staff not found");
+    }
+
+    const targetUserId = existing[0].user_id ?? null;
+    const targetName = existing[0].name ?? null;
+
     const updated = await client.query(
       `UPDATE staff SET status='inactive', updated_at=NOW()
-        WHERE id=$1 AND account_id=$2 AND status='active'
-        RETURNING user_id, name`,
-      [id, accountId]);
+        WHERE id=$1 AND account_id=$2 AND status='active'`,
+      [id, accountId],
+    );
 
     if (updated.rowCount === 0) {
       await client.query("ROLLBACK");
       return fail(res, 404, "not_found", "Staff not found");
     }
-
-    const targetUserId = updated.rows[0]?.user_id;
 
     if (targetUserId) {
       const { rows: stillStaff } = await client.query(
@@ -1720,7 +1720,7 @@ const deleteStaff = async (req, res) => {
       entityType: "staff",
       entityId: id,
       action: "delete",
-      after: { status: "inactive", name: updated.rows[0].name },
+      after: { status: "inactive", name: targetName },
       metadata: { softDelete: true },
       visibility: "participants",
     });
@@ -2359,18 +2359,11 @@ const deleteExpense = async (req, res) => {
 };
 
 // ===========================================================================
-// ─── NEW: VEHICLES + GATE ENTRY ─────────────────────────────────────────
+// VEHICLES + GATE ENTRY
 // ===========================================================================
 
 /**
  * GET /management/:accountId/vehicles/lookup?number=KA01AB1234
- *
- * Returns:
- *   { found: true, owner: {...} }              — one match
- *   { found: true, matches: [...] }            — multiple matches (rare)
- *   { found: false }                           — none
- *
- * Access: any active member of the account (owner, admin, or staff).
  */
 const lookupVehicle = async (req, res) => {
   try {
@@ -2398,10 +2391,7 @@ const lookupVehicle = async (req, res) => {
       [accountId, number]);
 
     if (rows.length === 0) {
-      return res.json({
-        found: false,
-        vehicle_number: number,
-      });
+      return res.json({ found: false, vehicle_number: number });
     }
 
     const shaped = rows.map((r) => ({
@@ -2420,8 +2410,8 @@ const lookupVehicle = async (req, res) => {
     return res.json({
       found: true,
       vehicle_number: number,
-      owner: shaped[0],      // convenience: first match
-      matches: shaped,       // all matches (usually just one)
+      owner: shaped[0],
+      matches: shaped,
     });
   } catch (err) {
     console.error("lookupVehicle error:", err);
@@ -2431,12 +2421,7 @@ const lookupVehicle = async (req, res) => {
 
 /**
  * POST /management/:accountId/vehicles
- *
- * Guard-side registration. Body:
- *   { vehicleNumber, name, flatNumber, phone, wing?, type? }
- *
- * Any active member (owner/admin/staff) can register a vehicle. The
- * record is marked registered_by_guard = TRUE.
+ * Guard-side registration.
  */
 const registerVehicle = async (req, res) => {
   const client = await pool.connect();
@@ -2468,8 +2453,6 @@ const registerVehicle = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // Reuse an existing row for this account+number if one exists (even
-    // inactive), so we don't fight the unique constraint.
     const { rows: existing } = await client.query(
       `SELECT id, status FROM vehicles
         WHERE account_id = $1 AND vehicle_number = $2`,
@@ -2505,7 +2488,6 @@ const registerVehicle = async (req, res) => {
       vehicleId = rows[0].id;
     }
 
-    // Best-effort: try to match a member row so future lookups can link back.
     const { rows: memberMatch } = await client.query(
       `SELECT m.id, m.user_id
          FROM members m JOIN users u ON u.id = m.user_id
@@ -2568,11 +2550,6 @@ const registerVehicle = async (req, res) => {
 
 /**
  * POST /management/:accountId/gate-entries
- *
- * Body: { vehicleNumber, direction: "in" | "out" }
- *
- * Looks up the vehicle to snapshot owner info, then logs the entry.
- * Any active member can log.
  */
 const createGateEntry = async (req, res) => {
   const client = await pool.connect();
@@ -2593,8 +2570,6 @@ const createGateEntry = async (req, res) => {
 
     if (!number) return fail(res, 400, "invalid_input", "Vehicle number is required");
 
-    // Optional: allow the client to pass a snapshot when it already looked up
-    // the vehicle (avoids a second read). If missing we do the lookup here.
     let vehicleId = null;
     let memberId = null;
     let ownerName = null;
@@ -2713,7 +2688,6 @@ module.exports = {
   getStaffAttendance, upsertStaffAttendance,
   upsertMemberPayment, upsertStaffPayment,
   listExpenses, getExpense, createExpense, updateExpense, deleteExpense,
-  // ─── NEW ────────────────────────────────────────────────────────────
   lookupVehicle,
   registerVehicle,
   createGateEntry,
