@@ -66,4 +66,16 @@ router.post("/:accountId/expenses", c.createExpense);
 router.patch("/:accountId/expenses/:id", c.updateExpense);
 router.delete("/:accountId/expenses/:id", c.deleteExpense);
 
+// ---------------- Vehicles ----------------
+// Any active member (owner / admin / staff) can look up a vehicle at the gate.
+// Registration is also open to any active member because guards must be able
+// to add unregistered vehicles on the spot.
+router.get("/:accountId/vehicles/lookup", c.lookupVehicle);
+router.post("/:accountId/vehicles", c.registerVehicle);
+
+// ---------------- Gate Entries ----------------
+// Every scan is logged. Reads are capped to the last N entries by the controller.
+router.post("/:accountId/gate-entries", c.createGateEntry);
+router.get("/:accountId/gate-entries", c.listGateEntries);
+
 module.exports = router;

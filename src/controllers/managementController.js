@@ -79,6 +79,213 @@ function normalizeRole(raw) {
   return s.replace(/\s+/g, " ").replace(/[\u0000-\u001F]/g, "").toLowerCase();
 }
 
+// ─── NEW: vehicle helpers ─────────────────────────────────────────────────
+const VALID_VEHICLE_TYPES = new Set(["car", "bike", "other"]);
+
+function normalizeVehicleNumber(raw) {
+  if (raw === null || raw === undefined) return "";
+  return String(raw).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function normalizeVehicleType(raw) {
+  const s = String(raw ?? "").toLowerCase().trim();
+  return VALID_VEHICLE_TYPES.has(s) ? s : "car";
+}
+
+/**
+ * Validate + clean a client-provided vehicles array.
+ * Returns { ok: true, value: [...] } or { ok: false, error: "..." }.
+ *
+ * Each entry becomes: { id?: uuid, number: "KA01AB1234", type: "car"|"bike"|"other" }
+ */
+function normalizeVehiclesInput(raw) {
+  if (raw === null || raw === undefined) return { ok: true, value: [] };
+  if (!Array.isArray(raw)) {
+    return { ok: false, error: "vehicles must be an array" };
+  }
+  if (raw.length === 0) return { ok: true, value: [] };
+
+  const out = [];
+  const seen = new Set();
+
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const number = normalizeVehicleNumber(
+      item.number ?? item.vehicle_number ?? "",
+    );
+    if (!number) {
+      return { ok: false, error: "Every vehicle must have a number" };
+    }
+    if (number.length < 5 || number.length > 15) {
+      return {
+        ok: false,
+        error: `"${number}" doesn't look like a valid vehicle plate`,
+      };
+    }
+    if (seen.has(number)) {
+      return { ok: false, error: `Duplicate vehicle number: ${number}` };
+    }
+    seen.add(number);
+
+    const idRaw = item.id ?? null;
+    const id =
+      typeof idRaw === "string" && idRaw.trim().length > 0
+        ? idRaw.trim()
+        : null;
+
+    out.push({
+      id,
+      number,
+      type: normalizeVehicleType(item.type ?? item.vehicle_type),
+    });
+  }
+
+  return { ok: true, value: out };
+}
+
+/**
+ * Load active vehicles for a member, shaped the way the frontend expects.
+ */
+async function loadVehiclesForMember(client, memberId) {
+  const { rows } = await client.query(
+    `SELECT id, vehicle_number, vehicle_type, owner_name, flat_number, wing,
+            owner_phone, registered_by_guard, status, created_at, updated_at
+       FROM vehicles
+      WHERE member_id = $1 AND status = 'active'
+      ORDER BY created_at ASC`,
+    [memberId],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    number: r.vehicle_number,
+    type: r.vehicle_type,
+    owner_name: r.owner_name,
+    flat_number: r.flat_number,
+    wing: r.wing,
+    owner_phone: r.owner_phone,
+    registered_by_guard: !!r.registered_by_guard,
+  }));
+}
+
+/**
+ * Replace the vehicles list for a member.
+ *
+ * Rules:
+ *   - vehicles[] with an `id` that already belongs to this member → UPDATE.
+ *   - vehicles[] without an `id` → INSERT.
+ *   - Any active vehicle for this member that is NOT in the incoming list →
+ *     soft-delete (status='inactive').
+ *
+ * Caller must be inside a transaction.
+ */
+async function replaceMemberVehicles(
+  client,
+  accountId,
+  memberId,
+  vehicles,
+  identity,
+  actorUserId,
+) {
+  const { rows: existing } = await client.query(
+    `SELECT id, vehicle_number FROM vehicles
+      WHERE member_id = $1 AND status = 'active'`,
+    [memberId],
+  );
+  const existingById = new Map(existing.map((r) => [r.id, r.vehicle_number]));
+  const incomingIds = new Set(
+    vehicles.map((v) => v.id).filter((x) => typeof x === "string" && x.length > 0),
+  );
+
+  // Soft-delete vehicles that disappeared
+  const toDeactivate = existing
+    .filter((r) => !incomingIds.has(r.id))
+    .map((r) => r.id);
+  if (toDeactivate.length > 0) {
+    await client.query(
+      `UPDATE vehicles SET status = 'inactive', updated_at = NOW()
+        WHERE id = ANY($1::uuid[])`,
+      [toDeactivate],
+    );
+  }
+
+  for (const v of vehicles) {
+    if (v.id && existingById.has(v.id)) {
+      // UPDATE — keep the row but refresh number/type + denormalized identity
+      await client.query(
+        `UPDATE vehicles SET
+           vehicle_number = $1,
+           vehicle_type   = $2,
+           owner_name     = $3,
+           flat_number    = $4,
+           wing           = $5,
+           owner_phone    = $6,
+           status         = 'active',
+           updated_at     = NOW()
+         WHERE id = $7 AND member_id = $8 AND account_id = $9`,
+        [
+          v.number,
+          v.type,
+          identity.name,
+          identity.flatNumber,
+          identity.wing,
+          identity.phone,
+          v.id,
+          memberId,
+          accountId,
+        ],
+      );
+    } else {
+      // INSERT — new vehicle, but watch for an account-wide number conflict
+      // (someone else already registered this plate).
+      const { rows: clash } = await client.query(
+        `SELECT id, member_id FROM vehicles
+          WHERE account_id = $1 AND vehicle_number = $2
+            AND status = 'active' LIMIT 1`,
+        [accountId, v.number],
+      );
+      if (clash.length > 0 && clash[0].member_id !== memberId) {
+        const err = new Error(
+          `Vehicle ${v.number} is already registered to another flat`,
+        );
+        err.code = "vehicle_conflict";
+        throw err;
+      }
+
+      await client.query(
+        `INSERT INTO vehicles
+           (account_id, member_id, user_id, vehicle_number,
+            owner_name, flat_number, wing, owner_phone, vehicle_type,
+            registered_by_guard, status, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE,'active',$10)
+         ON CONFLICT (account_id, vehicle_number)
+         DO UPDATE SET
+           member_id      = EXCLUDED.member_id,
+           user_id        = EXCLUDED.user_id,
+           owner_name     = EXCLUDED.owner_name,
+           flat_number    = EXCLUDED.flat_number,
+           wing           = EXCLUDED.wing,
+           owner_phone    = EXCLUDED.owner_phone,
+           vehicle_type   = EXCLUDED.vehicle_type,
+           status         = 'active',
+           updated_at     = NOW()`,
+        [
+          accountId,
+          memberId,
+          identity.userId,
+          v.number,
+          identity.name,
+          identity.flatNumber,
+          identity.wing,
+          identity.phone,
+          v.type,
+          actorUserId,
+        ],
+      );
+    }
+  }
+}
+// ─── END NEW helpers ──────────────────────────────────────────────────────
+
 const fail = (res, status, code, message) =>
   res.status(status).json({ code, message });
 
@@ -126,6 +333,8 @@ function shapeMemberRow(row, payment) {
     area_sqft: row.area_sqft ?? null,
     parking_available: !!row.parking_available,
     maintenance_amount: Number(row.maintenance_amount) || 0,
+    // ─── NEW: vehicle list (populated by listMembers/getMember) ─────────
+    vehicles: Array.isArray(row.vehicles) ? row.vehicles : [],
     status: row.status,
     created_by: row.created_by,
     created_at: row.created_at,
@@ -360,6 +569,37 @@ const listMembers = async (req, res) => {
         ORDER BY m.flat_number, u.name`,
       [accountId]);
 
+    // ─── NEW: batch-load vehicles for all members in one query ──────────
+    const memberIds = rows.map((r) => r.id);
+    const vehiclesByMember = new Map();
+    if (memberIds.length > 0) {
+      const { rows: vehicleRows } = await pool.query(
+        `SELECT id, member_id, vehicle_number, vehicle_type,
+                owner_name, flat_number, wing, owner_phone, registered_by_guard
+           FROM vehicles
+          WHERE account_id = $1
+            AND member_id = ANY($2::uuid[])
+            AND status = 'active'
+          ORDER BY created_at ASC`,
+        [accountId, memberIds],
+      );
+      for (const v of vehicleRows) {
+        if (!vehiclesByMember.has(v.member_id)) {
+          vehiclesByMember.set(v.member_id, []);
+        }
+        vehiclesByMember.get(v.member_id).push({
+          id: v.id,
+          number: v.vehicle_number,
+          type: v.vehicle_type,
+          owner_name: v.owner_name,
+          flat_number: v.flat_number,
+          wing: v.wing,
+          owner_phone: v.owner_phone,
+          registered_by_guard: !!v.registered_by_guard,
+        });
+      }
+    }
+
     const { rows: payRows } = await pool.query(
       `SELECT mmp.member_id, mmp.month, mmp.status, mmp.paid_date,
               mmp.additional_amount, mmp.additional_note,
@@ -372,7 +612,12 @@ const listMembers = async (req, res) => {
     const paymentByMember = new Map();
     for (const p of payRows) paymentByMember.set(p.member_id, p);
 
-    const result = rows.map((m) => shapeMemberRow(m, paymentByMember.get(m.id) ?? null));
+    const result = rows.map((m) =>
+      shapeMemberRow(
+        { ...m, vehicles: vehiclesByMember.get(m.id) ?? [] },
+        paymentByMember.get(m.id) ?? null,
+      ),
+    );
 
     if (role === "owner" || role === "admin") return res.json(result);
 
@@ -438,7 +683,10 @@ const getMember = async (req, res) => {
       [id, accountId]);
 
     if (!rows.length) return fail(res, 404, "not_found", "Member not found");
-    const member = shapeMemberRow(rows[0], null);
+
+    // ─── NEW: load vehicles for this member ─────────────────────────────
+    const vehicles = await loadVehiclesForMember({ query: pool.query.bind(pool) }, id);
+    const member = shapeMemberRow({ ...rows[0], vehicles }, null);
 
     if (role === "owner" || role === "admin") return res.json(member);
 
@@ -490,9 +738,23 @@ const createMember = async (req, res) => {
     if (!memberRole) return fail(res, 400, "invalid_input", "Member role is required");
     if (memberRole.length > 60) return fail(res, 400, "invalid_input", "Member role is too long");
 
+    // ─── NEW: validate vehicles up-front so we don't open a transaction ─
+    const vehiclesCheck = normalizeVehiclesInput(body.vehicles);
+    if (!vehiclesCheck.ok) {
+      return fail(res, 400, "invalid_input", vehiclesCheck.error);
+    }
+    const incomingVehicles = vehiclesCheck.value;
+
+    if (parking_available && incomingVehicles.length === 0) {
+      return fail(res, 400, "invalid_input",
+        "Add at least one vehicle number since parking is available");
+    }
+
     await client.query("BEGIN");
 
     let targetUserId = null;
+    let targetName = "";
+    let targetPhone = "";
 
     if (mode === "existing") {
       targetUserId = body.user_id || null;
@@ -501,11 +763,13 @@ const createMember = async (req, res) => {
         return fail(res, 400, "invalid_input", "user_id is required for mode=existing");
       }
       const { rows: u } = await client.query(
-        `SELECT id FROM users WHERE id=$1 LIMIT 1`, [targetUserId]);
+        `SELECT id, name, phone FROM users WHERE id=$1 LIMIT 1`, [targetUserId]);
       if (!u.length) {
         await client.query("ROLLBACK");
         return fail(res, 404, "not_found", "Person not found");
       }
+      targetName = u[0].name ?? "";
+      targetPhone = (u[0].phone ?? "").replace(/\D/g, "").slice(-10);
     } else {
       const name = (body.name || "").trim();
       const phone = normalizePhone(body.phone);
@@ -521,6 +785,8 @@ const createMember = async (req, res) => {
       }
 
       targetUserId = await ensureUserForPhone(client, phone, name);
+      targetName = name;
+      targetPhone = phone;
 
       if (photo_url !== null && photo_url !== undefined) {
         await client.query(
@@ -541,6 +807,32 @@ const createMember = async (req, res) => {
        area_sqft, parking_available, maintenance_amount, userId]);
 
     const memberId = rows[0].id;
+
+    // ─── NEW: persist vehicles if parking_available ─────────────────────
+    if (parking_available && incomingVehicles.length > 0) {
+      try {
+        await replaceMemberVehicles(
+          client,
+          accountId,
+          memberId,
+          incomingVehicles,
+          {
+            name: targetName,
+            flatNumber: flat_number,
+            wing,
+            phone: targetPhone,
+            userId: targetUserId,
+          },
+          userId,
+        );
+      } catch (vehErr) {
+        await client.query("ROLLBACK");
+        if (vehErr?.code === "vehicle_conflict") {
+          return fail(res, 409, "vehicle_conflict", vehErr.message);
+        }
+        throw vehErr;
+      }
+    }
 
     const { rows: joined } = await client.query(
       `SELECT m.id, m.account_id, m.user_id, m.role,
@@ -567,12 +859,24 @@ const createMember = async (req, res) => {
       entityId: memberId,
       action: "create",
       after: joined[0],
-      metadata: { role: memberRole, flat_number },
+      metadata: {
+        role: memberRole,
+        flat_number,
+        vehicles: incomingVehicles.map((v) => v.number),
+      },
       visibility: "admin",
     });
 
     await client.query("COMMIT");
-    return res.status(201).json(shapeMemberRow(joined[0], null));
+
+    // Return the final shape (with vehicles) using the same connection pool
+    const vehicles = await loadVehiclesForMember(
+      { query: pool.query.bind(pool) },
+      memberId,
+    );
+    return res.status(201).json(
+      shapeMemberRow({ ...joined[0], vehicles }, null),
+    );
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("createMember error:", err);
@@ -636,8 +940,19 @@ const updateMember = async (req, res) => {
       updates.role = roleStr;
     }
 
+    // ─── NEW: parse incoming vehicles once ──────────────────────────────
+    const hasVehiclesField = Object.prototype.hasOwnProperty.call(req.body, "vehicles");
+    let incomingVehicles = [];
+    if (hasVehiclesField) {
+      const check = normalizeVehiclesInput(req.body.vehicles);
+      if (!check.ok) {
+        return fail(res, 400, "invalid_input", check.error);
+      }
+      incomingVehicles = check.value;
+    }
+
     const nothingToUpdate =
-      Object.keys(updates).length === 0 && !hasName && !hasPhone && !hasPhoto;
+      Object.keys(updates).length === 0 && !hasName && !hasPhone && !hasPhoto && !hasVehiclesField;
     if (nothingToUpdate) return fail(res, 400, "invalid_input", "No permitted fields to update");
 
     await client.query("BEGIN");
@@ -697,6 +1012,58 @@ const updateMember = async (req, res) => {
         [id, accountId]);
     }
 
+    // ─── NEW: sync vehicles if the client sent a vehicles[] array ──────
+    if (hasVehiclesField) {
+      // Determine the effective parking state
+      const effectiveParking =
+        updates.parking_available !== undefined
+          ? !!updates.parking_available
+          : !!beforeSnapshot?.parking_available;
+
+      if (!effectiveParking && incomingVehicles.length > 0) {
+        await client.query("ROLLBACK");
+        return fail(res, 400, "invalid_input",
+          "Cannot register vehicles when parking is not available");
+      }
+      if (effectiveParking && incomingVehicles.length === 0) {
+        await client.query("ROLLBACK");
+        return fail(res, 400, "invalid_input",
+          "Add at least one vehicle number since parking is available");
+      }
+
+      // Identity for denormalized fields (fall back to current row)
+      const identity = {
+        name: newName ?? beforeSnapshot?.name ?? "",
+        flatNumber:
+          updates.flat_number !== undefined
+            ? String(updates.flat_number ?? "")
+            : (beforeSnapshot?.flat_number ?? ""),
+        wing:
+          updates.wing !== undefined
+            ? (updates.wing ?? null)
+            : (beforeSnapshot?.wing ?? null),
+        phone: newPhone ?? ((beforeSnapshot?.phone ?? "").replace(/\D/g, "").slice(-10)),
+        userId: targetUserId,
+      };
+
+      try {
+        await replaceMemberVehicles(
+          client,
+          accountId,
+          id,
+          incomingVehicles,
+          identity,
+          userId,
+        );
+      } catch (vehErr) {
+        await client.query("ROLLBACK");
+        if (vehErr?.code === "vehicle_conflict") {
+          return fail(res, 409, "vehicle_conflict", vehErr.message);
+        }
+        throw vehErr;
+      }
+    }
+
     const { rows: joined } = await client.query(
       `SELECT m.id, m.account_id, m.user_id, m.role,
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
@@ -728,12 +1095,18 @@ const updateMember = async (req, res) => {
           hasPhone && "phone",
           hasPhoto && "photo_url",
         ].filter(Boolean),
+        vehiclesChanged: hasVehiclesField,
       },
       visibility: "participants",
     });
 
     await client.query("COMMIT");
-    return res.json(shapeMemberRow(joined[0], null));
+
+    const vehicles = await loadVehiclesForMember(
+      { query: pool.query.bind(pool) },
+      id,
+    );
+    return res.json(shapeMemberRow({ ...joined[0], vehicles }, null));
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("updateMember error:", err);
@@ -767,6 +1140,13 @@ const deleteMember = async (req, res) => {
       await client.query("ROLLBACK");
       return fail(res, 404, "not_found", "Member not found");
     }
+
+    // ─── NEW: soft-delete the member's vehicles too ────────────────────
+    await client.query(
+      `UPDATE vehicles SET status='inactive', updated_at=NOW()
+        WHERE account_id=$1 AND member_id=$2 AND status='active'`,
+      [accountId, id],
+    );
 
     const targetUserId = updated.rows[0]?.user_id;
 
@@ -1454,8 +1834,6 @@ const upsertStaffAttendance = async (req, res) => {
        RETURNING *`,
       [accountId, staffId, month, JSON.stringify(statuses), paidDays, calculatedSalary, userId]);
 
-    // NOTE: Attendance is intentionally NOT written to audit_log.
-
     await client.query("COMMIT");
 
     const attendanceRow = rows[0];
@@ -1802,7 +2180,6 @@ const createExpense = async (req, res) => {
       visibility: "public",
     });
 
-    // ─── PUSH: schedule / cancel reminder ──────────────────────────────────
     if (rows[0].reminder_enabled && rows[0].status === "due") {
       await upsertExpenseReminder(client, {
         accountId,
@@ -1818,7 +2195,6 @@ const createExpense = async (req, res) => {
     } else {
       await cancelExpenseReminder(client, rows[0].id);
     }
-    // ─── END PUSH ──────────────────────────────────────────────────────────
 
     await client.query("COMMIT");
     return res.status(201).json(rows[0]);
@@ -1901,7 +2277,6 @@ const updateExpense = async (req, res) => {
       visibility: "public",
     });
 
-    // ─── PUSH: reschedule / cancel reminder ────────────────────────────────
     const after = updated.rows[0];
     if (after.reminder_enabled && after.status === "due") {
       await upsertExpenseReminder(client, {
@@ -1918,7 +2293,6 @@ const updateExpense = async (req, res) => {
     } else {
       await cancelExpenseReminder(client, after.id);
     }
-    // ─── END PUSH ──────────────────────────────────────────────────────────
 
     await client.query("COMMIT");
     return res.json(updated.rows[0]);
@@ -1959,9 +2333,7 @@ const deleteExpense = async (req, res) => {
       return fail(res, 404, "not_found", "Expense not found");
     }
 
-    // ─── PUSH: cancel any pending reminder ─────────────────────────────────
     await cancelExpenseReminder(client, id);
-    // ─── END PUSH ──────────────────────────────────────────────────────────
 
     await writeAudit(client, {
       accountId,
@@ -1986,6 +2358,353 @@ const deleteExpense = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// ─── NEW: VEHICLES + GATE ENTRY ─────────────────────────────────────────
+// ===========================================================================
+
+/**
+ * GET /management/:accountId/vehicles/lookup?number=KA01AB1234
+ *
+ * Returns:
+ *   { found: true, owner: {...} }              — one match
+ *   { found: true, matches: [...] }            — multiple matches (rare)
+ *   { found: false }                           — none
+ *
+ * Access: any active member of the account (owner, admin, or staff).
+ */
+const lookupVehicle = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const raw =
+      (req.query?.number ?? req.query?.vehicle_number ?? req.body?.number ?? "");
+    const number = normalizeVehicleNumber(raw);
+    if (!number) {
+      return fail(res, 400, "invalid_input", "Vehicle number is required");
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id, member_id, user_id, vehicle_number, owner_name, flat_number,
+              wing, owner_phone, vehicle_type, registered_by_guard,
+              created_at, updated_at
+         FROM vehicles
+        WHERE account_id = $1 AND vehicle_number = $2 AND status = 'active'
+        ORDER BY created_at ASC`,
+      [accountId, number]);
+
+    if (rows.length === 0) {
+      return res.json({
+        found: false,
+        vehicle_number: number,
+      });
+    }
+
+    const shaped = rows.map((r) => ({
+      vehicle_id: r.id,
+      member_id: r.member_id,
+      user_id: r.user_id,
+      vehicle_number: r.vehicle_number,
+      owner_name: r.owner_name || "",
+      flat_number: r.flat_number || "",
+      wing: r.wing,
+      owner_phone: r.owner_phone || "",
+      vehicle_type: r.vehicle_type,
+      registered_by_guard: !!r.registered_by_guard,
+    }));
+
+    return res.json({
+      found: true,
+      vehicle_number: number,
+      owner: shaped[0],      // convenience: first match
+      matches: shaped,       // all matches (usually just one)
+    });
+  } catch (err) {
+    console.error("lookupVehicle error:", err);
+    return fail(res, 500, "server_error", "Failed to look up vehicle");
+  }
+};
+
+/**
+ * POST /management/:accountId/vehicles
+ *
+ * Guard-side registration. Body:
+ *   { vehicleNumber, name, flatNumber, phone, wing?, type? }
+ *
+ * Any active member (owner/admin/staff) can register a vehicle. The
+ * record is marked registered_by_guard = TRUE.
+ */
+const registerVehicle = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const body = req.body || {};
+    const number = normalizeVehicleNumber(
+      body.vehicleNumber ?? body.vehicle_number ?? body.number ?? "",
+    );
+    const name = String(body.name ?? "").trim();
+    const flatNumber = String(body.flatNumber ?? body.flat_number ?? "").trim();
+    const wing = body.wing ? String(body.wing).trim() : null;
+    const phone = normalizePhone(body.phone ?? body.ownerPhone ?? body.owner_phone);
+    const type = normalizeVehicleType(body.type ?? body.vehicle_type);
+
+    if (!number) return fail(res, 400, "invalid_input", "Vehicle number is required");
+    if (number.length < 5 || number.length > 15) {
+      return fail(res, 400, "invalid_input", "Vehicle number is not valid");
+    }
+    if (!name) return fail(res, 400, "invalid_input", "Owner name is required");
+    if (!flatNumber) return fail(res, 400, "invalid_input", "Flat number is required");
+    if (!phone) return fail(res, 400, "invalid_input", "A valid 10-digit phone is required");
+
+    await client.query("BEGIN");
+
+    // Reuse an existing row for this account+number if one exists (even
+    // inactive), so we don't fight the unique constraint.
+    const { rows: existing } = await client.query(
+      `SELECT id, status FROM vehicles
+        WHERE account_id = $1 AND vehicle_number = $2`,
+      [accountId, number],
+    );
+
+    let vehicleId;
+    if (existing.length > 0) {
+      vehicleId = existing[0].id;
+      await client.query(
+        `UPDATE vehicles SET
+           owner_name = $1,
+           flat_number = $2,
+           wing = $3,
+           owner_phone = $4,
+           vehicle_type = $5,
+           registered_by_guard = TRUE,
+           status = 'active',
+           updated_at = NOW()
+         WHERE id = $6`,
+        [name, flatNumber, wing, phone, type, vehicleId],
+      );
+    } else {
+      const { rows } = await client.query(
+        `INSERT INTO vehicles
+           (account_id, member_id, user_id, vehicle_number,
+            owner_name, flat_number, wing, owner_phone, vehicle_type,
+            registered_by_guard, status, created_by)
+         VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, TRUE, 'active', $8)
+         RETURNING id`,
+        [accountId, number, name, flatNumber, wing, phone, type, userId],
+      );
+      vehicleId = rows[0].id;
+    }
+
+    // Best-effort: try to match a member row so future lookups can link back.
+    const { rows: memberMatch } = await client.query(
+      `SELECT m.id, m.user_id
+         FROM members m JOIN users u ON u.id = m.user_id
+        WHERE m.account_id = $1
+          AND m.flat_number = $2
+          AND m.status = 'active'
+          AND (u.phone LIKE $3 OR u.phone LIKE $4)
+        LIMIT 1`,
+      [accountId, flatNumber, `%${phone}`, `91${phone}`],
+    );
+    if (memberMatch.length > 0) {
+      await client.query(
+        `UPDATE vehicles SET member_id = $1, user_id = $2, updated_at = NOW()
+          WHERE id = $3`,
+        [memberMatch[0].id, memberMatch[0].user_id, vehicleId],
+      );
+    }
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "vehicle",
+      entityId: vehicleId,
+      action: "create",
+      after: {
+        vehicle_number: number,
+        owner_name: name,
+        flat_number: flatNumber,
+        owner_phone: phone,
+        registered_by_guard: true,
+      },
+      metadata: { source: "guard_registration" },
+      visibility: "public",
+    });
+
+    await client.query("COMMIT");
+
+    return res.status(201).json({
+      success: true,
+      vehicle: {
+        vehicle_id: vehicleId,
+        vehicle_number: number,
+        owner_name: name,
+        flat_number: flatNumber,
+        wing,
+        owner_phone: phone,
+        vehicle_type: type,
+        registered_by_guard: true,
+      },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("registerVehicle error:", err);
+    return fail(res, 500, "server_error", "Failed to register vehicle");
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * POST /management/:accountId/gate-entries
+ *
+ * Body: { vehicleNumber, direction: "in" | "out" }
+ *
+ * Looks up the vehicle to snapshot owner info, then logs the entry.
+ * Any active member can log.
+ */
+const createGateEntry = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const body = req.body || {};
+    const number = normalizeVehicleNumber(
+      body.vehicleNumber ?? body.vehicle_number ?? body.number ?? "",
+    );
+    const directionRaw = String(body.direction ?? "in").toLowerCase().trim();
+    const direction = directionRaw === "out" ? "out" : "in";
+
+    if (!number) return fail(res, 400, "invalid_input", "Vehicle number is required");
+
+    // Optional: allow the client to pass a snapshot when it already looked up
+    // the vehicle (avoids a second read). If missing we do the lookup here.
+    let vehicleId = null;
+    let memberId = null;
+    let ownerName = null;
+    let flatNumber = null;
+    let ownerPhone = null;
+    let registered = false;
+
+    const passedOwner = body.owner && typeof body.owner === "object" ? body.owner : null;
+
+    if (passedOwner) {
+      vehicleId = passedOwner.vehicle_id ?? null;
+      memberId = passedOwner.member_id ?? null;
+      ownerName = passedOwner.owner_name ?? null;
+      flatNumber = passedOwner.flat_number ?? null;
+      ownerPhone = passedOwner.owner_phone ?? null;
+      registered = true;
+    } else {
+      const { rows } = await pool.query(
+        `SELECT id, member_id, owner_name, flat_number, owner_phone
+           FROM vehicles
+          WHERE account_id = $1 AND vehicle_number = $2 AND status = 'active'
+          LIMIT 1`,
+        [accountId, number],
+      );
+      if (rows.length > 0) {
+        vehicleId = rows[0].id;
+        memberId = rows[0].member_id;
+        ownerName = rows[0].owner_name;
+        flatNumber = rows[0].flat_number;
+        ownerPhone = rows[0].owner_phone;
+        registered = true;
+      }
+    }
+
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `INSERT INTO gate_entries
+         (account_id, vehicle_number, vehicle_id, member_id,
+          owner_name, flat_number, owner_phone, registered, direction, scanned_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING id, scanned_at`,
+      [
+        accountId,
+        number,
+        vehicleId,
+        memberId,
+        ownerName,
+        flatNumber,
+        ownerPhone,
+        registered,
+        direction,
+        userId,
+      ],
+    );
+
+    await client.query("COMMIT");
+
+    return res.status(201).json({
+      success: true,
+      entry_id: rows[0].id,
+      scanned_at: rows[0].scanned_at,
+      registered,
+      vehicle_number: number,
+      direction,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("createGateEntry error:", err);
+    return fail(res, 500, "server_error", "Failed to log gate entry");
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * GET /management/:accountId/gate-entries?limit=50
+ */
+const listGateEntries = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const limitRaw = Number(req.query?.limit ?? 50);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(Math.max(Math.trunc(limitRaw), 1), 200)
+      : 50;
+
+    const { rows } = await pool.query(
+      `SELECT id, vehicle_number, vehicle_id, member_id,
+              owner_name, flat_number, owner_phone,
+              registered, direction, scanned_by, scanned_at
+         FROM gate_entries
+        WHERE account_id = $1
+        ORDER BY scanned_at DESC
+        LIMIT $2`,
+      [accountId, limit],
+    );
+
+    return res.json(rows);
+  } catch (err) {
+    console.error("listGateEntries error:", err);
+    return fail(res, 500, "server_error", "Failed to load gate entries");
+  }
+};
+
 module.exports = {
   listAccountPeople,
   listMembers, getMember, createMember, updateMember, deleteMember,
@@ -1994,4 +2713,9 @@ module.exports = {
   getStaffAttendance, upsertStaffAttendance,
   upsertMemberPayment, upsertStaffPayment,
   listExpenses, getExpense, createExpense, updateExpense, deleteExpense,
+  // ─── NEW ────────────────────────────────────────────────────────────
+  lookupVehicle,
+  registerVehicle,
+  createGateEntry,
+  listGateEntries,
 };

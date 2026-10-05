@@ -9,6 +9,8 @@
 --   • staff_attendance            — one row per staff per month (attendance)
 --   • staff_monthly_payments      — one row per staff per month (paid/due)
 --   • member_phone_visibility     — per-member phone visibility allow-list
+--   • vehicles                    — registered vehicles per flat / account
+--   • gate_entries                — log of every vehicle scan at the gate
 --
 -- Identity (name, phone, photo_url) lives on `users`. Members and staff
 -- carry a `user_id` FK instead.
@@ -312,3 +314,114 @@ CREATE INDEX IF NOT EXISTS idx_phone_vis_viewer
 
 CREATE INDEX IF NOT EXISTS idx_phone_vis_account
     ON member_phone_visibility(account_id);
+
+
+-- -----------------------------------------------------------------------------
+-- 8. VEHICLES  (per-flat registered vehicles)
+--
+-- One row per vehicle. A flat can register multiple vehicles when
+-- parking_available = TRUE. Guard-side registrations (registered_by_guard)
+-- are allowed even when a member row doesn't exist yet — flat_number/name/phone
+-- are stored denormalized so the guard can add entries without admin approval.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS vehicles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    account_id UUID NOT NULL
+        REFERENCES accounts(id)
+        ON DELETE CASCADE,
+
+    -- Optional link to the member (owner of the flat). NULL when a guard
+    -- registers a vehicle before the member row exists.
+    member_id UUID
+        REFERENCES members(id)
+        ON DELETE SET NULL,
+
+    -- Optional link to the user (the actual person). NULL for guard-registered.
+    user_id UUID
+        REFERENCES users(id)
+        ON DELETE SET NULL,
+
+    vehicle_number VARCHAR(20) NOT NULL,
+
+    -- Denormalized identity so guard lookups never need a join to succeed.
+    owner_name VARCHAR(200) NOT NULL DEFAULT '',
+    flat_number VARCHAR(50) NOT NULL DEFAULT '',
+    wing VARCHAR(50),
+    owner_phone VARCHAR(20) NOT NULL DEFAULT '',
+
+    vehicle_type VARCHAR(20) NOT NULL DEFAULT 'car'
+        CHECK (vehicle_type IN ('car', 'bike', 'other')),
+
+    registered_by_guard BOOLEAN NOT NULL DEFAULT FALSE,
+
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'inactive')),
+
+    created_by UUID
+        REFERENCES users(id)
+        ON DELETE SET NULL,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- One vehicle number can only exist once per account (case-insensitive
+    -- handled in the controller by upper-casing before insert/lookup).
+    UNIQUE (account_id, vehicle_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vehicles_account_id
+    ON vehicles(account_id);
+
+CREATE INDEX IF NOT EXISTS idx_vehicles_member_id
+    ON vehicles(member_id);
+
+CREATE INDEX IF NOT EXISTS idx_vehicles_number
+    ON vehicles(account_id, vehicle_number);
+
+CREATE INDEX IF NOT EXISTS idx_vehicles_flat
+    ON vehicles(account_id, flat_number);
+
+
+-- -----------------------------------------------------------------------------
+-- 9. GATE ENTRIES  (log every scan — registered or not)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS gate_entries (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    account_id UUID NOT NULL
+        REFERENCES accounts(id)
+        ON DELETE CASCADE,
+
+    vehicle_number VARCHAR(20) NOT NULL,
+
+    -- Snapshot of who/what was matched at scan time
+    vehicle_id UUID
+        REFERENCES vehicles(id)
+        ON DELETE SET NULL,
+
+    member_id UUID
+        REFERENCES members(id)
+        ON DELETE SET NULL,
+
+    owner_name VARCHAR(200),
+    flat_number VARCHAR(50),
+    owner_phone VARCHAR(20),
+
+    registered BOOLEAN NOT NULL DEFAULT FALSE,
+    direction VARCHAR(10) NOT NULL DEFAULT 'in'
+        CHECK (direction IN ('in', 'out')),
+
+    -- Guard who logged it
+    scanned_by UUID
+        REFERENCES users(id)
+        ON DELETE SET NULL,
+
+    scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_account_time
+    ON gate_entries(account_id, scanned_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_vehicle
+    ON gate_entries(account_id, vehicle_number);
