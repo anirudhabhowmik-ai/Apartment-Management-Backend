@@ -15,10 +15,9 @@ const {
 router.use(authenticate);
 
 // Cache the resolved subscription on req for all account-scoped routes below.
-// This is a single DB read per request, reused by all enforce* middlewares.
 router.use("/:accountId", attachSubscription);
 
-// ---------------- People (owner + admins + members + staff) ----------------
+// ---------------- People ----------------
 router.get("/:accountId/people", c.listAccountPeople);
 
 // ---------------- Members ----------------
@@ -43,7 +42,6 @@ router.patch("/:accountId/staff/:id", enforceStaffWritable, c.updateStaff);
 router.delete("/:accountId/staff/:id", enforceStaffWritable, c.deleteStaff);
 
 // ---------------- Staff Attendance ----------------
-// Attendance is a sub-resource of staff; guard it the same as staff writes
 router.get("/:accountId/staff/:id/attendance/:month", c.getStaffAttendance);
 router.put(
   "/:accountId/staff/:id/attendance/:month",
@@ -59,7 +57,6 @@ router.put(
 );
 
 // ---------------- Expenses ----------------
-// Expenses are NOT part of the plan limits — no middleware needed
 router.get("/:accountId/expenses", c.listExpenses);
 router.get("/:accountId/expenses/:id", c.getExpense);
 router.post("/:accountId/expenses", c.createExpense);
@@ -67,15 +64,45 @@ router.patch("/:accountId/expenses/:id", c.updateExpense);
 router.delete("/:accountId/expenses/:id", c.deleteExpense);
 
 // ---------------- Vehicles ----------------
-// Any active member (owner / admin / staff) can look up a vehicle at the gate.
-// Registration is also open to any active member because guards must be able
-// to add unregistered vehicles on the spot.
+// IMPORTANT: /vehicles/lookup must be declared before any /vehicles/:id.
 router.get("/:accountId/vehicles/lookup", c.lookupVehicle);
+router.get("/:accountId/vehicles/check-conflict", c.checkVehicleConflict);
 router.post("/:accountId/vehicles", c.registerVehicle);
 
 // ---------------- Gate Entries ----------------
-// Every scan is logged. Reads are capped to the last N entries by the controller.
 router.post("/:accountId/gate-entries", c.createGateEntry);
 router.get("/:accountId/gate-entries", c.listGateEntries);
+
+// Approval flow
+router.get("/:accountId/gate-entries/:id/status", c.getGateEntryStatus);
+router.post("/:accountId/gate-entries/:id/approve", c.approveGateEntry);
+router.post("/:accountId/gate-entries/:id/reject", c.rejectGateEntry);
+router.post("/:accountId/gate-entries/:id/override", c.overrideGateEntry);
+
+// ---------------- Gate Authorizations ----------------
+// IMPORTANT: /match must come BEFORE /:id.
+router.post("/:accountId/gate-authorizations/match", c.matchAuthorization);
+router.post("/:accountId/gate-authorizations", c.createAuthorization);
+router.get("/:accountId/gate-authorizations", c.listAuthorizations);
+router.patch(
+  "/:accountId/gate-authorizations/:id",
+  c.updateAuthorization,
+);
+router.delete(
+  "/:accountId/gate-authorizations/:id",
+  c.deleteAuthorization,
+);
+
+// ---------------- Gate Invites ----------------
+// IMPORTANT: /by-code/:code must come BEFORE /:id.
+router.post("/:accountId/gate-invites", c.createInvite);
+router.get("/:accountId/gate-invites", c.listInvites);
+router.get("/:accountId/gate-invites/by-code/:code", c.lookupInviteByCode);
+router.patch(
+  "/:accountId/gate-invites/:id",
+  c.updateInvite,
+);
+router.get("/:accountId/gate-invites/:id", c.getInvite);
+router.delete("/:accountId/gate-invites/:id", c.deleteInvite);
 
 module.exports = router;

@@ -9,7 +9,6 @@ const { writeAudit } = require("../controllers/auditController");
 
 const expo = new Expo();
 
-// How many days in a row to remind while an expense is still 'due'.
 const MAX_REMINDER_DAYS = 7;
 
 // ============================================================================
@@ -65,7 +64,6 @@ async function deliverPendingNotifications() {
 
     const userIds = [...new Set(pending.map((n) => n.user_id))];
 
-    // Only fetch tokens for users who haven't turned push off.
     const { rows: tokenRows } = await client.query(
       `SELECT t.user_id, t.token
          FROM user_push_tokens t
@@ -239,8 +237,8 @@ async function runDueReminders() {
             WHERE entity_type = 'expense'
               AND entity_id = $1
               AND action = 'expense_reminder'
-              AND created_at > NOW() - INTERVAL '${MAX_REMINDER_DAYS} days'`,
-          [r.entity_id],
+              AND created_at > NOW() - ($2 || ' days')::interval`,
+          [r.entity_id, String(MAX_REMINDER_DAYS)],
         );
         const remindersSent = countRows[0]?.c ?? 0;
 
@@ -309,7 +307,110 @@ async function cancelExpenseReminder(client, expenseId) {
 }
 
 // ============================================================================
-// 5. STARTUP
+// 5. GATE NOTIFICATIONS
+// ============================================================================
+
+async function sendGateNotification(userIds, { title, body, data = {} }) {
+  const ids = Array.isArray(userIds)
+    ? userIds.filter(Boolean)
+    : [userIds].filter(Boolean);
+  if (ids.length === 0) return { sent: 0, dead: 0 };
+
+  const { rows: tokenRows } = await pool.query(
+    `SELECT t.user_id, t.token
+       FROM user_push_tokens t
+      WHERE t.user_id = ANY($1::uuid[])
+        AND NOT EXISTS (
+          SELECT 1 FROM notification_preferences np
+           WHERE np.user_id = t.user_id
+             AND np.preference_key = 'push_enabled'
+             AND np.enabled = FALSE
+        )`,
+    [ids],
+  );
+
+  const messages = [];
+  for (const t of tokenRows) {
+    if (!Expo.isExpoPushToken(t.token)) continue;
+    messages.push({
+      to: t.token,
+      sound: "default",
+      title,
+      body: body || undefined,
+      channelId: "default",
+      priority: "high",
+      data,
+    });
+  }
+
+  if (messages.length === 0) return { sent: 0, dead: 0 };
+
+  let sent = 0;
+  const deadTokens = new Set();
+
+  const chunks = expo.chunkPushNotifications(messages);
+  for (const chunk of chunks) {
+    try {
+      const tickets = await expo.sendPushNotificationsAsync(chunk);
+      tickets.forEach((ticket, i) => {
+        if (ticket.status === "ok") sent++;
+        if (
+          ticket.status === "error" &&
+          ticket.details &&
+          ticket.details.error === "DeviceNotRegistered"
+        ) {
+          deadTokens.add(chunk[i].to);
+        }
+      });
+    } catch (e) {
+      console.error("[push] sendGateNotification failed:", e.message);
+    }
+  }
+
+  if (deadTokens.size > 0) {
+    await pool.query(
+      `DELETE FROM user_push_tokens WHERE token = ANY($1::text[])`,
+      [[...deadTokens]],
+    );
+  }
+
+  return { sent, dead: deadTokens.size };
+}
+
+/**
+ * Notify a resident about a gate visitor.
+ * ✅ NEW: forwards guestCount + vehicles[] through data.
+ */
+async function notifyMemberForGate(memberUserId, {
+  title,
+  body,
+  entryId,
+  accountId,
+  visitorName,
+  vehicleNumber,
+  flatNumber,
+  guestCount,
+  vehicles,
+}) {
+  if (!memberUserId) return { sent: 0, dead: 0 };
+  return sendGateNotification([memberUserId], {
+    title: title || "Visitor at gate",
+    body: body || `${visitorName || "A visitor"} is at the gate`,
+    data: {
+      type: "gate_approval",
+      entryId,
+      accountId,
+      visitorName,
+      vehicleNumber,
+      flatNumber,
+      guestCount: guestCount ?? 1,
+      vehicles: Array.isArray(vehicles) ? vehicles : [],
+    },
+  });
+}
+
+// ============================================================================
+// 6. STARTUP
 // ============================================================================
 
 let started = false;
@@ -340,5 +441,7 @@ module.exports = {
   runDueReminders,
   upsertExpenseReminder,
   cancelExpenseReminder,
+  sendGateNotification,
+  notifyMemberForGate,
   startPushWorker,
 };

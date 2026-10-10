@@ -1,30 +1,3 @@
--- =============================================================================
--- management.sql
---
--- Everything for member / staff / expense management:
---   • members                     — flat residents (per-record only; identity on users)
---   • staff                       — workers hired by the society
---   • expenses                    — bills the society pays
---   • member_monthly_payments     — one row per member per month (paid/due)
---   • staff_attendance            — one row per staff per month (attendance)
---   • staff_monthly_payments      — one row per staff per month (paid/due)
---   • member_phone_visibility     — per-member phone visibility allow-list
---   • vehicles                    — registered vehicles per flat / account
---   • gate_entries                — log of every vehicle scan at the gate
---
--- Identity (name, phone, photo_url) lives on `users`. Members and staff
--- carry a `user_id` FK instead.
---
--- Depends on (must exist first):
---   • users            (auth.sql)
---   • accounts         (account.sql)
---   • account_members  (roles.sql)
--- =============================================================================
-
-
--- -----------------------------------------------------------------------------
--- 1. MEMBERS
--- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS members (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -112,7 +85,6 @@ CREATE INDEX IF NOT EXISTS idx_staff_account_status
 
 -- -----------------------------------------------------------------------------
 -- 3. EXPENSES
--- due_date has been removed. expense_date is the single date column.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS expenses (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -317,12 +289,7 @@ CREATE INDEX IF NOT EXISTS idx_phone_vis_account
 
 
 -- -----------------------------------------------------------------------------
--- 8. VEHICLES  (per-flat registered vehicles)
---
--- One row per vehicle. A flat can register multiple vehicles when
--- parking_available = TRUE. Guard-side registrations (registered_by_guard)
--- are allowed even when a member row doesn't exist yet — flat_number/name/phone
--- are stored denormalized so the guard can add entries without admin approval.
+-- 8. VEHICLES
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS vehicles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -331,20 +298,16 @@ CREATE TABLE IF NOT EXISTS vehicles (
         REFERENCES accounts(id)
         ON DELETE CASCADE,
 
-    -- Optional link to the member (owner of the flat). NULL when a guard
-    -- registers a vehicle before the member row exists.
     member_id UUID
         REFERENCES members(id)
         ON DELETE SET NULL,
 
-    -- Optional link to the user (the actual person). NULL for guard-registered.
     user_id UUID
         REFERENCES users(id)
         ON DELETE SET NULL,
 
     vehicle_number VARCHAR(20) NOT NULL,
 
-    -- Denormalized identity so guard lookups never need a join to succeed.
     owner_name VARCHAR(200) NOT NULL DEFAULT '',
     flat_number VARCHAR(50) NOT NULL DEFAULT '',
     wing VARCHAR(50),
@@ -365,8 +328,6 @@ CREATE TABLE IF NOT EXISTS vehicles (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    -- One vehicle number can only exist once per account (case-insensitive
-    -- handled in the controller by upper-casing before insert/lookup).
     UNIQUE (account_id, vehicle_number)
 );
 
@@ -383,8 +344,128 @@ CREATE INDEX IF NOT EXISTS idx_vehicles_flat
     ON vehicles(account_id, flat_number);
 
 
+CREATE TABLE IF NOT EXISTS gate_authorizations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    account_id UUID NOT NULL
+        REFERENCES accounts(id)
+        ON DELETE CASCADE,
+
+    member_id UUID
+        REFERENCES members(id)
+        ON DELETE SET NULL,
+    wing VARCHAR(50),
+    flat_number VARCHAR(50) NOT NULL,
+
+    created_by UUID NOT NULL
+        REFERENCES users(id)
+        ON DELETE RESTRICT,
+
+    category VARCHAR(30) NOT NULL
+        CHECK (category IN ('delivery','helper','guest','cab','service','other')),
+
+    pass_mode VARCHAR(10) NOT NULL DEFAULT 'open'
+        CHECK (pass_mode IN ('open','named')),
+
+    visitor_name VARCHAR(200),
+    visitor_phone VARCHAR(20),
+    vehicle_number VARCHAR(20),
+    vehicles JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+    guest_count INTEGER NOT NULL DEFAULT 1,
+
+    valid_from  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_until TIMESTAMPTZ NOT NULL,
+
+    used_count  INTEGER NOT NULL DEFAULT 0,
+
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','expired','cancelled')),
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_auth_account_status
+    ON gate_authorizations(account_id, status, valid_until);
+
+CREATE INDEX IF NOT EXISTS idx_gate_auth_lookup
+    ON gate_authorizations(account_id, flat_number, status);
+
+CREATE INDEX IF NOT EXISTS idx_gate_auth_member
+    ON gate_authorizations(member_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_gate_auth_created_by
+    ON gate_authorizations(created_by, status);
+
+CREATE INDEX IF NOT EXISTS idx_gate_auth_match
+    ON gate_authorizations(account_id, flat_number, category, pass_mode, status);
+
+CREATE INDEX IF NOT EXISTS idx_gate_auth_vehicles_gin
+    ON gate_authorizations USING GIN (vehicles jsonb_path_ops);
+
+
 -- -----------------------------------------------------------------------------
--- 9. GATE ENTRIES  (log every scan — registered or not)
+-- 10. GATE INVITES  (QR-code guest invites)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS gate_invites (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    account_id UUID NOT NULL
+        REFERENCES accounts(id)
+        ON DELETE CASCADE,
+
+    created_by UUID NOT NULL
+        REFERENCES users(id)
+        ON DELETE RESTRICT,
+
+    member_id UUID
+        REFERENCES members(id)
+        ON DELETE SET NULL,
+    wing VARCHAR(50),
+    flat_number VARCHAR(50) NOT NULL,
+
+    guest_name VARCHAR(200) NOT NULL,
+    guest_phone VARCHAR(20),
+    purpose VARCHAR(40) NOT NULL DEFAULT 'guest'
+        CHECK (purpose IN ('guest','delivery','cab','service','other')),
+    guest_count INTEGER NOT NULL DEFAULT 1,
+    vehicle_number VARCHAR(20),
+    vehicles JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+    valid_from  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_until TIMESTAMPTZ NOT NULL,
+
+    code VARCHAR(24) NOT NULL UNIQUE,
+
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','used','expired','cancelled')),
+    used_at TIMESTAMPTZ,
+    used_by UUID
+        REFERENCES users(id)
+        ON DELETE SET NULL,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_invites_account_status
+    ON gate_invites(account_id, status, valid_until);
+
+CREATE INDEX IF NOT EXISTS idx_gate_invites_code
+    ON gate_invites(code);
+
+CREATE INDEX IF NOT EXISTS idx_gate_invites_created_by
+    ON gate_invites(created_by, status);
+
+CREATE INDEX IF NOT EXISTS idx_gate_invites_vehicles_gin
+    ON gate_invites USING GIN (vehicles jsonb_path_ops);
+
+
+-- -----------------------------------------------------------------------------
+-- 11. GATE ENTRIES  (log of guard-logged visitors)
+--
+-- NOTE: defined AFTER gate_authorizations and gate_invites so FKs resolve.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS gate_entries (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -395,7 +476,6 @@ CREATE TABLE IF NOT EXISTS gate_entries (
 
     vehicle_number VARCHAR(20) NOT NULL,
 
-    -- Snapshot of who/what was matched at scan time
     vehicle_id UUID
         REFERENCES vehicles(id)
         ON DELETE SET NULL,
@@ -412,12 +492,46 @@ CREATE TABLE IF NOT EXISTS gate_entries (
     direction VARCHAR(10) NOT NULL DEFAULT 'in'
         CHECK (direction IN ('in', 'out')),
 
-    -- Guard who logged it
     scanned_by UUID
         REFERENCES users(id)
         ON DELETE SET NULL,
 
-    scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    visitor_type VARCHAR(20) NOT NULL DEFAULT 'resident'
+        CHECK (visitor_type IN ('resident','visitor','invited_guest','delivery','cab','service','other')),
+    visitor_name VARCHAR(200),
+    visitor_phone VARCHAR(20),
+    purpose VARCHAR(40),
+    vehicle_type VARCHAR(20),
+
+    invite_id UUID
+        REFERENCES gate_invites(id) ON DELETE SET NULL,
+
+    authorization_id UUID
+        REFERENCES gate_authorizations(id) ON DELETE SET NULL,
+
+    rejected BOOLEAN NOT NULL DEFAULT FALSE,
+    notified BOOLEAN NOT NULL DEFAULT FALSE,
+
+    guests   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    vehicles JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+    status VARCHAR(30) NOT NULL DEFAULT 'auto_approved'
+        CHECK (status IN (
+            'auto_approved',
+            'invite_approved',
+            'pass_approved',
+            'pending_approval',
+            'approved',
+            'approved_by_guard_override',
+            'rejected'
+        )),
+
+    approved_by UUID
+        REFERENCES users(id) ON DELETE SET NULL,
+    approved_at TIMESTAMPTZ,
+    responded_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_gate_entries_account_time
@@ -425,3 +539,124 @@ CREATE INDEX IF NOT EXISTS idx_gate_entries_account_time
 
 CREATE INDEX IF NOT EXISTS idx_gate_entries_vehicle
     ON gate_entries(account_id, vehicle_number);
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_invite
+    ON gate_entries(invite_id);
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_authorization
+    ON gate_entries(authorization_id);
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_pending
+    ON gate_entries(account_id, status, scanned_at DESC)
+    WHERE status = 'pending_approval';
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_member
+    ON gate_entries(account_id, member_id, scanned_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_vehicles_gin
+    ON gate_entries USING GIN (vehicles jsonb_path_ops);
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_guests_gin
+    ON gate_entries USING GIN (guests jsonb_path_ops);
+
+
+-- =============================================================================
+-- 12. IDEMPOTENT MIGRATIONS
+--
+-- Safe to run against existing databases. Every statement is a no-op if the
+-- column / index / constraint already exists.
+-- =============================================================================
+
+-- ─── gate_authorizations: pass_mode, vehicles ─────────────────────────────
+ALTER TABLE gate_authorizations
+    ADD COLUMN IF NOT EXISTS pass_mode VARCHAR(10) NOT NULL DEFAULT 'open'
+        CHECK (pass_mode IN ('open','named')),
+    ADD COLUMN IF NOT EXISTS vehicles JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_gate_auth_match
+    ON gate_authorizations(account_id, flat_number, category, pass_mode, status);
+
+CREATE INDEX IF NOT EXISTS idx_gate_auth_vehicles_gin
+    ON gate_authorizations USING GIN (vehicles jsonb_path_ops);
+
+-- ─── gate_entries: authorization_id, guests, vehicles ─────────────────────
+ALTER TABLE gate_entries
+    ADD COLUMN IF NOT EXISTS authorization_id UUID
+        REFERENCES gate_authorizations(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS guests   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS vehicles JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_authorization
+    ON gate_entries(authorization_id);
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_vehicles_gin
+    ON gate_entries USING GIN (vehicles jsonb_path_ops);
+
+CREATE INDEX IF NOT EXISTS idx_gate_entries_guests_gin
+    ON gate_entries USING GIN (guests jsonb_path_ops);
+
+-- ─── gate_invites: vehicles ───────────────────────────────────────────────
+ALTER TABLE gate_invites
+    ADD COLUMN IF NOT EXISTS vehicles JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_gate_invites_vehicles_gin
+    ON gate_invites USING GIN (vehicles jsonb_path_ops);
+
+-- ─── Backfill: single vehicle_number → vehicles[] ─────────────────────────
+UPDATE gate_authorizations
+   SET vehicles = jsonb_build_array(
+         jsonb_build_object('number', vehicle_number, 'type', 'car')
+       )
+ WHERE jsonb_array_length(vehicles) = 0
+   AND vehicle_number IS NOT NULL
+   AND vehicle_number <> '';
+
+UPDATE gate_invites
+   SET vehicles = jsonb_build_array(
+         jsonb_build_object('number', vehicle_number, 'type', 'car')
+       )
+ WHERE jsonb_array_length(vehicles) = 0
+   AND vehicle_number IS NOT NULL
+   AND vehicle_number <> '';
+
+UPDATE gate_entries
+   SET vehicles = jsonb_build_array(
+         jsonb_build_object('number', vehicle_number, 'type', 'car')
+       )
+ WHERE jsonb_array_length(vehicles) = 0
+   AND vehicle_number IS NOT NULL
+   AND vehicle_number <> 'NO-VEHICLE';
+
+-- ─── Fix status CHECK on gate_entries (drop + re-add) ─────────────────────
+DO $$
+DECLARE
+  v_constraint_name TEXT;
+BEGIN
+  SELECT con.conname
+    INTO v_constraint_name
+    FROM pg_constraint con
+    JOIN pg_class rel ON rel.oid = con.conrelid
+    JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+   WHERE nsp.nspname = 'public'
+     AND rel.relname = 'gate_entries'
+     AND con.contype = 'c'
+     AND pg_get_constraintdef(con.oid) ILIKE '%status%';
+
+  IF v_constraint_name IS NOT NULL THEN
+    EXECUTE format('ALTER TABLE gate_entries DROP CONSTRAINT %I', v_constraint_name);
+  END IF;
+
+  ALTER TABLE gate_entries
+    ADD CONSTRAINT gate_entries_status_check
+    CHECK (status IN (
+      'auto_approved',
+      'invite_approved',
+      'pass_approved',
+      'pending_approval',
+      'approved',
+      'approved_by_guard_override',
+      'rejected'
+    ));
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;

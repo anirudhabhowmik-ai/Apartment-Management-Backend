@@ -9,7 +9,10 @@ const { writeAudit } = require("./auditController");
 const {
   upsertExpenseReminder,
   cancelExpenseReminder,
+  notifyMemberForGate,
+  sendGateNotification,
 } = require("../services/push");
+const crypto = require("crypto");
 
 const getUserId = (req) =>
   req.user?.userId ?? req.user?.id ?? req.userId ?? null;
@@ -92,10 +95,6 @@ function normalizeVehicleType(raw) {
   return VALID_VEHICLE_TYPES.has(s) ? s : "car";
 }
 
-/**
- * Validate + clean a client-provided vehicles array.
- * Returns { ok: true, value: [...] } or { ok: false, error: "..." }.
- */
 function normalizeVehiclesInput(raw) {
   if (raw === null || raw === undefined) return { ok: true, value: [] };
   if (!Array.isArray(raw)) {
@@ -139,6 +138,86 @@ function normalizeVehiclesInput(raw) {
   }
 
   return { ok: true, value: out };
+}
+
+// ─── Guest group parsing (gate entries) ──────────────────────────────────
+const MAX_GROUP_SIZE = 20;
+
+function normalizeGuestRow(g) {
+  if (!g || typeof g !== "object") return null;
+
+  const name = String(g.name ?? g.visitorName ?? "").trim();
+  if (!name || name.length > 200) return null;
+
+  const phone = normalizePhone(g.phone ?? g.visitorPhone);
+
+  let vehicle = null;
+  const v = g.vehicle ?? null;
+  if (v && typeof v === "object") {
+    const number = normalizeVehicleNumber(v.number ?? v.vehicle_number ?? "");
+    if (number.length >= 5 && number.length <= 15) {
+      vehicle = {
+        number,
+        type: normalizeVehicleType(v.type ?? v.vehicle_type),
+      };
+    }
+  } else if (typeof g.vehicleNumber === "string" && g.vehicleNumber.length > 0) {
+    const number = normalizeVehicleNumber(g.vehicleNumber);
+    if (number.length >= 5 && number.length <= 15) {
+      vehicle = { number, type: normalizeVehicleType(g.vehicleType) };
+    }
+  }
+
+  return { name, phone: phone || null, vehicle };
+}
+
+function normalizeGuestsGroup(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seenNames = new Set();
+  for (const item of raw) {
+    const row = normalizeGuestRow(item);
+    if (!row) continue;
+    const key = row.name.toLowerCase();
+    if (seenNames.has(key)) continue;
+    seenNames.add(key);
+    out.push(row);
+    if (out.length >= MAX_GROUP_SIZE) break;
+  }
+  return out;
+}
+
+function normalizeVehiclesPayloadInput(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const number = normalizeVehicleNumber(
+      item.number ?? item.vehicle_number ?? "",
+    );
+    if (!number || seen.has(number)) continue;
+    if (number.length < 5 || number.length > 15) continue;
+    seen.add(number);
+    out.push({
+      number,
+      type: normalizeVehicleType(item.type ?? item.vehicle_type),
+    });
+    if (out.length >= 5) break;
+  }
+  return out;
+}
+
+function deriveVehicleList(guests) {
+  const out = [];
+  const seen = new Set();
+  for (const g of guests) {
+    if (!g.vehicle) continue;
+    if (seen.has(g.vehicle.number)) continue;
+    seen.add(g.vehicle.number);
+    out.push(g.vehicle);
+  }
+  return out;
 }
 
 async function loadVehiclesForMember(client, memberId) {
@@ -1085,7 +1164,6 @@ const updateMember = async (req, res) => {
   }
 };
 
-// ─── FIXED: no `RETURNING name` on members (name lives on users) ─────────
 const deleteMember = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1100,7 +1178,6 @@ const deleteMember = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // Fetch user_id + name from the JOIN before updating.
     const { rows: existing } = await client.query(
       `SELECT m.user_id, u.name
          FROM members m
@@ -1128,7 +1205,6 @@ const deleteMember = async (req, res) => {
       return fail(res, 404, "not_found", "Member not found");
     }
 
-    // Soft-delete the member's vehicles too.
     await client.query(
       `UPDATE vehicles SET status='inactive', updated_at=NOW()
         WHERE account_id=$1 AND member_id=$2 AND status='active'`,
@@ -1650,7 +1726,6 @@ const updateStaff = async (req, res) => {
   }
 };
 
-// ─── FIXED: no `RETURNING name` on staff (name lives on users) ───────────
 const deleteStaff = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -2359,12 +2434,9 @@ const deleteExpense = async (req, res) => {
 };
 
 // ===========================================================================
-// VEHICLES + GATE ENTRY
+// VEHICLES
 // ===========================================================================
 
-/**
- * GET /management/:accountId/vehicles/lookup?number=KA01AB1234
- */
 const lookupVehicle = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -2419,10 +2491,130 @@ const lookupVehicle = async (req, res) => {
   }
 };
 
-/**
- * POST /management/:accountId/vehicles
- * Guard-side registration.
- */
+const checkVehicleConflict = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const raw =
+      req.query?.number ?? req.query?.vehicle_number ?? "";
+    const number = normalizeVehicleNumber(raw);
+    if (!number || number.length < 5) {
+      return fail(res, 400, "invalid_input", "Vehicle number is required");
+    }
+
+    const excludeId = req.query?.excludeId ? String(req.query.excludeId).trim() : null;
+    const excludeType = req.query?.excludeType ? String(req.query.excludeType).trim() : null;
+
+    // ── 1. Check vehicles table ─────────────────────────────────────
+    const { rows: veh } = await pool.query(
+      `SELECT id, owner_name, flat_number, wing
+         FROM vehicles
+        WHERE account_id = $1 AND vehicle_number = $2 AND status = 'active'
+        LIMIT 1`,
+      [accountId, number],
+    );
+
+    if (veh.length > 0) {
+      const ownerName = veh[0].owner_name || "a resident";
+      const flatLabel =
+        veh[0].wing && veh[0].flat_number
+          ? `${veh[0].wing} · ${veh[0].flat_number}`
+          : veh[0].flat_number || "";
+      return res.json({
+        conflict: true,
+        source: "registered",
+        message: `${number} is registered to ${ownerName}${
+          flatLabel ? ` (${flatLabel})` : ""
+        }.`,
+        ownerName,
+        flatLabel,
+      });
+    }
+
+    // ── 2. Check active gate_authorizations (passes) ────────────────
+    const { rows: auth } = await pool.query(
+      `SELECT id, visitor_name, flat_number, wing, valid_until
+         FROM gate_authorizations
+        WHERE account_id = $1
+          AND status = 'active'
+          AND valid_until >= NOW()
+          AND (
+                vehicle_number = $2
+             OR EXISTS (
+                  SELECT 1 FROM jsonb_array_elements(vehicles) AS v
+                   WHERE v->>'number' = $2
+                )
+          )
+          AND ($3::uuid IS NULL OR id <> $3::uuid)
+        ORDER BY valid_until DESC
+        LIMIT 1`,
+      [accountId, number, excludeType === "authorization" ? excludeId : null],
+    );
+
+    if (auth.length > 0) {
+      const a = auth[0];
+      const flatLabel =
+        a.wing && a.flat_number ? `${a.wing} · ${a.flat_number}` : a.flat_number || "";
+      const ownerName = a.visitor_name || "another resident";
+      return res.json({
+        conflict: true,
+        source: "pass",
+        message: `${number} is already on an active pass for ${ownerName}${
+          flatLabel ? ` (${flatLabel})` : ""
+        }.`,
+        ownerName,
+        flatLabel,
+      });
+    }
+
+    // ── 3. Check active gate_invites ────────────────────────────────
+    const { rows: inv } = await pool.query(
+      `SELECT id, guest_name, flat_number, wing, valid_until
+         FROM gate_invites
+        WHERE account_id = $1
+          AND status = 'active'
+          AND valid_until >= NOW()
+          AND (
+                vehicle_number = $2
+             OR EXISTS (
+                  SELECT 1 FROM jsonb_array_elements(vehicles) AS v
+                   WHERE v->>'number' = $2
+                )
+          )
+          AND ($3::uuid IS NULL OR id <> $3::uuid)
+        ORDER BY valid_until DESC
+        LIMIT 1`,
+      [accountId, number, excludeType === "invite" ? excludeId : null],
+    );
+
+    if (inv.length > 0) {
+      const i = inv[0];
+      const flatLabel =
+        i.wing && i.flat_number ? `${i.wing} · ${i.flat_number}` : i.flat_number || "";
+      const ownerName = i.guest_name || "another resident";
+      return res.json({
+        conflict: true,
+        source: "invite",
+        message: `${number} is already on an active QR invite for ${ownerName}${
+          flatLabel ? ` (${flatLabel})` : ""
+        }.`,
+        ownerName,
+        flatLabel,
+      });
+    }
+
+    return res.json({ conflict: false });
+  } catch (err) {
+    console.error("checkVehicleConflict error:", err);
+    return fail(res, 500, "server_error", "Failed to check vehicle conflict");
+  }
+};
+
 const registerVehicle = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -2548,8 +2740,20 @@ const registerVehicle = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// GATE ENTRIES
+// ===========================================================================
+
 /**
- * POST /management/:accountId/gate-entries
+ * createGateEntry — two modes:
+ *
+ *   mode: "pass_scan"  → guard scanned a valid QR / entered a valid code.
+ *                        No log is written. Returns invite details.
+ *
+ *   mode: "manual"     → guard manually entered visitor details.
+ *                        Creates a gate_entries row.
+ *                        autoApprove: true  → status = "auto_approved"
+ *                        autoApprove: false → status = "pending_approval"
  */
 const createGateEntry = async (req, res) => {
   const client = await pool.connect();
@@ -2562,79 +2766,288 @@ const createGateEntry = async (req, res) => {
     if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const body = req.body || {};
+    const modeRaw = String(body.mode ?? "manual").toLowerCase().trim();
+    const isPassScan = modeRaw === "pass_scan";
+
+    // ─── PASS SCAN (no log) ────────────────────────────────────────────
+    if (isPassScan) {
+      const inviteId = body.inviteId ?? body.invite_id ?? null;
+      const code = body.code ? String(body.code).trim() : null;
+
+      if (!inviteId && !code) {
+        return fail(res, 400, "invalid_input",
+          "inviteId or code is required for pass_scan");
+      }
+
+      // Resolve by code first if only code given
+      if (code && !inviteId) {
+        const { rows: inv } = await pool.query(
+          `SELECT id FROM gate_invites WHERE code = $1 AND account_id = $2 LIMIT 1`,
+          [code, accountId]);
+        if (inv.length) {
+          return res.json({
+            mode: "pass_scan",
+            kind: "invite",
+            verified: true,
+            inviteId: inv[0].id,
+          });
+        }
+        return fail(res, 404, "not_found", "This code doesn't match any pass");
+      }
+
+      if (inviteId) {
+        const { rows } = await pool.query(
+          `SELECT id, guest_name, guest_phone, guest_count, vehicle_number,
+                  vehicles, wing, flat_number, valid_from, valid_until,
+                  code, status
+             FROM gate_invites
+            WHERE id = $1 AND account_id = $2 LIMIT 1`,
+          [inviteId, accountId]);
+        if (!rows.length) return fail(res, 404, "not_found", "Invite not found");
+
+        const inv = rows[0];
+        if (inv.status === "cancelled") {
+          return fail(res, 410, "invite_cancelled", "This invite was cancelled");
+        }
+        const until = new Date(inv.valid_until);
+        if (!isNaN(until.getTime()) && until.getTime() < Date.now()) {
+          return res.json({ mode: "pass_scan", kind: "invite", verified: false, reason: "expired", invite: inv });
+        }
+        return res.json({
+          mode: "pass_scan",
+          kind: "invite",
+          verified: true,
+          invite: inv,
+        });
+      }
+    }
+
+    // ─── MANUAL ENTRY (creates a log) ──────────────────────────────────
     const number = normalizeVehicleNumber(
       body.vehicleNumber ?? body.vehicle_number ?? body.number ?? "",
     );
     const directionRaw = String(body.direction ?? "in").toLowerCase().trim();
     const direction = directionRaw === "out" ? "out" : "in";
 
-    if (!number) return fail(res, 400, "invalid_input", "Vehicle number is required");
+    const visitorTypeRaw = String(
+      body.visitorType ?? body.visitor_type ?? "visitor",
+    ).toLowerCase().trim();
+    const visitorType = ["resident", "visitor", "invited_guest", "delivery", "cab", "service", "other"]
+      .includes(visitorTypeRaw)
+      ? visitorTypeRaw
+      : "visitor";
 
+    const visitorName = body.visitorName
+      ? String(body.visitorName).trim()
+      : body.visitor_name
+        ? String(body.visitor_name).trim()
+        : null;
+
+    const visitorPhone = normalizePhone(
+      body.visitorPhone ?? body.visitor_phone,
+    );
+
+    const purpose = body.purpose ? String(body.purpose).trim().toLowerCase() : null;
+
+    const vehicleTypeRaw = body.vehicleType ?? body.vehicle_type;
+    const vehicleType = vehicleTypeRaw
+      ? normalizeVehicleType(vehicleTypeRaw)
+      : null;
+
+    const autoApprove = body.autoApprove !== false && !body.requiresApproval;
+
+    let guestsIn = normalizeGuestsGroup(body.guests);
+
+    if (guestsIn.length === 0 && visitorName) {
+      guestsIn = [
+        {
+          name: visitorName,
+          phone: visitorPhone || null,
+          vehicle: number
+            ? { number, type: vehicleType || "car" }
+            : null,
+        },
+      ];
+    }
+
+    if (guestsIn.length === 0 && Array.isArray(body.vehicles)) {
+      const v0 = normalizeVehiclesPayloadInput(body.vehicles)[0];
+      if (v0) {
+        guestsIn = [{ name: "Unknown visitor", phone: null, vehicle: v0 }];
+      }
+    }
+
+    const vehiclesIn = deriveVehicleList(guestsIn);
+
+    const headGuest = guestsIn[0] || null;
+    const headName = headGuest?.name || visitorName || null;
+    const headPhone = headGuest?.phone || visitorPhone || null;
+    const headVehicle = headGuest?.vehicle || null;
+
+    const primaryVehicle = headVehicle?.number || number || "NO-VEHICLE";
+    const primaryVehicleType = headVehicle?.type || vehicleType || null;
+
+    if (!primaryVehicle) {
+      return fail(res, 400, "invalid_input", "Vehicle number is required");
+    }
+
+    // Resolve flat/member
     let vehicleId = null;
     let memberId = null;
-    let ownerName = null;
-    let flatNumber = null;
-    let ownerPhone = null;
-    let registered = false;
+    let memberUserId = null;
+    let ownerName = headName;
+    let flatNumber = body.flatNumber ?? body.flat_number ?? null;
+    let ownerPhone = headPhone;
 
-    const passedOwner = body.owner && typeof body.owner === "object" ? body.owner : null;
-
-    if (passedOwner) {
-      vehicleId = passedOwner.vehicle_id ?? null;
-      memberId = passedOwner.member_id ?? null;
-      ownerName = passedOwner.owner_name ?? null;
-      flatNumber = passedOwner.flat_number ?? null;
-      ownerPhone = passedOwner.owner_phone ?? null;
-      registered = true;
-    } else {
+    if (primaryVehicle && primaryVehicle !== "NO-VEHICLE") {
       const { rows } = await pool.query(
         `SELECT id, member_id, owner_name, flat_number, owner_phone
            FROM vehicles
           WHERE account_id = $1 AND vehicle_number = $2 AND status = 'active'
           LIMIT 1`,
-        [accountId, number],
+        [accountId, primaryVehicle],
       );
       if (rows.length > 0) {
         vehicleId = rows[0].id;
         memberId = rows[0].member_id;
-        ownerName = rows[0].owner_name;
-        flatNumber = rows[0].flat_number;
-        ownerPhone = rows[0].owner_phone;
-        registered = true;
+        ownerName = ownerName || rows[0].owner_name;
+        flatNumber = flatNumber || rows[0].flat_number;
+        ownerPhone = ownerPhone || rows[0].owner_phone;
       }
     }
+
+    if (!memberId && flatNumber) {
+      const { rows: mm } = await pool.query(
+        `SELECT m.id, m.user_id
+           FROM members m
+          WHERE m.account_id = $1
+            AND m.flat_number = $2
+            AND ($3::text IS NULL OR m.wing = $3)
+            AND m.status = 'active'
+          LIMIT 1`,
+        [accountId, flatNumber, body.wing ?? body.wing_number ?? null],
+      );
+      if (mm.length > 0) {
+        memberId = mm[0].id;
+        memberUserId = mm[0].user_id;
+      }
+    } else if (memberId) {
+      const { rows: m } = await pool.query(
+        `SELECT user_id FROM members WHERE id = $1 LIMIT 1`,
+        [memberId],
+      );
+      if (m.length > 0) memberUserId = m[0].user_id;
+    }
+
+    const status = autoApprove ? "auto_approved" : "pending_approval";
 
     await client.query("BEGIN");
 
     const { rows } = await client.query(
       `INSERT INTO gate_entries
          (account_id, vehicle_number, vehicle_id, member_id,
-          owner_name, flat_number, owner_phone, registered, direction, scanned_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       RETURNING id, scanned_at`,
+          owner_name, flat_number, owner_phone, registered, direction, scanned_by,
+          visitor_type, visitor_name, visitor_phone, purpose, vehicle_type,
+          invite_id, authorization_id, rejected, notified, status,
+          guests, vehicles)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+               $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+               $21::jsonb, $22::jsonb)
+       RETURNING id, scanned_at, status`,
       [
         accountId,
-        number,
+        primaryVehicle,
         vehicleId,
         memberId,
         ownerName,
         flatNumber,
         ownerPhone,
-        registered,
+        false,
         direction,
         userId,
+        visitorType,
+        headName,
+        headPhone,
+        purpose,
+        primaryVehicleType,
+        null,
+        null,
+        false,
+        false,
+        status,
+        JSON.stringify(guestsIn),
+        JSON.stringify(vehiclesIn),
       ],
     );
+
+    const entryId = rows[0].id;
+
+    // Notify resident
+    if (memberUserId) {
+      const total = guestsIn.length;
+      const vehicleCount = vehiclesIn.length;
+
+      const guestLabel =
+        total === 0
+          ? "A visitor"
+          : total === 1
+            ? headName || "A visitor"
+            : `${headName || "A visitor"} + ${total - 1} more`;
+
+      const vehicleLabel =
+        vehicleCount === 0
+          ? ""
+          : vehicleCount === 1
+            ? ` (vehicle ${vehiclesIn[0].number})`
+            : ` (${vehicleCount} vehicles)`;
+
+      const flatLabel = flatNumber
+        ? (body.wing ? `${body.wing} · ${flatNumber}` : flatNumber)
+        : "your flat";
+
+      const title = autoApprove
+        ? "Visitor allowed by guard"
+        : total <= 1
+          ? "Visitor at gate"
+          : "Group at gate";
+
+      const bodyText = autoApprove
+        ? `${guestLabel}${vehicleLabel} is entering ${flatLabel}.`
+        : `${guestLabel}${vehicleLabel} is at the gate for ${flatLabel}. Tap to allow or deny.`;
+
+      try {
+        await notifyMemberForGate(memberUserId, {
+          title,
+          body: bodyText,
+          entryId,
+          accountId,
+          visitorName: headName,
+          vehicleNumber: primaryVehicle,
+          flatNumber,
+          guestCount: total || 1,
+          vehicles: vehiclesIn.map((v) => v.number),
+        });
+        await client.query(
+          `UPDATE gate_entries SET notified = TRUE WHERE id = $1`,
+          [entryId],
+        );
+      } catch (e) {
+        console.warn("[gate] notify failed:", e.message);
+      }
+    }
 
     await client.query("COMMIT");
 
     return res.status(201).json({
+      mode: "manual",
       success: true,
-      entry_id: rows[0].id,
+      entry_id: entryId,
       scanned_at: rows[0].scanned_at,
-      registered,
-      vehicle_number: number,
+      status: rows[0].status,
+      vehicle_number: primaryVehicle,
       direction,
+      guest_count: guestsIn.length,
+      vehicle_count: vehiclesIn.length,
     });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -2645,9 +3058,7 @@ const createGateEntry = async (req, res) => {
   }
 };
 
-/**
- * GET /management/:accountId/gate-entries?limit=50
- */
+// ─── List gate entries ─────────────────────────────────────────────────
 const listGateEntries = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -2662,21 +3073,1217 @@ const listGateEntries = async (req, res) => {
       ? Math.min(Math.max(Math.trunc(limitRaw), 1), 200)
       : 50;
 
+    const dateRaw = req.query?.date ? String(req.query.date).trim() : null;
+    const useDate = dateRaw && /^\d{4}-\d{2}-\d{2}$/.test(dateRaw);
+
+    const VALID_STATUSES = new Set([
+      "auto_approved",
+      "invite_approved",
+      "pass_approved",
+      "pending_approval",
+      "approved",
+      "approved_by_guard_override",
+      "rejected",
+    ]);
+    const statusRaw = req.query?.status ? String(req.query.status).trim() : null;
+    const useStatus = statusRaw && VALID_STATUSES.has(statusRaw);
+
+    const flatRaw = req.query?.flatNumber ? String(req.query.flatNumber).trim() : null;
+    const wingRaw = req.query?.wing ? String(req.query.wing).trim() : null;
+
+    const params = [accountId];
+    const conditions = [`account_id = $1`];
+
+    if (useStatus) {
+      params.push(statusRaw);
+      conditions.push(`status = $${params.length}`);
+    }
+
+    if (useDate) {
+      params.push(dateRaw);
+      conditions.push(
+        `(scanned_at AT TIME ZONE 'Asia/Kolkata')::date = $${params.length}::date`,
+      );
+    } else if (!useStatus) {
+      conditions.push(
+        `(scanned_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date`,
+      );
+    }
+
+    if (flatRaw) {
+      params.push(flatRaw);
+      conditions.push(`flat_number = $${params.length}`);
+    }
+
+    if (wingRaw) {
+      params.push(wingRaw);
+      conditions.push(`wing = $${params.length}`);
+    }
+
+    params.push(limit);
+    const limitIdx = params.length;
+
     const { rows } = await pool.query(
       `SELECT id, vehicle_number, vehicle_id, member_id,
               owner_name, flat_number, owner_phone,
-              registered, direction, scanned_by, scanned_at
+              registered, direction, scanned_by, scanned_at,
+              visitor_type, visitor_name, visitor_phone, purpose,
+              vehicle_type, invite_id, authorization_id,
+              rejected, notified, status,
+              guests, vehicles
          FROM gate_entries
-        WHERE account_id = $1
+        WHERE ${conditions.join(" AND ")}
         ORDER BY scanned_at DESC
-        LIMIT $2`,
-      [accountId, limit],
+        LIMIT $${limitIdx}`,
+      params,
     );
 
     return res.json(rows);
   } catch (err) {
     console.error("listGateEntries error:", err);
     return fail(res, 500, "server_error", "Failed to load gate entries");
+  }
+};
+
+// ─── Approval flow ─────────────────────────────────────────────────────
+const approveGateEntry = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const { rows: entryRows } = await client.query(
+      `SELECT ge.id, ge.member_id, ge.status, ge.scanned_by,
+              ge.visitor_name, ge.flat_number,
+              m.user_id AS member_user_id
+         FROM gate_entries ge
+         LEFT JOIN members m ON m.id = ge.member_id
+        WHERE ge.id = $1 AND ge.account_id = $2`,
+      [id, accountId],
+    );
+    if (!entryRows.length) return fail(res, 404, "not_found", "Entry not found");
+
+    const entry = entryRows[0];
+    const isPrivileged = role === "owner" || role === "admin";
+    const isTarget = entry.member_user_id === userId;
+
+    if (!isPrivileged && !isTarget) {
+      return fail(res, 403, "forbidden", "You can only approve entries for your own flat");
+    }
+    if (entry.status !== "pending_approval") {
+      return fail(res, 409, "invalid_state",
+        `This entry is already ${entry.status.replace(/_/g, " ")}`);
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE gate_entries
+          SET status = 'approved',
+              approved_by = $1,
+              approved_at = NOW(),
+              responded_at = NOW()
+        WHERE id = $2 AND account_id = $3`,
+      [userId, id, accountId],
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_entry",
+      entityId: id,
+      action: "gate_approved",
+      after: { status: "approved" },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+
+    if (entry.scanned_by) {
+      try {
+        await sendGateNotification([entry.scanned_by], {
+          title: "Entry approved",
+          body: `${entry.visitor_name || "Visitor"} was allowed in by the resident.`,
+          data: {
+            type: "gate_status",
+            entryId: id,
+            accountId,
+            status: "approved",
+          },
+        });
+      } catch (e) {
+        console.warn("[gate] guard notify failed:", e.message);
+      }
+    }
+
+    return res.json({ success: true, status: "approved" });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("approveGateEntry error:", err);
+    return fail(res, 500, "server_error", "Failed to approve entry");
+  } finally {
+    client.release();
+  }
+};
+
+const rejectGateEntry = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const { rows: entryRows } = await client.query(
+      `SELECT ge.id, ge.member_id, ge.status, ge.scanned_by,
+              ge.visitor_name, ge.flat_number,
+              m.user_id AS member_user_id
+         FROM gate_entries ge
+         LEFT JOIN members m ON m.id = ge.member_id
+        WHERE ge.id = $1 AND ge.account_id = $2`,
+      [id, accountId],
+    );
+    if (!entryRows.length) return fail(res, 404, "not_found", "Entry not found");
+
+    const entry = entryRows[0];
+    const isPrivileged = role === "owner" || role === "admin";
+    const isTarget = entry.member_user_id === userId;
+
+    if (!isPrivileged && !isTarget) {
+      return fail(res, 403, "forbidden", "You can only reject entries for your own flat");
+    }
+    if (entry.status !== "pending_approval") {
+      return fail(res, 409, "invalid_state",
+        `This entry is already ${entry.status.replace(/_/g, " ")}`);
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE gate_entries
+          SET status = 'rejected',
+              rejected = TRUE,
+              approved_by = $1,
+              approved_at = NOW(),
+              responded_at = NOW()
+        WHERE id = $2 AND account_id = $3`,
+      [userId, id, accountId],
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_entry",
+      entityId: id,
+      action: "gate_rejected",
+      after: { status: "rejected" },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+
+    if (entry.scanned_by) {
+      try {
+        await sendGateNotification([entry.scanned_by], {
+          title: "Entry rejected",
+          body: `${entry.visitor_name || "Visitor"} was denied entry by the resident.`,
+          data: {
+            type: "gate_status",
+            entryId: id,
+            accountId,
+            status: "rejected",
+          },
+        });
+      } catch (e) {
+        console.warn("[gate] guard notify failed:", e.message);
+      }
+    }
+
+    return res.json({ success: true, status: "rejected" });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("rejectGateEntry error:", err);
+    return fail(res, 500, "server_error", "Failed to reject entry");
+  } finally {
+    client.release();
+  }
+};
+
+const overrideGateEntry = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const { rows: entryRows } = await client.query(
+      `SELECT id, status, scanned_by, visitor_name FROM gate_entries
+        WHERE id = $1 AND account_id = $2`,
+      [id, accountId],
+    );
+    if (!entryRows.length) return fail(res, 404, "not_found", "Entry not found");
+    if (entryRows[0].status !== "pending_approval") {
+      return fail(res, 409, "invalid_state",
+        `This entry is already ${entryRows[0].status.replace(/_/g, " ")}`);
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE gate_entries
+          SET status = 'approved_by_guard_override',
+              approved_by = $1,
+              approved_at = NOW(),
+              responded_at = NOW()
+        WHERE id = $2 AND account_id = $3`,
+      [userId, id, accountId],
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_entry",
+      entityId: id,
+      action: "gate_guard_override",
+      after: { status: "approved_by_guard_override" },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+
+    return res.json({ success: true, status: "approved_by_guard_override" });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("overrideGateEntry error:", err);
+    return fail(res, 500, "server_error", "Failed to override entry");
+  } finally {
+    client.release();
+  }
+};
+
+const getGateEntryStatus = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const { rows } = await pool.query(
+      `SELECT id, status, approved_at, responded_at
+         FROM gate_entries
+        WHERE id = $1 AND account_id = $2`,
+      [id, accountId],
+    );
+    if (!rows.length) return fail(res, 404, "not_found", "Entry not found");
+
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("getGateEntryStatus error:", err);
+    return fail(res, 500, "server_error", "Failed to load entry status");
+  }
+};
+
+// ===========================================================================
+// GATE AUTHORIZATIONS
+// ===========================================================================
+
+const OPEN_CATEGORIES = new Set(["delivery", "cab", "service", "other"]);
+
+const createAuthorization = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const body = req.body || {};
+    const category = String(body.category ?? "").toLowerCase().trim();
+    const validCategories = ["delivery", "helper", "guest", "cab", "service", "other"];
+    if (!validCategories.includes(category)) {
+      return fail(res, 400, "invalid_input", "Invalid category");
+    }
+
+    const passMode = OPEN_CATEGORIES.has(category) ? "open" : "named";
+
+    const memberId = body.memberId ?? body.member_id ?? null;
+    const wing = body.wing ? String(body.wing).trim() : null;
+    const flatNumber = String(body.flatNumber ?? body.flat_number ?? "").trim();
+    if (!flatNumber) return fail(res, 400, "invalid_input", "Flat number is required");
+
+    let visitorName = body.visitorName ? String(body.visitorName).trim() : null;
+    if (passMode === "named" && !visitorName) {
+      return fail(res, 400, "invalid_input",
+        "Visitor name is required for this category");
+    }
+    if (visitorName && visitorName.length > 200) {
+      return fail(res, 400, "invalid_input", "Visitor name is too long");
+    }
+
+    const visitorPhone = normalizePhone(body.visitorPhone);
+
+    // Multi-vehicle parsing
+    let vehiclesIn = normalizeVehiclesPayloadInput(body.vehicles);
+
+    // Fallback to singular vehicleNumber for old clients
+    if (vehiclesIn.length === 0) {
+      const legacy = normalizeVehicleNumber(
+        body.vehicleNumber ?? body.vehicle_number ?? "",
+      );
+      if (legacy && legacy.length >= 5 && legacy.length <= 15) {
+        vehiclesIn = [{ number: legacy, type: "car" }];
+      }
+    }
+
+    // Primary vehicle = first (for the legacy `vehicle_number` column)
+    const primaryVehicle = vehiclesIn[0]?.number ?? null;
+
+    const validFromRaw = body.validFrom ?? body.valid_from ?? null;
+    const validUntilRaw = body.validUntil ?? body.valid_until ?? null;
+    if (!validUntilRaw) return fail(res, 400, "invalid_input", "validUntil is required");
+
+    const validFrom = validFromRaw ? new Date(validFromRaw) : new Date();
+    const validUntil = new Date(validUntilRaw);
+    if (isNaN(validFrom.getTime()) || isNaN(validUntil.getTime())) {
+      return fail(res, 400, "invalid_input", "Invalid validity window");
+    }
+
+    const guestCountRaw = Number(body.guestCount ?? body.guest_count ?? 1);
+    const guestCount = Number.isFinite(guestCountRaw)
+      ? Math.max(1, Math.min(20, Math.trunc(guestCountRaw)))
+      : 1;
+
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `INSERT INTO gate_authorizations
+         (account_id, member_id, wing, flat_number, created_by,
+          category, pass_mode, visitor_name, visitor_phone, vehicle_number,
+          vehicles,
+          guest_count, valid_from, valid_until, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+               $11::jsonb,
+               $12,$13,$14,'active')
+       RETURNING *`,
+      [
+        accountId,
+        memberId,
+        wing,
+        flatNumber,
+        userId,
+        category,
+        passMode,
+        visitorName,
+        visitorPhone,
+        primaryVehicle,
+        JSON.stringify(vehiclesIn),
+        guestCount,
+        validFrom.toISOString(),
+        validUntil.toISOString(),
+      ],
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_authorization",
+      entityId: rows[0].id,
+      action: "create",
+      after: rows[0],
+      metadata: {
+        category,
+        passMode,
+        flatNumber,
+        visitorName,
+        vehicles: vehiclesIn.map((v) => v.number),
+      },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+    return res.status(201).json(rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("createAuthorization error:", err);
+    return fail(res, 500, "server_error", "Failed to create pass");
+  } finally {
+    client.release();
+  }
+};
+
+const listAuthorizations = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const isPrivileged = role === "owner" || role === "admin";
+
+    let query;
+    let params;
+    if (isPrivileged) {
+      query = `
+        SELECT *
+          FROM gate_authorizations
+         WHERE account_id = $1
+         ORDER BY
+           CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+           valid_until DESC`;
+      params = [accountId];
+    } else {
+      query = `
+        SELECT *
+          FROM gate_authorizations
+         WHERE account_id = $1 AND created_by = $2
+         ORDER BY
+           CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+           valid_until DESC`;
+      params = [accountId, userId];
+    }
+
+    const { rows } = await pool.query(query, params);
+    return res.json(rows);
+  } catch (err) {
+    console.error("listAuthorizations error:", err);
+    return fail(res, 500, "server_error", "Failed to load passes");
+  }
+};
+
+const deleteAuthorization = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const { rows: existing } = await client.query(
+      `SELECT id, created_by FROM gate_authorizations
+        WHERE id = $1 AND account_id = $2`,
+      [id, accountId],
+    );
+    if (!existing.length) return fail(res, 404, "not_found", "Pass not found");
+
+    const isOwner = role === "owner" || role === "admin";
+    if (!isOwner && existing[0].created_by !== userId) {
+      return fail(res, 403, "forbidden", "You can only cancel your own passes");
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE gate_authorizations
+          SET status = 'cancelled', updated_at = NOW()
+        WHERE id = $1 AND account_id = $2`,
+      [id, accountId],
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_authorization",
+      entityId: id,
+      action: "delete",
+      after: { status: "cancelled" },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+    return res.json({ success: true });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("deleteAuthorization error:", err);
+    return fail(res, 500, "server_error", "Failed to cancel pass");
+  } finally {
+    client.release();
+  }
+};
+
+// ===========================================================================
+// UPDATE AUTHORIZATION (edit pass)
+// ===========================================================================
+const updateAuthorization = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const { rows: existing } = await client.query(
+      `SELECT id, created_by, pass_mode FROM gate_authorizations
+        WHERE id = $1 AND account_id = $2`,
+      [id, accountId],
+    );
+    if (!existing.length) return fail(res, 404, "not_found", "Pass not found");
+
+    const isOwner = role === "owner" || role === "admin";
+    if (!isOwner && existing[0].created_by !== userId) {
+      return fail(res, 403, "forbidden", "You can only edit your own passes");
+    }
+
+    const body = req.body || {};
+
+    // Editable fields
+    let visitorName = null;
+    if (Object.prototype.hasOwnProperty.call(body, "visitorName")) {
+      const v = body.visitorName;
+      visitorName = v == null || String(v).trim() === "" ? null : String(v).trim();
+      if (visitorName && visitorName.length > 200) {
+        return fail(res, 400, "invalid_input", "Visitor name is too long");
+      }
+    }
+
+    let visitorPhone;
+    if (Object.prototype.hasOwnProperty.call(body, "visitorPhone")) {
+      const raw = body.visitorPhone;
+      visitorPhone = raw == null || String(raw).trim() === ""
+        ? null
+        : normalizePhone(raw);
+    }
+
+    let vehiclesIn;
+    let primaryVehicle;
+    if (Object.prototype.hasOwnProperty.call(body, "vehicles")) {
+      vehiclesIn = normalizeVehiclesPayloadInput(body.vehicles);
+      if (vehiclesIn.length === 0) {
+        const legacy = normalizeVehicleNumber(
+          body.vehicleNumber ?? body.vehicle_number ?? "",
+        );
+        if (legacy && legacy.length >= 5 && legacy.length <= 15) {
+          vehiclesIn = [{ number: legacy, type: "car" }];
+        }
+      }
+      primaryVehicle = vehiclesIn[0]?.number ?? null;
+    }
+
+    let validFrom = null;
+    if (Object.prototype.hasOwnProperty.call(body, "validFrom")) {
+      const d = new Date(body.validFrom);
+      if (isNaN(d.getTime())) {
+        return fail(res, 400, "invalid_input", "Invalid validFrom");
+      }
+      validFrom = d;
+    }
+
+    let validUntil = null;
+    if (Object.prototype.hasOwnProperty.call(body, "validUntil")) {
+      const d = new Date(body.validUntil);
+      if (isNaN(d.getTime())) {
+        return fail(res, 400, "invalid_input", "Invalid validUntil");
+      }
+      validUntil = d;
+    }
+
+    let guestCount;
+    if (Object.prototype.hasOwnProperty.call(body, "guestCount")) {
+      const n = Number(body.guestCount);
+      guestCount = Number.isFinite(n) ? Math.max(1, Math.min(20, Math.trunc(n))) : 1;
+    }
+
+    await client.query("BEGIN");
+
+    const sets = [];
+    const values = [];
+    const push = (col, val) => {
+      values.push(val);
+      sets.push(`${col} = $${values.length}`);
+    };
+
+    if (visitorName !== null || Object.prototype.hasOwnProperty.call(body, "visitorName")) {
+      push("visitor_name", visitorName);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "visitorPhone")) {
+      push("visitor_phone", visitorPhone);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "vehicles")) {
+      push("vehicles", JSON.stringify(vehiclesIn));
+      push("vehicle_number", primaryVehicle);
+    }
+    if (validFrom) push("valid_from", validFrom.toISOString());
+    if (validUntil) push("valid_until", validUntil.toISOString());
+    if (guestCount !== undefined) push("guest_count", guestCount);
+
+    if (sets.length === 0) {
+      await client.query("ROLLBACK");
+      return fail(res, 400, "invalid_input", "No editable fields provided");
+    }
+
+    sets.push("updated_at = NOW()");
+    values.push(id);
+    values.push(accountId);
+
+    const { rows: updated } = await client.query(
+      `UPDATE gate_authorizations
+          SET ${sets.join(", ")}
+        WHERE id = $${values.length - 1} AND account_id = $${values.length}
+        RETURNING *`,
+      values,
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_authorization",
+      entityId: id,
+      action: "update",
+      after: updated[0],
+      metadata: { fields: sets.map((s) => s.split(" ")[0]) },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+    return res.json(updated[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("updateAuthorization error:", err);
+    return fail(res, 500, "server_error", "Failed to update pass");
+  } finally {
+    client.release();
+  }
+};
+
+const matchAuthorization = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const body = req.body || {};
+    const flatNumber = String(body.flatNumber ?? body.flat_number ?? "").trim();
+    if (!flatNumber) {
+      return fail(res, 400, "invalid_input", "Flat number is required");
+    }
+
+    const wing = body.wing ? String(body.wing).trim() : null;
+    const category = body.category
+      ? String(body.category).toLowerCase().trim()
+      : null;
+    const visitorName = body.visitorName
+      ? String(body.visitorName).trim().toLowerCase()
+      : null;
+    const vehicleNumber = body.vehicleNumber
+      ? normalizeVehicleNumber(body.vehicleNumber)
+      : null;
+
+    const { rows } = await pool.query(
+      `SELECT *
+         FROM gate_authorizations
+        WHERE account_id = $1
+          AND flat_number = $2
+          AND status = 'active'
+          AND valid_from <= NOW()
+          AND valid_until >= NOW()
+          AND ($3::text IS NULL OR wing = $3)
+          AND ($4::text IS NULL OR category = $4)
+          AND (
+                pass_mode = 'open'
+             OR (pass_mode = 'named' AND
+                 ($5::text IS NULL OR LOWER(visitor_name) = $5))
+          )
+          AND (vehicle_number IS NULL OR $6::text IS NULL OR vehicle_number = $6)
+        ORDER BY
+          CASE WHEN pass_mode = 'named' THEN 0 ELSE 1 END,
+          valid_until ASC
+        LIMIT 5`,
+      [accountId, flatNumber, wing, category, visitorName, vehicleNumber],
+    );
+
+    if (rows.length === 0) {
+      return res.json({ matched: false });
+    }
+
+    return res.json({
+      matched: true,
+      authorization: rows[0],
+    });
+  } catch (err) {
+    console.error("matchAuthorization error:", err);
+    return fail(res, 500, "server_error", "Failed to match authorization");
+  }
+};
+
+// ===========================================================================
+// GATE INVITES
+// ===========================================================================
+
+function generateInviteCode() {
+  return "gti_" + crypto.randomBytes(8).toString("hex");
+}
+
+const createInvite = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const body = req.body || {};
+    const memberId = body.memberId ?? body.member_id ?? null;
+    const wing = body.wing ? String(body.wing).trim() : null;
+    const flatNumber = String(body.flatNumber ?? body.flat_number ?? "").trim();
+    if (!flatNumber) return fail(res, 400, "invalid_input", "Flat number is required");
+
+    const guestName = String(body.guestName ?? body.guest_name ?? "").trim();
+    if (!guestName) return fail(res, 400, "invalid_input", "Guest name is required");
+    if (guestName.length > 200) return fail(res, 400, "invalid_input", "Guest name is too long");
+
+    const guestPhone = normalizePhone(body.guestPhone ?? body.guest_phone);
+
+    const purposeRaw = String(body.purpose ?? "guest").toLowerCase().trim();
+    const purpose = ["guest", "delivery", "cab", "service", "other"].includes(purposeRaw)
+      ? purposeRaw
+      : "guest";
+
+    const guestCountRaw = Number(body.guestCount ?? body.guest_count ?? 1);
+    const guestCount = Number.isFinite(guestCountRaw)
+      ? Math.max(1, Math.min(20, Math.trunc(guestCountRaw)))
+      : 1;
+
+    let vehiclesIn = normalizeVehiclesPayloadInput(body.vehicles);
+
+    if (vehiclesIn.length === 0) {
+      const legacy = normalizeVehicleNumber(
+        body.vehicleNumber ?? body.vehicle_number ?? "",
+      );
+      if (legacy && legacy.length >= 5 && legacy.length <= 15) {
+        vehiclesIn = [{ number: legacy, type: "car" }];
+      }
+    }
+
+    const primaryVehicle = vehiclesIn[0]?.number ?? null;
+
+    const validFromRaw = body.validFrom ?? body.valid_from ?? null;
+    const validUntilRaw = body.validUntil ?? body.valid_until ?? null;
+    if (!validUntilRaw) return fail(res, 400, "invalid_input", "validUntil is required");
+
+    const validFrom = validFromRaw ? new Date(validFromRaw) : new Date();
+    const validUntil = new Date(validUntilRaw);
+    if (isNaN(validFrom.getTime()) || isNaN(validUntil.getTime())) {
+      return fail(res, 400, "invalid_input", "Invalid validity window");
+    }
+    if (validUntil.getTime() <= validFrom.getTime()) {
+      return fail(res, 400, "invalid_input", "validUntil must be after validFrom");
+    }
+
+    const code = generateInviteCode();
+
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `INSERT INTO gate_invites
+         (account_id, created_by, member_id, wing, flat_number,
+          guest_name, guest_phone, purpose, guest_count, vehicle_number,
+          vehicles,
+          valid_from, valid_until, code, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,'active')
+       RETURNING *`,
+      [
+        accountId,
+        userId,
+        memberId,
+        wing,
+        flatNumber,
+        guestName,
+        guestPhone,
+        purpose,
+        guestCount,
+        primaryVehicle,
+        JSON.stringify(vehiclesIn),
+        validFrom.toISOString(),
+        validUntil.toISOString(),
+        code,
+      ],
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_invite",
+      entityId: rows[0].id,
+      action: "create",
+      after: rows[0],
+      metadata: { guestName, flatNumber, purpose, vehicles: vehiclesIn.map((v) => v.number) },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+    return res.status(201).json(rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("createInvite error:", err);
+    return fail(res, 500, "server_error", "Failed to create invite");
+  } finally {
+    client.release();
+  }
+};
+
+const listInvites = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const isPrivileged = role === "owner" || role === "admin";
+
+    let query;
+    let params;
+    if (isPrivileged) {
+      query = `
+        SELECT *
+          FROM gate_invites
+         WHERE account_id = $1
+         ORDER BY
+           CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+           valid_until DESC`;
+      params = [accountId];
+    } else {
+      query = `
+        SELECT *
+          FROM gate_invites
+         WHERE account_id = $1 AND created_by = $2
+         ORDER BY
+           CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+           valid_until DESC`;
+      params = [accountId, userId];
+    }
+
+    const { rows } = await pool.query(query, params);
+    return res.json(rows);
+  } catch (err) {
+    console.error("listInvites error:", err);
+    return fail(res, 500, "server_error", "Failed to load invites");
+  }
+};
+
+const getInvite = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const { rows } = await pool.query(
+      `SELECT * FROM gate_invites WHERE id = $1 AND account_id = $2`,
+      [id, accountId],
+    );
+    if (!rows.length) return fail(res, 404, "not_found", "Invite not found");
+
+    const invite = rows[0];
+    const isPrivileged = role === "owner" || role === "admin";
+    if (!isPrivileged && invite.created_by !== userId) {
+      return fail(res, 403, "forbidden", "You don't have access to this invite");
+    }
+
+    return res.json(invite);
+  } catch (err) {
+    console.error("getInvite error:", err);
+    return fail(res, 500, "server_error", "Failed to load invite");
+  }
+};
+
+const lookupInviteByCode = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId, code } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const cleanCode = String(code ?? "").trim();
+    if (!cleanCode) return fail(res, 400, "invalid_input", "Code is required");
+
+    const { rows } = await pool.query(
+      `SELECT * FROM gate_invites WHERE code = $1 AND account_id = $2 LIMIT 1`,
+      [cleanCode, accountId],
+    );
+
+    if (!rows.length) {
+      return fail(res, 404, "not_found", "This QR doesn't match any invite");
+    }
+
+    const invite = rows[0];
+
+    if (invite.status === "cancelled") {
+      return fail(res, 410, "invite_cancelled", "This invite was cancelled");
+    }
+    if (invite.status === "used") {
+      return res.status(200).json({ ...invite, _warning: "already_used" });
+    }
+
+    const now = new Date();
+    const until = new Date(invite.valid_until);
+    if (!isNaN(until.getTime()) && until.getTime() < now.getTime()) {
+      return res.status(200).json({ ...invite, _warning: "expired" });
+    }
+
+    let vehicles = Array.isArray(invite.vehicles) ? invite.vehicles : [];
+    if (vehicles.length === 0 && invite.vehicle_number) {
+      vehicles = [{ number: invite.vehicle_number, type: "car" }];
+    }
+
+    return res.json({ ...invite, vehicles });
+  } catch (err) {
+    console.error("lookupInviteByCode error:", err);
+    return fail(res, 500, "server_error", "Failed to look up invite");
+  }
+};
+
+const deleteInvite = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const { rows: existing } = await client.query(
+      `SELECT id, created_by FROM gate_invites
+        WHERE id = $1 AND account_id = $2`,
+      [id, accountId],
+    );
+    if (!existing.length) return fail(res, 404, "not_found", "Invite not found");
+
+    const isOwner = role === "owner" || role === "admin";
+    if (!isOwner && existing[0].created_by !== userId) {
+      return fail(res, 403, "forbidden", "You can only cancel your own invites");
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE gate_invites
+          SET status = 'cancelled', updated_at = NOW()
+        WHERE id = $1 AND account_id = $2`,
+      [id, accountId],
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_invite",
+      entityId: id,
+      action: "delete",
+      after: { status: "cancelled" },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+    return res.json({ success: true });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("deleteInvite error:", err);
+    return fail(res, 500, "server_error", "Failed to cancel invite");
+  } finally {
+    client.release();
+  }
+};
+
+// ===========================================================================
+// UPDATE INVITE (edit QR)
+// ===========================================================================
+const updateInvite = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const { rows: existing } = await client.query(
+      `SELECT id, created_by FROM gate_invites
+        WHERE id = $1 AND account_id = $2`,
+      [id, accountId],
+    );
+    if (!existing.length) return fail(res, 404, "not_found", "Invite not found");
+
+    const isOwner = role === "owner" || role === "admin";
+    if (!isOwner && existing[0].created_by !== userId) {
+      return fail(res, 403, "forbidden", "You can only edit your own invites");
+    }
+
+    const body = req.body || {};
+
+    // ── Purpose (category) ────────────────────────────────────────
+    let purpose;
+    if (Object.prototype.hasOwnProperty.call(body, "purpose")) {
+      const purposeRaw = String(body.purpose ?? "").toLowerCase().trim();
+      const validPurposes = ["guest", "delivery", "cab", "service", "other"];
+      if (!validPurposes.includes(purposeRaw)) {
+        return fail(res, 400, "invalid_input", "Invalid purpose");
+      }
+      purpose = purposeRaw;
+    }
+
+    // ── Guest name ────────────────────────────────────────────────
+    let guestName = null;
+    if (Object.prototype.hasOwnProperty.call(body, "guestName")) {
+      const v = body.guestName;
+      guestName = v == null || String(v).trim() === "" ? null : String(v).trim();
+      if (guestName && guestName.length > 200) {
+        return fail(res, 400, "invalid_input", "Guest name is too long");
+      }
+    }
+
+    // ── Guest phone ───────────────────────────────────────────────
+    let guestPhone;
+    if (Object.prototype.hasOwnProperty.call(body, "guestPhone")) {
+      const raw = body.guestPhone;
+      guestPhone = raw == null || String(raw).trim() === ""
+        ? null
+        : normalizePhone(raw);
+    }
+
+    // ── Vehicles ──────────────────────────────────────────────────
+    let vehiclesIn;
+    let primaryVehicle;
+    if (Object.prototype.hasOwnProperty.call(body, "vehicles")) {
+      vehiclesIn = normalizeVehiclesPayloadInput(body.vehicles);
+      if (vehiclesIn.length === 0) {
+        const legacy = normalizeVehicleNumber(
+          body.vehicleNumber ?? body.vehicle_number ?? "",
+        );
+        if (legacy && legacy.length >= 5 && legacy.length <= 15) {
+          vehiclesIn = [{ number: legacy, type: "car" }];
+        }
+      }
+      primaryVehicle = vehiclesIn[0]?.number ?? null;
+    }
+
+    // ── Validity window ───────────────────────────────────────────
+    let validFrom = null;
+    if (Object.prototype.hasOwnProperty.call(body, "validFrom")) {
+      const d = new Date(body.validFrom);
+      if (isNaN(d.getTime())) {
+        return fail(res, 400, "invalid_input", "Invalid validFrom");
+      }
+      validFrom = d;
+    }
+
+    let validUntil = null;
+    if (Object.prototype.hasOwnProperty.call(body, "validUntil")) {
+      const d = new Date(body.validUntil);
+      if (isNaN(d.getTime())) {
+        return fail(res, 400, "invalid_input", "Invalid validUntil");
+      }
+      validUntil = d;
+    }
+
+    // ── Guest count ───────────────────────────────────────────────
+    let guestCount;
+    if (Object.prototype.hasOwnProperty.call(body, "guestCount")) {
+      const n = Number(body.guestCount);
+      guestCount = Number.isFinite(n) ? Math.max(1, Math.min(20, Math.trunc(n))) : 1;
+    }
+
+    await client.query("BEGIN");
+
+    const sets = [];
+    const values = [];
+    const push = (col, val) => {
+      values.push(val);
+      sets.push(`${col} = $${values.length}`);
+    };
+
+    if (purpose !== undefined) {
+      push("purpose", purpose);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, "guestName")) {
+      push("guest_name", guestName);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "guestPhone")) {
+      push("guest_phone", guestPhone);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "vehicles")) {
+      push("vehicles", JSON.stringify(vehiclesIn));
+      push("vehicle_number", primaryVehicle);
+    }
+    if (validFrom) push("valid_from", validFrom.toISOString());
+    if (validUntil) push("valid_until", validUntil.toISOString());
+    if (guestCount !== undefined) push("guest_count", guestCount);
+
+    if (sets.length === 0) {
+      await client.query("ROLLBACK");
+      return fail(res, 400, "invalid_input", "No editable fields provided");
+    }
+
+    sets.push("updated_at = NOW()");
+    values.push(id);
+    values.push(accountId);
+
+    const { rows: updated } = await client.query(
+      `UPDATE gate_invites
+          SET ${sets.join(", ")}
+        WHERE id = $${values.length - 1} AND account_id = $${values.length}
+        RETURNING *`,
+      values,
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_invite",
+      entityId: id,
+      action: "update",
+      after: updated[0],
+      metadata: { fields: sets.map((s) => s.split(" ")[0]) },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+    return res.json(updated[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("updateInvite error:", err);
+    return fail(res, 500, "server_error", "Failed to update invite");
+  } finally {
+    client.release();
   }
 };
 
@@ -2689,7 +4296,23 @@ module.exports = {
   upsertMemberPayment, upsertStaffPayment,
   listExpenses, getExpense, createExpense, updateExpense, deleteExpense,
   lookupVehicle,
+  checkVehicleConflict,
   registerVehicle,
   createGateEntry,
   listGateEntries,
+  approveGateEntry,
+  rejectGateEntry,
+  overrideGateEntry,
+  getGateEntryStatus,
+  createAuthorization,
+  listAuthorizations,
+  updateAuthorization,
+  deleteAuthorization,
+  matchAuthorization,
+  createInvite,
+  listInvites,
+  updateInvite,
+  getInvite,
+  lookupInviteByCode,
+  deleteInvite,
 };
