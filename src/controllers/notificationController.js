@@ -462,15 +462,43 @@ function capitalize(s) {
 
 // ---------------------------------------------------------------------------
 // Fresh name lookup
+//
+// CHANGED: prefers users.name (the user's own identity). If that's empty
+// but the user has been linked to a members/staff row, fall back to the
+// directory label so notifications still read naturally.
 // ---------------------------------------------------------------------------
 async function freshUserName(client, userId) {
   if (!userId) return null;
   try {
     const { rows } = await client.query(
-      `SELECT name FROM users WHERE id = $1 LIMIT 1`,
+      `SELECT u.name AS user_name,
+              COALESCE(m.name, s.name) AS directory_name
+         FROM users u
+         LEFT JOIN LATERAL (
+           SELECT m.name
+             FROM members m
+            WHERE m.user_id = u.id
+              AND m.status  = 'active'
+            ORDER BY m.updated_at DESC NULLS LAST, m.created_at DESC
+            LIMIT 1
+         ) m ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT s.name
+             FROM staff s
+            WHERE s.user_id = u.id
+              AND s.status  = 'active'
+            ORDER BY s.updated_at DESC NULLS LAST, s.created_at DESC
+            LIMIT 1
+         ) s ON TRUE
+        WHERE u.id = $1
+        LIMIT 1`,
       [userId],
     );
-    return rows[0]?.name ?? null;
+    const row = rows[0];
+    if (!row) return null;
+    const ownName = (row.user_name || "").trim();
+    if (ownName) return ownName;
+    return row.directory_name ?? null;
   } catch (_e) {
     return null;
   }
@@ -509,7 +537,12 @@ async function projectNotifications(client, entry) {
   if (finalRecipients.length === 0) return;
 
   const actorName = await freshUserName(client, entry.actorUserId);
-  const targetName = await freshUserName(client, entry.targetUserId);
+
+  // Prefer the targetName already computed in writeAudit (which falls back
+  // to the directory label when targetUserId is NULL). Only hit the DB if
+  // it wasn't passed.
+  const targetName = entry.targetName
+    ?? await freshUserName(client, entry.targetUserId);
 
   const data = {
     entityType: entry.entityType,

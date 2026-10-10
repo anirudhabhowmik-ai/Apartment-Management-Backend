@@ -28,20 +28,9 @@ const isContinuationRow = (row) =>
 const isLowerRole = (r) => LOWER_ROLES.includes(r);
 const isExclusiveRole = (r) => EXCLUSIVE_ROLES.includes(r);
 
-// ---------------------------------------------------------------------------
-// Visibility helper — based on the invitation's role
-//   admin / ownership_transfer  → "admin"        (only owner+admin see the
-//                                                 create event; they're the
-//                                                 only ones who need to know
-//                                                 about a pending invite)
-//   member_visibility / staff   → "participants" (owner, admin, and the
-//                                                 target user)
-// ---------------------------------------------------------------------------
 const visibilityForCreate = (role) =>
   ADMIN_LIKE_ROLES.includes(role) ? "admin" : "participants";
 
-// Accept events for admin/ownership are public (everyone should know who the
-// new owner/admin is). Accept events for member/staff stay participants-only.
 const visibilityForAccept = (role) =>
   ADMIN_LIKE_ROLES.includes(role) ? "public" : "participants";
 
@@ -63,6 +52,89 @@ async function getRolesForAccount(userId, accountId) {
 const hasOwnerOrAdmin = (roles) =>
   roles.includes("owner") || roles.includes("admin");
 const isOwner = (roles) => roles.includes("owner");
+
+// ---------------------------------------------------------------------------
+// linkMemberStaffRows — phone-based fallback.
+// Called after the target_member_id / target_staff_id link, as a belt-and-
+// braces match for rows created before this fix (or when the invite did not
+// carry a target_member_id).
+// ---------------------------------------------------------------------------
+async function linkMemberStaffRows(client, accountId, userId, phone) {
+  if (!userId || !phone) return;
+
+  await client.query(
+    `UPDATE members
+        SET user_id = $1, updated_at = NOW()
+      WHERE account_id = $2
+        AND user_id IS NULL
+        AND status   = 'active'
+        AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3`,
+    [userId, accountId, phone],
+  );
+
+  await client.query(
+    `UPDATE staff
+        SET user_id = $1, updated_at = NOW()
+      WHERE account_id = $2
+        AND user_id IS NULL
+        AND status   = 'active'
+        AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3`,
+    [userId, accountId, phone],
+  );
+
+  await client.query(
+    `UPDATE members
+        SET phone = $1, updated_at = NOW()
+      WHERE account_id = $2
+        AND user_id   = $3
+        AND status    = 'active'
+        AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) <> $1`,
+    [phone, accountId, userId],
+  );
+
+  await client.query(
+    `UPDATE staff
+        SET phone = $1, updated_at = NOW()
+      WHERE account_id = $2
+        AND user_id   = $3
+        AND status    = 'active'
+        AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) <> $1`,
+    [phone, accountId, userId],
+  );
+}
+
+// ---------------------------------------------------------------------------
+// linkExplicitTargetRows — exact-row link using the invitation's target IDs.
+// Runs first in acceptInvitation. Works even when members.phone is empty
+// because the invitation tells us precisely which row(s) it belongs to.
+// ---------------------------------------------------------------------------
+async function linkExplicitTargetRows(client, accountId, userId, inv) {
+  if (inv?.target_member_id) {
+    await client.query(
+      `UPDATE members
+          SET user_id    = $1,
+              updated_at = NOW()
+        WHERE id         = $2
+          AND account_id = $3
+          AND status     = 'active'
+          AND user_id IS NULL`,
+      [userId, inv.target_member_id, accountId],
+    );
+  }
+
+  if (inv?.target_staff_id) {
+    await client.query(
+      `UPDATE staff
+          SET user_id    = $1,
+              updated_at = NOW()
+        WHERE id         = $2
+          AND account_id = $3
+          AND status     = 'active'
+          AND user_id IS NULL`,
+      [userId, inv.target_staff_id, accountId],
+    );
+  }
+}
 
 // ===========================================================================
 // PREFLIGHT
@@ -522,7 +594,8 @@ const listInvitations = async (req, res) => {
               u.phone AS invited_by_phone,
               a.name AS account_name, a.photo_url AS account_photo_url,
               au.name AS accepted_user_name, au.photo_url AS accepted_user_photo_url,
-              iu.name AS invitee_user_name, iu.photo_url AS invitee_user_photo_url,
+              COALESCE(iu.name, tm.name, ts.name)           AS invitee_user_name,
+              COALESCE(iu.photo_url, tm.photo_url, ts.photo_url) AS invitee_user_photo_url,
               FALSE AS can_dismiss
          FROM invitations i
          LEFT JOIN users u ON u.id = i.invited_by
@@ -530,6 +603,8 @@ const listInvitations = async (req, res) => {
          LEFT JOIN users iu
            ON RIGHT(REGEXP_REPLACE(COALESCE(iu.phone,''),'\\D','','g'),10)
             = RIGHT(REGEXP_REPLACE(i.invited_phone,'\\D','','g'),10)
+         LEFT JOIN members tm ON tm.id = i.target_member_id
+         LEFT JOIN staff   ts ON ts.id = i.target_staff_id
          LEFT JOIN accounts a ON a.id = i.account_id
          ${invitesWhere}
          ORDER BY i.created_at DESC`,
@@ -807,6 +882,11 @@ const listMyInvitations = async (req, res) => {
 
 // ===========================================================================
 // ACCEPT
+//
+// Fix part 2 lives here: when the invite carries target_member_id or
+// target_staff_id, we link those exact rows FIRST. This works even if
+// members.phone is empty (e.g. the admin-created row was never backfilled).
+// The phone-based linkMemberStaffRows still runs afterwards.
 // ===========================================================================
 const acceptInvitation = async (req, res) => {
   const client = await pool.connect();
@@ -861,7 +941,8 @@ const acceptInvitation = async (req, res) => {
 
       await client.query(
         `UPDATE accounts SET created_by=$1, updated_at=NOW() WHERE id=$2`,
-        [newOwnerId, inv.account_id]);
+        [newOwnerId, inv.account_id],
+      );
 
       await grantRoleWithImpliedRoles(client, inv.account_id, newOwnerId, "admin");
 
@@ -897,7 +978,8 @@ const acceptInvitation = async (req, res) => {
       await client.query(
         `UPDATE invitations SET status='accepted', accepted_by=$1, responded_at=NOW()
           WHERE id=$2`,
-        [newOwnerId, id]);
+        [newOwnerId, id],
+      );
 
       await client.query(
         `UPDATE invitations SET status='cancelled',
@@ -906,13 +988,13 @@ const acceptInvitation = async (req, res) => {
             AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10)=$2
             AND status='pending' AND id <> $3
             AND NOT (accepted_by IS NOT NULL AND accepted_by=invited_by)`,
-        [inv.account_id, myPhone, id]);
+        [inv.account_id, myPhone, id],
+      );
 
-      if (inv.invited_name &&
-          (!userRows[0].name || String(userRows[0].name).trim() === "")) {
-        await client.query(
-          `UPDATE users SET name=$1, updated_at=NOW() WHERE id=$2`,
-          [inv.invited_name, newOwnerId]);
+      // Link explicit target rows first, then phone fallback.
+      await linkExplicitTargetRows(client, inv.account_id, newOwnerId, inv);
+      if (myPhone) {
+        await linkMemberStaffRows(client, inv.account_id, newOwnerId, myPhone);
       }
 
       await writeAudit(client, {
@@ -963,11 +1045,11 @@ const acceptInvitation = async (req, res) => {
       visibility: visibilityForAccept(inv.role),
     });
 
-    if (inv.invited_name &&
-        (!userRows[0].name || String(userRows[0].name).trim() === "")) {
-      await client.query(
-        `UPDATE users SET name=$1, updated_at=NOW() WHERE id=$2`,
-        [inv.invited_name, userId]);
+    // Link exact target rows from the invite (works even if phone is NULL
+    // on the directory row), then fall back to phone matching.
+    await linkExplicitTargetRows(client, inv.account_id, userId, inv);
+    if (myPhone) {
+      await linkMemberStaffRows(client, inv.account_id, userId, myPhone);
     }
 
     if (inv.role === "admin") {
@@ -979,7 +1061,8 @@ const acceptInvitation = async (req, res) => {
             AND role IN ('member_visibility', 'staff_visibility')
             AND status='pending' AND id <> $3
             AND NOT (accepted_by IS NOT NULL AND accepted_by=invited_by)`,
-        [inv.account_id, myPhone, id]);
+        [inv.account_id, myPhone, id],
+      );
     }
 
     await writeAudit(client, {
@@ -1046,7 +1129,8 @@ const rejectInvitation = async (req, res) => {
 
     await client.query(
       `UPDATE invitations SET status='rejected', responded_at=NOW() WHERE id=$1`,
-      [id]);
+      [id],
+    );
 
     await writeAudit(client, {
       accountId: inv.account_id,
@@ -1100,15 +1184,17 @@ const getAdminLinkedProfiles = async (req, res) => {
 
     if (inv.accepted_by) {
       const { rows: m } = await pool.query(
-        `SELECT m.id, u.name FROM members m
-           JOIN users u ON u.id = m.user_id
+        `SELECT m.id, COALESCE(u.name, m.name) AS name
+           FROM members m
+           LEFT JOIN users u ON u.id = m.user_id
           WHERE m.account_id=$1 AND m.user_id=$2 AND m.status='active' LIMIT 1`,
         [accountId, inv.accepted_by]);
       if (m.length) { memberId = m[0].id; memberName = m[0].name; }
 
       const { rows: s } = await pool.query(
-        `SELECT s.id, u.name FROM staff s
-           JOIN users u ON u.id = s.user_id
+        `SELECT s.id, COALESCE(u.name, s.name) AS name
+           FROM staff s
+           LEFT JOIN users u ON u.id = s.user_id
           WHERE s.account_id=$1 AND s.user_id=$2 AND s.status='active' LIMIT 1`,
         [accountId, inv.accepted_by]);
       if (s.length) { staffId = s[0].id; staffName = s[0].name; }
@@ -1157,8 +1243,10 @@ const previewRevoke = async (req, res) => {
     let memberProfile = null, staffProfile = null;
 
     const { rows: m } = await pool.query(
-      `SELECT m.id, m.wing, m.flat_number, m.role, u.name
-         FROM members m JOIN users u ON u.id = m.user_id
+      `SELECT m.id, m.wing, m.flat_number, m.role,
+              COALESCE(u.name, m.name) AS name
+         FROM members m
+         LEFT JOIN users u ON u.id = m.user_id
         WHERE m.account_id=$1 AND m.user_id=$2 AND m.status='active' LIMIT 1`,
       [accountId, targetUserId]);
     if (m.length) {
@@ -1170,8 +1258,9 @@ const previewRevoke = async (req, res) => {
     }
 
     const { rows: s } = await pool.query(
-      `SELECT s.id, s.role, u.name FROM staff s
-         JOIN users u ON u.id = s.user_id
+      `SELECT s.id, s.role, COALESCE(u.name, s.name) AS name
+         FROM staff s
+         LEFT JOIN users u ON u.id = s.user_id
         WHERE s.account_id=$1 AND s.user_id=$2 AND s.status='active' LIMIT 1`,
       [accountId, targetUserId]);
     if (s.length) {
@@ -1407,7 +1496,7 @@ const revokeAccess = async (req, res) => {
 };
 
 // ===========================================================================
-// RENAME PERSON
+// RENAME PERSON  — per-account only. Never touches users.name.
 // ===========================================================================
 const renamePersonOnAccount = async (req, res) => {
   const client = await pool.connect();
@@ -1429,105 +1518,72 @@ const renamePersonOnAccount = async (req, res) => {
 
     await client.query("BEGIN");
 
-    const { rows: userRows } = await client.query(
-      `SELECT id, name FROM users
-        WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10)=$1`,
-      [phone]);
+    const membersResult = await client.query(
+      `UPDATE members
+          SET name = $1, updated_at = NOW()
+        WHERE account_id = $2
+          AND status     = 'active'
+          AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3`,
+      [cleanName, accountId, phone],
+    );
 
-    if (userRows.length > 0) {
-      const userIds = userRows.map((r) => r.id);
-      const beforeNames = userRows.map((r) => ({ id: r.id, name: r.name }));
+    const staffResult = await client.query(
+      `UPDATE staff
+          SET name = $1, updated_at = NOW()
+        WHERE account_id = $2
+          AND status     = 'active'
+          AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3`,
+      [cleanName, accountId, phone],
+    );
 
-      await client.query(
-        `UPDATE users SET name=$1, updated_at=NOW() WHERE id=ANY($2::uuid[])`,
-        [cleanName, userIds]);
+    const invitationsResult = await client.query(
+      `UPDATE invitations SET invited_name = $1
+        WHERE account_id = $2 AND status = 'pending'
+          AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $3`,
+      [cleanName, accountId, phone],
+    );
 
-      const membersResult = await client.query(
-        `UPDATE members SET updated_at=NOW()
-          WHERE account_id=$1 AND user_id=ANY($2::uuid[]) AND status='active'`,
-        [accountId, userIds]);
-      const staffResult = await client.query(
-        `UPDATE staff SET updated_at=NOW()
-          WHERE account_id=$1 AND user_id=ANY($2::uuid[]) AND status='active'`,
-        [accountId, userIds]);
-      const invitationsResult = await client.query(
-        `UPDATE invitations SET invited_name=$1
-          WHERE account_id=$2 AND status='pending'
-            AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10)=$3`,
-        [cleanName, accountId, phone]);
-
-      await writeAudit(client, {
-        accountId,
-        actorUserId: userId,
-        actorRole: requesterRoles[0] ?? null,
-        targetUserId: userIds[0],
-        entityType: "user",
-        entityId: userIds[0],
-        action: "update",
-        before: { names: beforeNames },
-        after: { name: cleanName },
-        metadata: {
-          phone,
-          usersUpdated: userIds.length,
-          membersUpdated: membersResult.rowCount,
-          staffUpdated: staffResult.rowCount,
-          invitationsUpdated: invitationsResult.rowCount,
-        },
-        visibility: "participants",
-      });
-
-      await client.query("COMMIT");
-      return res.json({
-        success: true, name: cleanName,
-        users_updated: userIds.length,
-        members_updated: membersResult.rowCount,
-        staff_updated: staffResult.rowCount,
-        invitations_updated: invitationsResult.rowCount,
-      });
-    }
-
-    const { rows: memberMatches } = await client.query(
-      `SELECT id FROM members WHERE account_id=$1
-         AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10)=$2 LIMIT 1`,
-      [accountId, phone]);
-    const { rows: staffMatches } = await client.query(
-      `SELECT id FROM staff WHERE account_id=$1
-         AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10)=$2 LIMIT 1`,
-      [accountId, phone]);
-    const { rows: pendingInvites } = await client.query(
-      `SELECT id FROM invitations WHERE account_id=$1 AND status='pending'
-         AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10)=$2 LIMIT 1`,
-      [accountId, phone]);
-
-    if (memberMatches.length === 0 && staffMatches.length === 0 && pendingInvites.length === 0) {
+    if (
+      membersResult.rowCount === 0 &&
+      staffResult.rowCount === 0 &&
+      invitationsResult.rowCount === 0
+    ) {
       await client.query("ROLLBACK");
       return fail(res, 404, "not_found");
     }
 
-    const invitationsResult = await client.query(
-      `UPDATE invitations SET invited_name=$1
-        WHERE account_id=$2 AND status='pending'
-          AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10)=$3`,
-      [cleanName, accountId, phone]);
+    const { rows: tu } = await client.query(
+      `SELECT id FROM users
+        WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1 LIMIT 1`,
+      [phone],
+    );
+    const targetUserId = tu[0]?.id ?? null;
 
     await writeAudit(client, {
       accountId,
       actorUserId: userId,
       actorRole: requesterRoles[0] ?? null,
-      entityType: "invitation",
-      action: "rename",
+      targetUserId,
+      entityType: "member",
+      entityId: null,
+      action: "update",
       after: { name: cleanName, phone },
       metadata: {
+        kind: "rename",
+        membersUpdated: membersResult.rowCount,
+        staffUpdated: staffResult.rowCount,
         invitationsUpdated: invitationsResult.rowCount,
-        onlyInvitations: true,
+        scope: "account",
       },
-      visibility: "admin",
+      visibility: "participants",
     });
 
     await client.query("COMMIT");
     return res.json({
       success: true, name: cleanName,
-      users_updated: 0, members_updated: 0, staff_updated: 0,
+      users_updated: 0,
+      members_updated: membersResult.rowCount,
+      staff_updated: staffResult.rowCount,
       invitations_updated: invitationsResult.rowCount,
     });
   } catch (err) {

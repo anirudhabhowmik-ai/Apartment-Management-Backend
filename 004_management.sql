@@ -5,12 +5,22 @@ CREATE TABLE IF NOT EXISTS members (
         REFERENCES accounts(id)
         ON DELETE CASCADE,
 
+    -- Optional link to a real user. NULL until the person installs the app
+    -- and joins via an invitation. Linked in acceptInvitation.
     user_id UUID
         REFERENCES users(id)
         ON DELETE SET NULL,
 
     role VARCHAR(60) NOT NULL DEFAULT 'flat'
         CHECK (role IN ('flat', 'shop', 'custom')),
+
+    -- NEW: admin's directory label for this per-account row.
+    -- These are NEVER copied into users.name / users.photo_url.
+    -- They are used for display only until an active account_members row
+    -- exists for (account_id, user_id), after which reads prefer users.*.
+    name      TEXT,
+    phone     TEXT,
+    photo_url TEXT,
 
     wing VARCHAR(50),
     flat_number VARCHAR(50) NOT NULL,
@@ -41,6 +51,18 @@ CREATE INDEX IF NOT EXISTS idx_members_flat_number
 CREATE INDEX IF NOT EXISTS idx_members_account_status
     ON members(account_id, status);
 
+-- NEW: phone-name consistency check ("one phone -> one name per property").
+CREATE INDEX IF NOT EXISTS members_account_phone_idx
+    ON members (
+      account_id,
+      (RIGHT(REGEXP_REPLACE(COALESCE(phone,''), '\D', '', 'g'), 10))
+    );
+
+-- NEW: accelerates the read-time join that decides admin's label vs user's name.
+CREATE INDEX IF NOT EXISTS members_account_user_idx
+    ON members (account_id, user_id)
+    WHERE user_id IS NOT NULL AND status = 'active';
+
 
 -- -----------------------------------------------------------------------------
 -- 2. STAFF
@@ -52,6 +74,7 @@ CREATE TABLE IF NOT EXISTS staff (
         REFERENCES accounts(id)
         ON DELETE CASCADE,
 
+    -- Same as members.user_id — NULL until the person joins.
     user_id UUID
         REFERENCES users(id)
         ON DELETE SET NULL,
@@ -59,6 +82,11 @@ CREATE TABLE IF NOT EXISTS staff (
     role VARCHAR(60) NOT NULL
         CHECK (role IN ('sweeper', 'security', 'maintenance', 'gardener',
                         'driver', 'accountant', 'custom')),
+
+    -- NEW: admin's directory label for this per-account row.
+    name      TEXT,
+    phone     TEXT,
+    photo_url TEXT,
 
     monthly_salary NUMERIC(12,2) NOT NULL DEFAULT 0,
 
@@ -81,6 +109,17 @@ CREATE INDEX IF NOT EXISTS idx_staff_user_id
 
 CREATE INDEX IF NOT EXISTS idx_staff_account_status
     ON staff(account_id, status);
+
+-- NEW:
+CREATE INDEX IF NOT EXISTS staff_account_phone_idx
+    ON staff (
+      account_id,
+      (RIGHT(REGEXP_REPLACE(COALESCE(phone,''), '\D', '', 'g'), 10))
+    );
+
+CREATE INDEX IF NOT EXISTS staff_account_user_idx
+    ON staff (account_id, user_id)
+    WHERE user_id IS NOT NULL AND status = 'active';
 
 
 -- -----------------------------------------------------------------------------
@@ -344,6 +383,9 @@ CREATE INDEX IF NOT EXISTS idx_vehicles_flat
     ON vehicles(account_id, flat_number);
 
 
+-- -----------------------------------------------------------------------------
+-- 9. GATE AUTHORIZATIONS  (open / named passes)
+-- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS gate_authorizations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -566,6 +608,55 @@ CREATE INDEX IF NOT EXISTS idx_gate_entries_guests_gin
 -- Safe to run against existing databases. Every statement is a no-op if the
 -- column / index / constraint already exists.
 -- =============================================================================
+
+-- ─── members: directory columns + indexes ─────────────────────────────────
+ALTER TABLE members
+    ADD COLUMN IF NOT EXISTS name      TEXT,
+    ADD COLUMN IF NOT EXISTS phone     TEXT,
+    ADD COLUMN IF NOT EXISTS photo_url TEXT;
+
+CREATE INDEX IF NOT EXISTS members_account_phone_idx
+    ON members (
+      account_id,
+      (RIGHT(REGEXP_REPLACE(COALESCE(phone,''), '\D', '', 'g'), 10))
+    );
+
+CREATE INDEX IF NOT EXISTS members_account_user_idx
+    ON members (account_id, user_id)
+    WHERE user_id IS NOT NULL AND status = 'active';
+
+-- ─── staff: directory columns + indexes ───────────────────────────────────
+ALTER TABLE staff
+    ADD COLUMN IF NOT EXISTS name      TEXT,
+    ADD COLUMN IF NOT EXISTS phone     TEXT,
+    ADD COLUMN IF NOT EXISTS photo_url TEXT;
+
+CREATE INDEX IF NOT EXISTS staff_account_phone_idx
+    ON staff (
+      account_id,
+      (RIGHT(REGEXP_REPLACE(COALESCE(phone,''), '\D', '', 'g'), 10))
+    );
+
+CREATE INDEX IF NOT EXISTS staff_account_user_idx
+    ON staff (account_id, user_id)
+    WHERE user_id IS NOT NULL AND status = 'active';
+
+-- ─── Backfill from users for existing rows ────────────────────────────────
+UPDATE members m
+   SET phone     = COALESCE(m.phone,     RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),'\D','','g'),10)),
+       name      = COALESCE(m.name,      u.name),
+       photo_url = COALESCE(m.photo_url, u.photo_url)
+  FROM users u
+ WHERE u.id = m.user_id
+   AND (m.phone IS NULL OR m.name IS NULL OR m.photo_url IS NULL);
+
+UPDATE staff s
+   SET phone     = COALESCE(s.phone,     RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),'\D','','g'),10)),
+       name      = COALESCE(s.name,      u.name),
+       photo_url = COALESCE(s.photo_url, u.photo_url)
+  FROM users u
+ WHERE u.id = s.user_id
+   AND (s.phone IS NULL OR s.name IS NULL OR s.photo_url IS NULL);
 
 -- ─── gate_authorizations: pass_mode, vehicles ─────────────────────────────
 ALTER TABLE gate_authorizations

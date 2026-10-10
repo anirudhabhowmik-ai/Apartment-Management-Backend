@@ -210,6 +210,11 @@ async function resolveIsHomeAccount(client, accountId) {
 
 // ---------------------------------------------------------------------------
 // writeAudit — MUST be called inside an open transaction.
+//
+// CHANGED: when targetUserId is NULL (an admin-created member/staff that
+// hasn't been linked to a users row yet), we fall back to the name
+// snapshot in `after` / `before` so the summary reads "added Anirudh"
+// instead of "added someone".
 // ---------------------------------------------------------------------------
 async function writeAudit(client, entry) {
   const {
@@ -235,9 +240,15 @@ async function writeAudit(client, entry) {
   }
 
   const actorName = await resolveUserName(client, actorUserId);
-  const targetName = targetUserId
-    ? await resolveUserName(client, targetUserId)
-    : null;
+
+  let targetName = null;
+  if (targetUserId) {
+    targetName = await resolveUserName(client, targetUserId);
+  } else if (after && typeof after === "object" && after.name) {
+    targetName = after.name;
+  } else if (before && typeof before === "object" && before.name) {
+    targetName = before.name;
+  }
 
   const isHome = await resolveIsHomeAccount(client, accountId);
 
@@ -337,9 +348,9 @@ const isAdminLike = (role) => role === "owner" || role === "admin";
 // is resolved at query time via the `tu` lateral join and aliased as
 // `tu.id AS target_user_id` in the SELECT list.
 //
-// This means we cannot reference `al.target_user_id` anywhere. Any filter
-// that needs the resolved target user must reference `tu.id` instead — which
-// works because PostgreSQL allows lateral-join aliases in the WHERE clause.
+// CHANGED: the `member` and `staff` branches now use LEFT JOIN and COALESCE
+// so a member/staff row whose user_id is NULL (admin created, user hasn't
+// joined yet) still resolves tu.name from the members/staff table.
 // ---------------------------------------------------------------------------
 const HISTORY_SELECT = `
   SELECT
@@ -377,12 +388,20 @@ const HISTORY_SELECT = `
      WHERE al.entity_type = 'user' AND u.id = al.entity_id
 
     UNION ALL
-    SELECT u.id, u.name, u.phone, u.photo_url
-      FROM members m JOIN users u ON u.id = m.user_id
+    SELECT u.id,
+           COALESCE(u.name, m.name)           AS name,
+           COALESCE(u.phone, m.phone)         AS phone,
+           COALESCE(u.photo_url, m.photo_url) AS photo_url
+      FROM members m
+      LEFT JOIN users u ON u.id = m.user_id
      WHERE al.entity_type = 'member' AND m.id = al.entity_id
     UNION ALL
-    SELECT u.id, u.name, u.phone, u.photo_url
-      FROM staff s JOIN users u ON u.id = s.user_id
+    SELECT u.id,
+           COALESCE(u.name, s.name)           AS name,
+           COALESCE(u.phone, s.phone)         AS phone,
+           COALESCE(u.photo_url, s.photo_url) AS photo_url
+      FROM staff s
+      LEFT JOIN users u ON u.id = s.user_id
      WHERE al.entity_type = 'staff' AND s.id = al.entity_id
 
     UNION ALL
@@ -406,21 +425,6 @@ const HISTORY_SELECT = `
 // ---------------------------------------------------------------------------
 // SQL fragment: hide self-service role grants that duplicate an
 // invitation.accept row.
-//
-// When someone accepts an invitation, the backend writes BOTH:
-//   1. invitation.accept           → "X accepted invitation for tenant access"
-//   2. account_member.role_granted → "X granted themselves tenant access"
-//
-// We suppress the self-grant on the server so every client gets clean data.
-//
-// IMPORTANT: audit_log has NO target_user_id column. The resolved target
-// user id comes from the lateral join alias `tu.id` — which is why we
-// reference `tu.id` here, NOT `al.target_user_id`.
-//
-// Self-grant detection:
-//   • actor_user_id equals the resolved target user id (tu.id), OR
-//   • actor_user_id equals the user_id stored in the `after` JSONB
-//     (used as a fallback when the lateral join couldn't resolve tu.id).
 // ---------------------------------------------------------------------------
 const SELF_GRANT_FILTER = `
   NOT (
@@ -467,7 +471,6 @@ const getAccountHistory = async (req, res) => {
     const params = [accountId];
     let where = `al.account_id = $1`;
 
-    // Hide duplicate self-service role grants.
     where += ` AND ${SELF_GRANT_FILTER}`;
 
     if (entityType) {
@@ -560,7 +563,6 @@ const getMyHistory = async (req, res) => {
       )
     )`;
 
-    // Hide duplicate self-service role grants.
     where += ` AND ${SELF_GRANT_FILTER}`;
 
     if (isTenantViewer) {

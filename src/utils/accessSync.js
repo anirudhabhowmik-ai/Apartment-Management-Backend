@@ -1,4 +1,6 @@
 // src/utils/accessSync.js
+const { pool } = require("../config/database");
+
 const normalizePhone = (raw) => {
   if (!raw) return null;
   const digits = String(raw).replace(/\D/g, "");
@@ -10,10 +12,18 @@ const normalizePhone = (raw) => {
 // Users lookup
 // -----------------------------------------------------------------------------
 
+/**
+ * Pure lookup: return users.id for a phone, or null.
+ * Never creates a users row. Never writes to users.*
+ *
+ * This is the ONLY function admin-side code should use when it wants to
+ * opportunistically link a members/staff row to an existing user.
+ */
 async function findUserIdByPhone(client, phone) {
   const ten = normalizePhone(phone);
   if (!ten) return null;
-  const { rows } = await client.query(
+  const runner = client || pool;
+  const { rows } = await runner.query(
     `SELECT id FROM users
        WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
        LIMIT 1`,
@@ -23,41 +33,61 @@ async function findUserIdByPhone(client, phone) {
 }
 
 /**
- * Return users.id for `phone`, creating the row if it doesn't exist.
- * If the user already exists and has no name, seed it from `fallbackName`.
- * Never grants access — this only touches `users`.
+ * Backwards-compatible alias. Kept so existing callers don't break on import.
+ *
+ * ⚠️ Behaviour change from the previous version:
+ *   - Does NOT create a users row when the phone is unknown.
+ *   - Does NOT seed users.name from the admin-supplied `fallbackName`.
+ *
+ * Admin-created members/staff rows are now the only place an unverified name
+ * is stored. `users` is written only when the real person logs in.
+ *
+ * The `fallbackName` argument is accepted and ignored so we don't have to
+ * touch every call site in one commit.
  */
-async function ensureUserForPhone(client, phone, fallbackName) {
+async function ensureUserForPhone(client, phone, _fallbackName) {
+  return findUserIdByPhone(client, phone);
+}
+
+// -----------------------------------------------------------------------------
+// Per-account directory checks (used by createMember / createStaff)
+// -----------------------------------------------------------------------------
+
+/**
+ * Return the first active members/staff row in `accountId` that already has
+ * the given phone, optionally excluding a row by id.
+ *
+ * Used to enforce the rule:
+ *   one phone  →  one name  within a single property.
+ *
+ * Returns { kind: 'member'|'staff', id, name } or null.
+ */
+async function findExistingDirectoryEntry(client, accountId, phone, excludeId = null) {
   const ten = normalizePhone(phone);
-  if (!ten) return null;
+  if (!ten || !accountId) return null;
+  const runner = client || pool;
 
-  const { rows: existing } = await client.query(
-    `SELECT id, name FROM users
-       WHERE RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10) = $1
-       LIMIT 1`,
-    [ten],
+  const { rows } = await runner.query(
+    `SELECT kind, id, name FROM (
+       SELECT 'member'::text AS kind, id, name
+         FROM members
+        WHERE account_id = $1
+          AND status     = 'active'
+          AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $2
+       UNION ALL
+       SELECT 'staff'::text AS kind, id, name
+         FROM staff
+        WHERE account_id = $1
+          AND status     = 'active'
+          AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $2
+     ) x
+     WHERE ($3::uuid IS NULL OR id <> $3::uuid)
+     ORDER BY name NULLS FIRST
+     LIMIT 1`,
+    [accountId, ten, excludeId],
   );
 
-  if (existing.length) {
-    const user = existing[0];
-    if (fallbackName && (!user.name || String(user.name).trim() === "")) {
-      await client.query(
-        `UPDATE users
-            SET name = $1, updated_at = NOW()
-          WHERE id = $2`,
-        [fallbackName, user.id],
-      );
-    }
-    return user.id;
-  }
-
-  const { rows: created } = await client.query(
-    `INSERT INTO users (phone, name, is_active, last_login_at)
-     VALUES ($1, $2, true, NULL)
-     RETURNING id`,
-    [`91${ten}`, fallbackName || null],
-  );
-  return created[0].id;
+  return rows[0] ?? null;
 }
 
 // -----------------------------------------------------------------------------
@@ -193,7 +223,8 @@ async function isEligibleForAutoGrant(client, accountId, userId) {
 module.exports = {
   normalizePhone,
   findUserIdByPhone,
-  ensureUserForPhone,
+  ensureUserForPhone,          // lookup-only alias
+  findExistingDirectoryEntry,  // new — phone-name consistency check
   hasActiveMemberRow,
   hasActiveStaffRow,
   deactivateAccessRole,

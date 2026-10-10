@@ -154,17 +154,37 @@ const EVENT_COLS = `
   e.created_by_id, e.created_by_name, e.created_by_phone, e.created_by_role,
   e.approved_by_id, e.approved_by_name, e.approved_by_phone, e.approved_by_role,
   e.rejection_reason, e.created_at, e.updated_at,
-  creator.photo_url  AS created_by_photo,
-  approver.photo_url AS approved_by_photo
+  COALESCE(creator.photo_url,  creator_member.photo_url)  AS created_by_photo,
+  COALESCE(approver.photo_url, approver_member.photo_url) AS approved_by_photo
 `;
 
+// Photo resolution: prefer users.photo_url; fall back to the members row in
+// this account that matches the event's stored phone number.
 const EVENT_JOINS = `
   LEFT JOIN users creator
          ON RIGHT(REGEXP_REPLACE(creator.phone,'\\D','','g'),10)
           = RIGHT(REGEXP_REPLACE(e.created_by_phone,'\\D','','g'),10)
+  LEFT JOIN LATERAL (
+    SELECT m.photo_url
+      FROM members m
+     WHERE m.account_id = e.account_id
+       AND m.status     = 'active'
+       AND RIGHT(REGEXP_REPLACE(COALESCE(m.phone,''),'\\D','','g'),10)
+         = RIGHT(REGEXP_REPLACE(COALESCE(e.created_by_phone,''),'\\D','','g'),10)
+     LIMIT 1
+  ) creator_member ON TRUE
   LEFT JOIN users approver
          ON RIGHT(REGEXP_REPLACE(approver.phone,'\\D','','g'),10)
           = RIGHT(REGEXP_REPLACE(e.approved_by_phone,'\\D','','g'),10)
+  LEFT JOIN LATERAL (
+    SELECT m.photo_url
+      FROM members m
+     WHERE m.account_id = e.account_id
+       AND m.status     = 'active'
+       AND RIGHT(REGEXP_REPLACE(COALESCE(m.phone,''),'\\D','','g'),10)
+         = RIGHT(REGEXP_REPLACE(COALESCE(e.approved_by_phone,''),'\\D','','g'),10)
+     LIMIT 1
+  ) approver_member ON TRUE
 `;
 
 // ---------------------------------------------------------------------------
@@ -177,11 +197,22 @@ async function fetchResponses(eventIds) {
     `SELECT r.event_id,
             r.user_id, r.name, r.phone, r.role, r.response,
             r.reason, r.note, r.responded_at,
-            u.photo_url
+            COALESCE(u.photo_url, m.photo_url) AS photo_url
        FROM calendar_event_responses r
        LEFT JOIN users u
               ON RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10)
                = RIGHT(REGEXP_REPLACE(r.phone,'\\D','','g'),10)
+       LEFT JOIN LATERAL (
+         SELECT mm.photo_url
+           FROM members mm
+          WHERE mm.status = 'active'
+            AND mm.account_id IN (
+              SELECT account_id FROM calendar_events WHERE id = r.event_id
+            )
+            AND RIGHT(REGEXP_REPLACE(COALESCE(mm.phone,''),'\\D','','g'),10)
+              = RIGHT(REGEXP_REPLACE(COALESCE(r.phone,''),'\\D','','g'),10)
+          LIMIT 1
+       ) m ON TRUE
       WHERE r.event_id = ANY($1::uuid[])`,
     [eventIds]
   );
@@ -207,18 +238,50 @@ async function fetchEventWithResponses(eventId) {
   return mapEventRow(rows[0], byEvent.get(eventId) ?? []);
 }
 
+// ---------------------------------------------------------------------------
+// resolveDisplayName
+//
+// Lookup order:
+//   1. users.name              (the user's own identity, by phone)
+//   2. members.name            (this account's directory row, by phone)
+//   3. staff.name              (this account's directory row, by phone)
+//   4. fallback
+//
+// The `client` argument is used for transactional callers (createEvent);
+// non-transactional callers pass `pool`.
+// ---------------------------------------------------------------------------
 async function resolveDisplayName(client, accountId, phone, fallback) {
   if (!phone) return fallback;
   if (!isUuid(accountId)) return fallback;
 
+  const runner = client || pool;
+
+  // 1. users.name — the user's own identity.
   try {
-    const { rows } = await client.query(
-      `SELECT u.name AS name
-         FROM users u
-         JOIN members m ON m.user_id = u.id
-        WHERE m.account_id = $1
-          AND m.status     = 'active'
-          AND RIGHT(REGEXP_REPLACE(u.phone, '\\D', '', 'g'), 10) = $2
+    const { rows } = await runner.query(
+      `SELECT name
+         FROM users
+        WHERE RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $1
+        LIMIT 1`,
+      [phone]
+    );
+    if (rows.length && rows[0].name && String(rows[0].name).trim()) {
+      return String(rows[0].name).trim();
+    }
+  } catch (e) {
+    console.warn("[resolveDisplayName] users lookup failed:", e.message);
+  }
+
+  // 2. members.name — this account's directory label.
+  try {
+    const { rows } = await runner.query(
+      `SELECT name
+         FROM members
+        WHERE account_id = $1
+          AND status     = 'active'
+          AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $2
+          AND name IS NOT NULL
+          AND TRIM(name) <> ''
         LIMIT 1`,
       [accountId, phone]
     );
@@ -227,33 +290,22 @@ async function resolveDisplayName(client, accountId, phone, fallback) {
     console.warn("[resolveDisplayName] members lookup failed:", e.message);
   }
 
+  // 3. staff.name — same, staff side.
   try {
-    const { rows } = await client.query(
-      `SELECT u.name AS name
-         FROM users u
-         JOIN staff s ON s.user_id = u.id
-        WHERE s.account_id = $1
-          AND s.status     = 'active'
-          AND RIGHT(REGEXP_REPLACE(u.phone, '\\D', '', 'g'), 10) = $2
+    const { rows } = await runner.query(
+      `SELECT name
+         FROM staff
+        WHERE account_id = $1
+          AND status     = 'active'
+          AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $2
+          AND name IS NOT NULL
+          AND TRIM(name) <> ''
         LIMIT 1`,
       [accountId, phone]
     );
     if (rows.length && rows[0].name) return rows[0].name;
   } catch (e) {
     console.warn("[resolveDisplayName] staff lookup failed:", e.message);
-  }
-
-  try {
-    const { rows } = await client.query(
-      `SELECT name
-         FROM users
-        WHERE RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $1
-        LIMIT 1`,
-      [phone]
-    );
-    if (rows.length && rows[0].name) return rows[0].name;
-  } catch (e) {
-    console.warn("[resolveDisplayName] users lookup failed:", e.message);
   }
 
   return fallback;

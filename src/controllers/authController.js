@@ -739,11 +739,9 @@ const deleteMe = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // Lock the user row
     const { rows: userRows } = await client.query(
       `SELECT id, is_active FROM users WHERE id = $1 FOR UPDATE`,
-      [userId],
-    );
+      [userId]);
     if (!userRows.length) {
       await client.query("ROLLBACK");
       client.release();
@@ -758,84 +756,54 @@ const deleteMe = async (req, res) => {
       });
     }
 
-    // ── Step 1: Find owned accounts (before cascade) ─────────────
     const { rows: ownedRows } = await client.query(
       `SELECT id FROM accounts WHERE created_by = $1`,
-      [userId],
-    );
+      [userId]);
     const ownedAccountIds = ownedRows.map((r) => r.id);
     const hasOwned = ownedAccountIds.length > 0;
 
-    // ── Step 2: Manually clean non-cascaded tables for owned accounts ──
     if (hasOwned) {
       await client.query(
         `DELETE FROM audit_log WHERE account_id = ANY($1::uuid[])`,
-        [ownedAccountIds],
-      );
+        [ownedAccountIds]);
       await client.query(
         `DELETE FROM notifications WHERE account_id = ANY($1::uuid[])`,
-        [ownedAccountIds],
-      );
+        [ownedAccountIds]);
       await client.query(
         `DELETE FROM ownership_transfers WHERE account_id = ANY($1::uuid[])`,
-        [ownedAccountIds],
-      );
+        [ownedAccountIds]);
     }
 
-    // ── Step 3: Clean user-scoped rows (this user's own data) ──
-    // These reference the user directly, not an account.
-    await client.query(
-      `DELETE FROM audit_log WHERE actor_user_id = $1`,
-      [userId],
-    );
-    await client.query(
-      `DELETE FROM notifications WHERE user_id = $1`,
-      [userId],
-    );
-    await client.query(
-      `DELETE FROM notification_preferences WHERE user_id = $1`,
-      [userId],
-    );
-    await client.query(
-      `DELETE FROM user_push_tokens WHERE user_id = $1`,
-      [userId],
-    );
+    await client.query(`DELETE FROM audit_log WHERE actor_user_id = $1`, [userId]);
+    await client.query(`DELETE FROM notifications WHERE user_id = $1`, [userId]);
+    await client.query(`DELETE FROM notification_preferences WHERE user_id = $1`, [userId]);
+    await client.query(`DELETE FROM user_push_tokens WHERE user_id = $1`, [userId]);
 
-    // ── Step 4: Delete owned accounts (cascades children) ──
     let deletedAccounts = 0;
     if (hasOwned) {
       const result = await client.query(
         `DELETE FROM accounts WHERE created_by = $1`,
-        [userId],
-      );
+        [userId]);
       deletedAccounts = result.rowCount;
     }
 
-    // ── Step 5: Deactivate memberships in OTHER people's accounts ──
     await client.query(
       `UPDATE account_members
           SET status = 'inactive', updated_at = NOW()
         WHERE user_id = $1 AND status = 'active'`,
-      [userId],
-    );
+      [userId]);
 
-    // ── Step 6: Remove phone-visibility grants they made ──
     await client.query(
       `DELETE FROM member_phone_visibility WHERE viewer_user_id = $1`,
-      [userId],
-    );
+      [userId]);
 
-    // ── Step 7: Clear stale last_account_id ──
     await client.query(
       `UPDATE users SET last_account_id = NULL WHERE id = $1`,
-      [userId],
-    );
+      [userId]);
 
-    // ── Step 8: Deactivate the login ──
     await client.query(
       `UPDATE users SET is_active = false, updated_at = NOW() WHERE id = $1`,
-      [userId],
-    );
+      [userId]);
 
     await client.query("COMMIT");
 
@@ -889,7 +857,6 @@ const recoverAccount = async (req, res) => {
       });
     }
 
-    // Verify the recovery token
     let decoded;
     try {
       decoded = jwt.verify(recoveryToken, process.env.JWT_SECRET);
@@ -913,8 +880,7 @@ const recoverAccount = async (req, res) => {
       `SELECT id, phone, name, photo_url, is_active,
               last_login_at, last_account_id, created_at, updated_at
          FROM users WHERE id = $1 LIMIT 1`,
-      [userId],
-    );
+      [userId]);
     if (!userRows.length) {
       return res.status(404).json({
         success: false,
@@ -944,8 +910,7 @@ const recoverAccount = async (req, res) => {
         WHERE id = $1
         RETURNING id, phone, name, photo_url, is_active,
                   last_login_at, last_account_id, created_at, updated_at`,
-      [user.id],
-    );
+      [user.id]);
 
     const recoveredUser = updatedRows[0];
     const token = createAppToken(recoveredUser);

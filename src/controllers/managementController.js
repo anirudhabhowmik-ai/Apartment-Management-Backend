@@ -2,7 +2,8 @@
 const { pool } = require("../config/database");
 const {
   isEligibleForAutoGrant,
-  ensureUserForPhone,
+  findUserIdByPhone,
+  findExistingDirectoryEntry,
   deactivateAccessRole,
 } = require("../utils/accessSync");
 const { writeAudit } = require("./auditController");
@@ -523,23 +524,12 @@ async function syncStaffAccessOnCreate(client, accountId, staffRow) {
 // Flat uniqueness helpers
 // ─────────────────────────────────────────────────────────────────────────
 
-/**
- * Normalize a flat/wing value for comparison. Trims, collapses whitespace,
- * and treats empty strings as null.
- */
 function normalizeFlatKeyValue(raw) {
   if (raw === null || raw === undefined) return null;
   const s = String(raw).trim().replace(/\s+/g, " ");
   return s.length === 0 ? null : s;
 }
 
-/**
- * Returns the conflicting member row (id, flat_number, wing, name) if the
- * given flat+wing is already registered to an active member of this account.
- * Excludes `excludeMemberId` (used by updateMember).
- *
- * Passing `client` = null uses the pool directly.
- */
 async function findFlatConflict(
   client,
   accountId,
@@ -554,9 +544,8 @@ async function findFlatConflict(
   const runner = client || pool;
 
   const { rows } = await runner.query(
-    `SELECT m.id, m.flat_number, m.wing, u.name
+    `SELECT m.id, m.flat_number, m.wing, m.name
        FROM members m
-       LEFT JOIN users u ON u.id = m.user_id
       WHERE m.account_id = $1
         AND m.status = 'active'
         AND LOWER(TRIM(m.flat_number)) = LOWER($2)
@@ -570,6 +559,76 @@ async function findFlatConflict(
   );
 
   return rows[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Resolve an "existing" selection coming from the picker.
+// ---------------------------------------------------------------------------
+async function resolveExistingSelection(client, accountId, rawUserId) {
+  if (!rawUserId || typeof rawUserId !== "string") {
+    const err = new Error("user_id is required for mode=existing");
+    err.code = "invalid_input";
+    throw err;
+  }
+
+  if (rawUserId.startsWith("pending:")) {
+    const parts = rawUserId.split(":");
+    const sourceKind = parts[1];
+    const sourceId = parts[2];
+
+    if (!sourceId || (sourceKind !== "member" && sourceKind !== "staff")) {
+      const err = new Error("Invalid pending id");
+      err.code = "invalid_input";
+      throw err;
+    }
+
+    const table = sourceKind === "member" ? "members" : "staff";
+    const { rows } = await client.query(
+      `SELECT id, user_id, name, phone, photo_url
+         FROM ${table}
+        WHERE id = $1 AND account_id = $2 AND status = 'active'
+        LIMIT 1`,
+      [sourceId, accountId],
+    );
+    const row = rows[0];
+    if (!row) {
+      const err = new Error("Directory entry not found");
+      err.code = "not_found";
+      throw err;
+    }
+
+    const phone = (row.phone ?? "").replace(/\D/g, "").slice(-10) || null;
+
+    let linkedUserId = row.user_id;
+    if (!linkedUserId && phone) {
+      linkedUserId = await findUserIdByPhone(client, phone);
+    }
+
+    return {
+      userId: linkedUserId,
+      name: row.name ?? "",
+      phone: phone ?? "",
+      photoUrl: row.photo_url ?? null,
+    };
+  }
+
+  const { rows: u } = await client.query(
+    `SELECT id, name, phone, photo_url FROM users WHERE id=$1 LIMIT 1`,
+    [rawUserId],
+  );
+  const user = u[0];
+  if (!user) {
+    const err = new Error("Person not found");
+    err.code = "not_found";
+    throw err;
+  }
+
+  return {
+    userId: user.id,
+    name: user.name ?? "",
+    phone: (user.phone ?? "").replace(/\D/g, "").slice(-10),
+    photoUrl: user.photo_url ?? null,
+  };
 }
 
 // ===========================================================================
@@ -613,9 +672,9 @@ const listAccountPeople = async (req, res) => {
     }
 
     const { rows: memberRows } = await pool.query(
-      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
-         FROM members m JOIN users u ON u.id = m.user_id
-        WHERE m.account_id=$1 AND m.status='active'`,
+      `SELECT m.user_id, m.name, m.phone, m.photo_url
+         FROM members m
+        WHERE m.account_id=$1 AND m.status='active' AND m.user_id IS NOT NULL`,
       [accountId]);
     for (const r of memberRows) {
       if (!r.user_id || map.has(r.user_id)) continue;
@@ -626,9 +685,9 @@ const listAccountPeople = async (req, res) => {
     }
 
     const { rows: staffRows } = await pool.query(
-      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
-         FROM staff s JOIN users u ON u.id = s.user_id
-        WHERE s.account_id=$1 AND s.status='active'`,
+      `SELECT s.user_id, s.name, s.phone, s.photo_url
+         FROM staff s
+        WHERE s.account_id=$1 AND s.status='active' AND s.user_id IS NOT NULL`,
       [accountId]);
     for (const r of staffRows) {
       if (!r.user_id || map.has(r.user_id)) continue;
@@ -636,6 +695,54 @@ const listAccountPeople = async (req, res) => {
         user_id: r.user_id, name: r.name ?? "", phone: r.phone ?? null,
         photo_url: r.photo_url ?? null, kind: "staff",
       });
+    }
+
+    {
+      const { rows: pendingMembers } = await pool.query(
+        `SELECT id::text AS member_id, name, phone, photo_url
+           FROM members
+          WHERE account_id = $1
+            AND status     = 'active'
+            AND user_id IS NULL
+          ORDER BY created_at ASC`,
+        [accountId]);
+
+      for (const r of pendingMembers) {
+        const key = `pending:member:${r.member_id}`;
+        if (map.has(key)) continue;
+        map.set(key, {
+          user_id: key,
+          name: r.name ?? "",
+          phone: r.phone ?? null,
+          photo_url: r.photo_url ?? null,
+          kind: "member",
+          pending: true,
+        });
+      }
+    }
+
+    {
+      const { rows: pendingStaff } = await pool.query(
+        `SELECT id::text AS staff_id, name, phone, photo_url
+           FROM staff
+          WHERE account_id = $1
+            AND status     = 'active'
+            AND user_id IS NULL
+          ORDER BY created_at ASC`,
+        [accountId]);
+
+      for (const r of pendingStaff) {
+        const key = `pending:staff:${r.staff_id}`;
+        if (map.has(key)) continue;
+        map.set(key, {
+          user_id: key,
+          name: r.name ?? "",
+          phone: r.phone ?? null,
+          photo_url: r.photo_url ?? null,
+          kind: "staff",
+          pending: true,
+        });
+      }
     }
 
     const result = Array.from(map.values())
@@ -650,6 +757,10 @@ const listAccountPeople = async (req, res) => {
 
 // ===========================================================================
 // MEMBERS
+//
+// The LATERAL subquery now falls back to phone matching when the directory
+// row still has user_id = NULL. This is the fix that makes an admin-created
+// "AB" row display as "Anirudha" the moment the real user joins the property.
 // ===========================================================================
 const listMembers = async (req, res) => {
   try {
@@ -667,14 +778,30 @@ const listMembers = async (req, res) => {
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
               m.maintenance_amount, m.status, m.created_by,
               m.created_at, m.updated_at,
-              u.name, u.phone, u.photo_url,
-              EXISTS (SELECT 1 FROM account_members am
-                       WHERE am.account_id = m.account_id
-                         AND am.user_id = m.user_id
-                         AND am.status = 'active') AS has_access
-         FROM members m JOIN users u ON u.id = m.user_id
+              COALESCE(joined.name,      m.name)      AS name,
+              COALESCE(joined.phone,     m.phone)     AS phone,
+              COALESCE(joined.photo_url, m.photo_url) AS photo_url,
+              (joined.user_id IS NOT NULL) AS has_access
+         FROM members m
+         LEFT JOIN LATERAL (
+           SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+             FROM account_members am
+             JOIN users u ON u.id = am.user_id
+            WHERE am.account_id = m.account_id
+              AND am.status     = 'active'
+              AND (
+                (m.user_id IS NOT NULL AND am.user_id = m.user_id)
+                OR (
+                  m.user_id IS NULL
+                  AND m.phone IS NOT NULL
+                  AND RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),'\\D','','g'),10)
+                    = RIGHT(REGEXP_REPLACE(COALESCE(m.phone,''),'\\D','','g'),10)
+                )
+              )
+            LIMIT 1
+         ) joined ON TRUE
         WHERE m.account_id=$1 AND m.status='active'
-        ORDER BY m.flat_number, u.name`,
+        ORDER BY m.flat_number, COALESCE(joined.name, m.name)`,
       [accountId]);
 
     const memberIds = rows.map((r) => r.id);
@@ -688,8 +815,7 @@ const listMembers = async (req, res) => {
             AND member_id = ANY($2::uuid[])
             AND status = 'active'
           ORDER BY created_at ASC`,
-        [accountId, memberIds],
-      );
+        [accountId, memberIds]);
       for (const v of vehicleRows) {
         if (!vehiclesByMember.has(v.member_id)) {
           vehiclesByMember.set(v.member_id, []);
@@ -738,8 +864,7 @@ const listMembers = async (req, res) => {
         WHERE am.account_id = $1
           AND am.role = 'admin'
           AND am.status = 'active'`,
-      [accountId],
-    );
+      [accountId]);
     const privilegedUserIds = new Set(
       privilegedRows.map((r) => r.user_id).filter(Boolean),
     );
@@ -780,12 +905,28 @@ const getMember = async (req, res) => {
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
               m.maintenance_amount, m.status, m.created_by,
               m.created_at, m.updated_at,
-              u.name, u.phone, u.photo_url,
-              EXISTS (SELECT 1 FROM account_members am
-                       WHERE am.account_id = m.account_id
-                         AND am.user_id = m.user_id
-                         AND am.status = 'active') AS has_access
-         FROM members m JOIN users u ON u.id = m.user_id
+              COALESCE(joined.name,      m.name)      AS name,
+              COALESCE(joined.phone,     m.phone)     AS phone,
+              COALESCE(joined.photo_url, m.photo_url) AS photo_url,
+              (joined.user_id IS NOT NULL) AS has_access
+         FROM members m
+         LEFT JOIN LATERAL (
+           SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+             FROM account_members am
+             JOIN users u ON u.id = am.user_id
+            WHERE am.account_id = m.account_id
+              AND am.status     = 'active'
+              AND (
+                (m.user_id IS NOT NULL AND am.user_id = m.user_id)
+                OR (
+                  m.user_id IS NULL
+                  AND m.phone IS NOT NULL
+                  AND RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),'\\D','','g'),10)
+                    = RIGHT(REGEXP_REPLACE(COALESCE(m.phone,''),'\\D','','g'),10)
+                )
+              )
+            LIMIT 1
+         ) joined ON TRUE
         WHERE m.id=$1 AND m.account_id=$2 AND m.status='active'`,
       [id, accountId]);
 
@@ -857,19 +998,10 @@ const createMember = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // ── Flat / Room number uniqueness ────────────────────────────────
-    // A flat number (within the same wing bucket) can only belong to one
-    // active member at a time. Trying to re-register a flat that already
-    // exists returns 409 flat_already_registered.
     {
       const flatConflict = await findFlatConflict(
-        client,
-        accountId,
-        flat_number,
-        wing,
-        null,
+        client, accountId, flat_number, wing, null,
       );
-
       if (flatConflict) {
         await client.query("ROLLBACK");
         return fail(
@@ -886,21 +1018,22 @@ const createMember = async (req, res) => {
     let targetUserId = null;
     let targetName = "";
     let targetPhone = "";
+    let targetPhotoUrl = null;
 
     if (mode === "existing") {
-      targetUserId = body.user_id || null;
-      if (!targetUserId) {
+      try {
+        const resolved = await resolveExistingSelection(
+          client, accountId, body.user_id,
+        );
+        targetUserId = resolved.userId;
+        targetName = resolved.name;
+        targetPhone = resolved.phone;
+        targetPhotoUrl = resolved.photoUrl;
+      } catch (e) {
         await client.query("ROLLBACK");
-        return fail(res, 400, "invalid_input", "user_id is required for mode=existing");
+        const status = e?.code === "not_found" ? 404 : 400;
+        return fail(res, status, e?.code ?? "invalid_input", e?.message ?? "Invalid selection");
       }
-      const { rows: u } = await client.query(
-        `SELECT id, name, phone FROM users WHERE id=$1 LIMIT 1`, [targetUserId]);
-      if (!u.length) {
-        await client.query("ROLLBACK");
-        return fail(res, 404, "not_found", "Person not found");
-      }
-      targetName = u[0].name ?? "";
-      targetPhone = (u[0].phone ?? "").replace(/\D/g, "").slice(-10);
     } else {
       const name = (body.name || "").trim();
       const phone = normalizePhone(body.phone);
@@ -915,15 +1048,30 @@ const createMember = async (req, res) => {
         return fail(res, 400, "invalid_input", "A valid 10-digit phone is required");
       }
 
-      targetUserId = await ensureUserForPhone(client, phone, name);
       targetName = name;
       targetPhone = phone;
+      targetPhotoUrl = photo_url;
 
-      if (photo_url !== null && photo_url !== undefined) {
-        await client.query(
-          `UPDATE users SET photo_url = COALESCE(photo_url, $1), updated_at = NOW()
-            WHERE id = $2`,
-          [photo_url, targetUserId]);
+      targetUserId = await findUserIdByPhone(client, phone);
+    }
+
+    if (targetPhone) {
+      const existingEntry = await findExistingDirectoryEntry(
+        client, accountId, targetPhone, null,
+      );
+      if (
+        existingEntry &&
+        existingEntry.name &&
+        existingEntry.name.trim().toLowerCase() !==
+          String(targetName || "").trim().toLowerCase()
+      ) {
+        await client.query("ROLLBACK");
+        return fail(
+          res,
+          409,
+          "phone_name_mismatch",
+          `${targetPhone} is already in this property as "${existingEntry.name}" (${existingEntry.kind}). Use that name, or edit the existing entry.`,
+        );
       }
     }
 
@@ -931,11 +1079,15 @@ const createMember = async (req, res) => {
       `INSERT INTO members
          (account_id, user_id, role, wing, flat_number,
           area_sqft, parking_available, maintenance_amount,
+          name, phone, photo_url,
           status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12)
        RETURNING id`,
-      [accountId, targetUserId, memberRole, wing, flat_number,
-       area_sqft, parking_available, maintenance_amount, userId]);
+      [
+        accountId, targetUserId, memberRole, wing, flat_number,
+        area_sqft, parking_available, maintenance_amount,
+        targetName, targetPhone, targetPhotoUrl, userId,
+      ]);
 
     const memberId = rows[0].id;
 
@@ -969,12 +1121,28 @@ const createMember = async (req, res) => {
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
               m.maintenance_amount, m.status, m.created_by,
               m.created_at, m.updated_at,
-              u.name, u.phone, u.photo_url,
-              EXISTS (SELECT 1 FROM account_members am
-                       WHERE am.account_id = m.account_id
-                         AND am.user_id = m.user_id
-                         AND am.status = 'active') AS has_access
-         FROM members m JOIN users u ON u.id = m.user_id
+              COALESCE(joined.name,      m.name)      AS name,
+              COALESCE(joined.phone,     m.phone)     AS phone,
+              COALESCE(joined.photo_url, m.photo_url) AS photo_url,
+              (joined.user_id IS NOT NULL) AS has_access
+         FROM members m
+         LEFT JOIN LATERAL (
+           SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+             FROM account_members am
+             JOIN users u ON u.id = am.user_id
+            WHERE am.account_id = m.account_id
+              AND am.status     = 'active'
+              AND (
+                (m.user_id IS NOT NULL AND am.user_id = m.user_id)
+                OR (
+                  m.user_id IS NULL
+                  AND m.phone IS NOT NULL
+                  AND RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),'\\D','','g'),10)
+                    = RIGHT(REGEXP_REPLACE(COALESCE(m.phone,''),'\\D','','g'),10)
+                )
+              )
+            LIMIT 1
+         ) joined ON TRUE
         WHERE m.id = $1`,
       [memberId]);
 
@@ -1026,7 +1194,7 @@ const updateMember = async (req, res) => {
     if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows } = await client.query(
-      `SELECT id, user_id FROM members
+      `SELECT id, user_id, name, phone FROM members
         WHERE id=$1 AND account_id=$2 AND status='active'`,
       [id, accountId]);
     if (!rows.length) return fail(res, 404, "not_found", "Member not found");
@@ -1035,17 +1203,9 @@ const updateMember = async (req, res) => {
       return fail(res, 403, "forbidden", "Only owners and admins can edit members");
     }
 
-    const targetUserId = rows[0].user_id;
-    const identityLocked = await hasActiveAccountMemberRow(client, accountId, targetUserId);
-
     const hasName = Object.prototype.hasOwnProperty.call(req.body, "name");
     const hasPhone = Object.prototype.hasOwnProperty.call(req.body, "phone");
     const hasPhoto = Object.prototype.hasOwnProperty.call(req.body, "photo_url");
-
-    if (identityLocked && (hasName || hasPhone || hasPhoto)) {
-      return fail(res, 403, "user_identity_locked",
-        "This person has joined the app. Their name, phone and photo can only be changed by them.");
-    }
 
     const newName = hasName ? String(req.body.name ?? "").trim() || null : null;
     const newPhone = hasPhone ? normalizePhone(req.body.phone) : null;
@@ -1089,13 +1249,12 @@ const updateMember = async (req, res) => {
       `SELECT m.id, m.account_id, m.user_id, m.role,
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
               m.maintenance_amount, m.status,
-              u.name, u.phone, u.photo_url
-         FROM members m JOIN users u ON u.id = m.user_id
+              m.name, m.phone, m.photo_url
+         FROM members m
         WHERE m.id = $1`,
       [id]);
     const beforeSnapshot = beforeRows[0] ?? null;
 
-    // ── Flat / Room number uniqueness (only when flat/wing is changing) ──
     if (
       Object.prototype.hasOwnProperty.call(req.body, "flat_number") ||
       Object.prototype.hasOwnProperty.call(req.body, "wing")
@@ -1110,7 +1269,6 @@ const updateMember = async (req, res) => {
           ? updates.wing
           : beforeSnapshot?.wing ?? null;
 
-      // Skip the check if nothing actually changed.
       const flatChanged =
         normalizeFlatKeyValue(nextFlat) !==
         normalizeFlatKeyValue(beforeSnapshot?.flat_number);
@@ -1120,13 +1278,8 @@ const updateMember = async (req, res) => {
 
       if (flatChanged || wingChanged) {
         const flatConflict = await findFlatConflict(
-          client,
-          accountId,
-          nextFlat,
-          nextWing,
-          id,
+          client, accountId, nextFlat, nextWing, id,
         );
-
         if (flatConflict) {
           await client.query("ROLLBACK");
           return fail(
@@ -1141,49 +1294,55 @@ const updateMember = async (req, res) => {
       }
     }
 
-    if (!identityLocked && (hasName || hasPhone || hasPhoto)) {
-      if (hasPhone) {
-        const { rows: conflict } = await client.query(
-          `SELECT id FROM users WHERE phone=$1 AND id <> $2 LIMIT 1`,
-          [`91${newPhone}`, targetUserId]);
-        let conflictRows = conflict;
-        if (!conflictRows.length) {
-          const { rows: alt } = await client.query(
-            `SELECT id FROM users WHERE phone=$1 AND id <> $2 LIMIT 1`,
-            [newPhone, targetUserId]);
-          conflictRows = alt;
-        }
-        if (conflictRows.length) {
+    if (hasPhone || hasName) {
+      const effectivePhone = hasPhone ? newPhone : beforeSnapshot?.phone;
+      const effectiveName = hasName ? newName : beforeSnapshot?.name;
+      if (effectivePhone) {
+        const existingEntry = await findExistingDirectoryEntry(
+          client, accountId, effectivePhone, id,
+        );
+        if (
+          existingEntry &&
+          existingEntry.name &&
+          existingEntry.name.trim().toLowerCase() !==
+            String(effectiveName || "").trim().toLowerCase()
+        ) {
           await client.query("ROLLBACK");
-          return fail(res, 409, "phone_in_use", "This phone number already belongs to another user.");
+          return fail(
+            res,
+            409,
+            "phone_name_mismatch",
+            `${effectivePhone} is already in this property as "${existingEntry.name}" (${existingEntry.kind}). Use that name, or edit the existing entry.`,
+          );
         }
       }
-
-      const setParts = [];
-      const values = [];
-      if (hasName) { values.push(newName); setParts.push(`name = $${values.length}`); }
-      if (hasPhone) { values.push(`91${newPhone}`); setParts.push(`phone = $${values.length}`); }
-      if (hasPhoto) { values.push(newPhoto); setParts.push(`photo_url = $${values.length}`); }
-      values.push(targetUserId);
-
-      await client.query(
-        `UPDATE users SET ${setParts.join(", ")}, updated_at = NOW()
-          WHERE id = $${values.length}`,
-        values);
     }
 
-    if (Object.keys(updates).length > 0) {
-      const keys = Object.keys(updates);
-      const values = keys.map((k) => updates[k]);
-      const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
+    const setParts = [];
+    const values = [];
+    const push = (col, val) => {
+      values.push(val);
+      setParts.push(`${col} = $${values.length}`);
+    };
+
+    for (const key of Object.keys(updates)) push(key, updates[key]);
+    if (hasName) push("name", newName);
+    if (hasPhone) push("phone", newPhone);
+    if (hasPhoto) push("photo_url", newPhoto);
+
+    if (hasPhone) {
+      const linkedUserId = await findUserIdByPhone(client, newPhone);
+      push("user_id", linkedUserId);
+    }
+
+    if (setParts.length > 0) {
+      values.push(id);
+      values.push(accountId);
       await client.query(
-        `UPDATE members SET ${setClause}, updated_at = NOW()
-          WHERE id = $${keys.length + 1} AND account_id = $${keys.length + 2}`,
-        [...values, id, accountId]);
-    } else if (!identityLocked && (hasName || hasPhone || hasPhoto)) {
-      await client.query(
-        `UPDATE members SET updated_at = NOW() WHERE id = $1 AND account_id = $2`,
-        [id, accountId]);
+        `UPDATE members SET ${setParts.join(", ")}, updated_at = NOW()
+          WHERE id = $${values.length - 1} AND account_id = $${values.length}`,
+        values,
+      );
     }
 
     if (hasVehiclesField) {
@@ -1214,17 +1373,12 @@ const updateMember = async (req, res) => {
             ? (updates.wing ?? null)
             : (beforeSnapshot?.wing ?? null),
         phone: newPhone ?? ((beforeSnapshot?.phone ?? "").replace(/\D/g, "").slice(-10)),
-        userId: targetUserId,
+        userId: beforeSnapshot?.user_id ?? null,
       };
 
       try {
         await replaceMemberVehicles(
-          client,
-          accountId,
-          id,
-          incomingVehicles,
-          identity,
-          userId,
+          client, accountId, id, incomingVehicles, identity, userId,
         );
       } catch (vehErr) {
         await client.query("ROLLBACK");
@@ -1240,12 +1394,28 @@ const updateMember = async (req, res) => {
               m.wing, m.flat_number, m.area_sqft, m.parking_available,
               m.maintenance_amount, m.status, m.created_by,
               m.created_at, m.updated_at,
-              u.name, u.phone, u.photo_url,
-              EXISTS (SELECT 1 FROM account_members am
-                       WHERE am.account_id = m.account_id
-                         AND am.user_id = m.user_id
-                         AND am.status = 'active') AS has_access
-         FROM members m JOIN users u ON u.id = m.user_id
+              COALESCE(joined.name,      m.name)      AS name,
+              COALESCE(joined.phone,     m.phone)     AS phone,
+              COALESCE(joined.photo_url, m.photo_url) AS photo_url,
+              (joined.user_id IS NOT NULL) AS has_access
+         FROM members m
+         LEFT JOIN LATERAL (
+           SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+             FROM account_members am
+             JOIN users u ON u.id = am.user_id
+            WHERE am.account_id = m.account_id
+              AND am.status     = 'active'
+              AND (
+                (m.user_id IS NOT NULL AND am.user_id = m.user_id)
+                OR (
+                  m.user_id IS NULL
+                  AND m.phone IS NOT NULL
+                  AND RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),'\\D','','g'),10)
+                    = RIGHT(REGEXP_REPLACE(COALESCE(m.phone,''),'\\D','','g'),10)
+                )
+              )
+            LIMIT 1
+         ) joined ON TRUE
         WHERE m.id = $1`,
       [id]);
 
@@ -1253,7 +1423,7 @@ const updateMember = async (req, res) => {
       accountId,
       actorUserId: userId,
       actorRole: role,
-      targetUserId,
+      targetUserId: joined[0].user_id,
       entityType: "member",
       entityId: id,
       action: "update",
@@ -1302,12 +1472,10 @@ const deleteMember = async (req, res) => {
     await client.query("BEGIN");
 
     const { rows: existing } = await client.query(
-      `SELECT m.user_id, m.flat_number, m.wing, u.name
+      `SELECT m.user_id, m.flat_number, m.wing, m.name
          FROM members m
-         LEFT JOIN users u ON u.id = m.user_id
         WHERE m.id = $1 AND m.account_id = $2 AND m.status = 'active'`,
-      [id, accountId],
-    );
+      [id, accountId]);
 
     if (!existing.length) {
       await client.query("ROLLBACK");
@@ -1322,8 +1490,7 @@ const deleteMember = async (req, res) => {
     const updated = await client.query(
       `UPDATE members SET status='inactive', updated_at=NOW()
         WHERE id=$1 AND account_id=$2 AND status='active'`,
-      [id, accountId],
-    );
+      [id, accountId]);
 
     if (updated.rowCount === 0) {
       await client.query("ROLLBACK");
@@ -1333,12 +1500,8 @@ const deleteMember = async (req, res) => {
     await client.query(
       `UPDATE vehicles SET status='inactive', updated_at=NOW()
         WHERE account_id=$1 AND member_id=$2 AND status='active'`,
-      [accountId, id],
-    );
+      [accountId, id]);
 
-    // ── Cascade: cancel all gate passes / invites for this flat ───────
-    // When a flat is sold / a tenant leaves, the previous owner's invites
-    // and open passes must not remain visible to the new occupant.
     if (flatNumber) {
       const wingKey =
         wingRaw && String(wingRaw).trim() !== ""
@@ -1364,17 +1527,10 @@ const deleteMember = async (req, res) => {
            )`;
 
       await client.query(cancelSql.replace("%TABLE%", "gate_invites"), [
-        accountId,
-        id,
-        flatNumber,
-        wingKey,
+        accountId, id, flatNumber, wingKey,
       ]);
-
       await client.query(cancelSql.replace("%TABLE%", "gate_authorizations"), [
-        accountId,
-        id,
-        flatNumber,
-        wingKey,
+        accountId, id, flatNumber, wingKey,
       ]);
     }
 
@@ -1432,9 +1588,8 @@ const getPhoneVisibility = async (req, res) => {
     if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows: memberRows } = await pool.query(
-      `SELECT m.id, u.phone, u.id AS user_id
-         FROM members m JOIN users u ON u.id = m.user_id
-        WHERE m.id=$1 AND m.account_id=$2 AND m.status='active'`,
+      `SELECT id, user_id, phone FROM members
+        WHERE id=$1 AND account_id=$2 AND status='active'`,
       [memberId, accountId]);
     if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
 
@@ -1458,14 +1613,14 @@ const getPhoneVisibility = async (req, res) => {
          JOIN users u ON u.id = am.user_id
          LEFT JOIN members m ON m.user_id = u.id AND m.account_id = am.account_id AND m.status='active'
          LEFT JOIN staff s ON s.user_id = u.id AND s.account_id = am.account_id AND s.status='active'
-        WHERE am.account_id=$1 AND am.status='active' AND u.id <> $2
+        WHERE am.account_id=$1 AND am.status='active'
         ORDER BY CASE am.role
                    WHEN 'admin' THEN 1
                    WHEN 'member_visibility' THEN 2
                    WHEN 'staff_visibility' THEN 3
                    ELSE 4 END,
                  COALESCE(u.name, '')`,
-      [accountId, targetMember.user_id]);
+      [accountId]);
 
     const { rows: existing } = await pool.query(
       `SELECT viewer_user_id FROM member_phone_visibility WHERE member_id=$1`,
@@ -1510,8 +1665,8 @@ const updatePhoneVisibility = async (req, res) => {
     if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows: memberRows } = await client.query(
-      `SELECT m.id, u.phone FROM members m JOIN users u ON u.id = m.user_id
-        WHERE m.id=$1 AND m.account_id=$2 AND m.status='active'`,
+      `SELECT id, phone FROM members
+        WHERE id=$1 AND account_id=$2 AND status='active'`,
       [memberId, accountId]);
     if (!memberRows.length) return fail(res, 404, "not_found", "Member not found");
 
@@ -1564,14 +1719,30 @@ const listStaff = async (req, res) => {
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
               s.created_at, s.updated_at,
-              u.name, u.phone, u.photo_url,
-              EXISTS (SELECT 1 FROM account_members am
-                       WHERE am.account_id = s.account_id
-                         AND am.user_id = s.user_id
-                         AND am.status = 'active') AS has_access
-         FROM staff s JOIN users u ON u.id = s.user_id
+              COALESCE(joined.name,      s.name)      AS name,
+              COALESCE(joined.phone,     s.phone)     AS phone,
+              COALESCE(joined.photo_url, s.photo_url) AS photo_url,
+              (joined.user_id IS NOT NULL) AS has_access
+         FROM staff s
+         LEFT JOIN LATERAL (
+           SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+             FROM account_members am
+             JOIN users u ON u.id = am.user_id
+            WHERE am.account_id = s.account_id
+              AND am.status     = 'active'
+              AND (
+                (s.user_id IS NOT NULL AND am.user_id = s.user_id)
+                OR (
+                  s.user_id IS NULL
+                  AND s.phone IS NOT NULL
+                  AND RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),'\\D','','g'),10)
+                    = RIGHT(REGEXP_REPLACE(COALESCE(s.phone,''),'\\D','','g'),10)
+                )
+              )
+            LIMIT 1
+         ) joined ON TRUE
         WHERE s.account_id=$1 AND s.status='active'
-        ORDER BY u.name`,
+        ORDER BY COALESCE(joined.name, s.name)`,
       [accountId]);
 
     const { rows: payRows } = await pool.query(
@@ -1616,12 +1787,28 @@ const getStaff = async (req, res) => {
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
               s.created_at, s.updated_at,
-              u.name, u.phone, u.photo_url,
-              EXISTS (SELECT 1 FROM account_members am
-                       WHERE am.account_id = s.account_id
-                         AND am.user_id = s.user_id
-                         AND am.status = 'active') AS has_access
-         FROM staff s JOIN users u ON u.id = s.user_id
+              COALESCE(joined.name,      s.name)      AS name,
+              COALESCE(joined.phone,     s.phone)     AS phone,
+              COALESCE(joined.photo_url, s.photo_url) AS photo_url,
+              (joined.user_id IS NOT NULL) AS has_access
+         FROM staff s
+         LEFT JOIN LATERAL (
+           SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+             FROM account_members am
+             JOIN users u ON u.id = am.user_id
+            WHERE am.account_id = s.account_id
+              AND am.status     = 'active'
+              AND (
+                (s.user_id IS NOT NULL AND am.user_id = s.user_id)
+                OR (
+                  s.user_id IS NULL
+                  AND s.phone IS NOT NULL
+                  AND RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),'\\D','','g'),10)
+                    = RIGHT(REGEXP_REPLACE(COALESCE(s.phone,''),'\\D','','g'),10)
+                )
+              )
+            LIMIT 1
+         ) joined ON TRUE
         WHERE s.id=$1 AND s.account_id=$2 AND s.status='active'`,
       [id, accountId]);
 
@@ -1657,18 +1844,23 @@ const createStaff = async (req, res) => {
     await client.query("BEGIN");
 
     let targetUserId = null;
+    let targetName = "";
+    let targetPhone = "";
+    let targetPhotoUrl = null;
 
     if (mode === "existing") {
-      targetUserId = body.user_id || null;
-      if (!targetUserId) {
+      try {
+        const resolved = await resolveExistingSelection(
+          client, accountId, body.user_id,
+        );
+        targetUserId = resolved.userId;
+        targetName = resolved.name;
+        targetPhone = resolved.phone;
+        targetPhotoUrl = resolved.photoUrl;
+      } catch (e) {
         await client.query("ROLLBACK");
-        return fail(res, 400, "invalid_input", "user_id is required for mode=existing");
-      }
-      const { rows: u } = await client.query(
-        `SELECT id FROM users WHERE id=$1 LIMIT 1`, [targetUserId]);
-      if (!u.length) {
-        await client.query("ROLLBACK");
-        return fail(res, 404, "not_found", "Person not found");
+        const status = e?.code === "not_found" ? 404 : 400;
+        return fail(res, status, e?.code ?? "invalid_input", e?.message ?? "Invalid selection");
       }
     } else {
       const name = (body.name || "").trim();
@@ -1684,22 +1876,44 @@ const createStaff = async (req, res) => {
         return fail(res, 400, "invalid_input", "A valid 10-digit phone is required");
       }
 
-      targetUserId = await ensureUserForPhone(client, phone, name);
+      targetName = name;
+      targetPhone = phone;
+      targetPhotoUrl = photo_url;
 
-      if (photo_url !== null && photo_url !== undefined) {
-        await client.query(
-          `UPDATE users SET photo_url = COALESCE(photo_url, $1), updated_at = NOW()
-            WHERE id = $2`,
-          [photo_url, targetUserId]);
+      targetUserId = await findUserIdByPhone(client, phone);
+    }
+
+    if (targetPhone) {
+      const existingEntry = await findExistingDirectoryEntry(
+        client, accountId, targetPhone, null,
+      );
+      if (
+        existingEntry &&
+        existingEntry.name &&
+        existingEntry.name.trim().toLowerCase() !==
+          String(targetName || "").trim().toLowerCase()
+      ) {
+        await client.query("ROLLBACK");
+        return fail(
+          res,
+          409,
+          "phone_name_mismatch",
+          `${targetPhone} is already in this property as "${existingEntry.name}" (${existingEntry.kind}). Use that name, or edit the existing entry.`,
+        );
       }
     }
 
     const { rows } = await client.query(
       `INSERT INTO staff
-         (account_id, user_id, role, monthly_salary, status, created_by)
-       VALUES ($1,$2,$3,$4,'active',$5)
+         (account_id, user_id, role, monthly_salary,
+          name, phone, photo_url,
+          status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8)
        RETURNING id`,
-      [accountId, targetUserId, staffRole, monthly_salary, userId]);
+      [
+        accountId, targetUserId, staffRole, monthly_salary,
+        targetName, targetPhone, targetPhotoUrl, userId,
+      ]);
 
     const staffId = rows[0].id;
 
@@ -1707,12 +1921,28 @@ const createStaff = async (req, res) => {
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
               s.created_at, s.updated_at,
-              u.name, u.phone, u.photo_url,
-              EXISTS (SELECT 1 FROM account_members am
-                       WHERE am.account_id = s.account_id
-                         AND am.user_id = s.user_id
-                         AND am.status = 'active') AS has_access
-         FROM staff s JOIN users u ON u.id = s.user_id
+              COALESCE(joined.name,      s.name)      AS name,
+              COALESCE(joined.phone,     s.phone)     AS phone,
+              COALESCE(joined.photo_url, s.photo_url) AS photo_url,
+              (joined.user_id IS NOT NULL) AS has_access
+         FROM staff s
+         LEFT JOIN LATERAL (
+           SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+             FROM account_members am
+             JOIN users u ON u.id = am.user_id
+            WHERE am.account_id = s.account_id
+              AND am.status     = 'active'
+              AND (
+                (s.user_id IS NOT NULL AND am.user_id = s.user_id)
+                OR (
+                  s.user_id IS NULL
+                  AND s.phone IS NOT NULL
+                  AND RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),'\\D','','g'),10)
+                    = RIGHT(REGEXP_REPLACE(COALESCE(s.phone,''),'\\D','','g'),10)
+                )
+              )
+            LIMIT 1
+         ) joined ON TRUE
         WHERE s.id = $1`,
       [staffId]);
 
@@ -1753,7 +1983,7 @@ const updateStaff = async (req, res) => {
     if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const { rows } = await client.query(
-      `SELECT id, user_id FROM staff
+      `SELECT id, user_id, name, phone FROM staff
         WHERE id=$1 AND account_id=$2 AND status='active'`,
       [id, accountId]);
     if (!rows.length) return fail(res, 404, "not_found", "Staff not found");
@@ -1762,17 +1992,9 @@ const updateStaff = async (req, res) => {
       return fail(res, 403, "forbidden", "Only owners and admins can edit staff");
     }
 
-    const targetUserId = rows[0].user_id;
-    const identityLocked = await hasActiveAccountMemberRow(client, accountId, targetUserId);
-
     const hasName = Object.prototype.hasOwnProperty.call(req.body, "name");
     const hasPhone = Object.prototype.hasOwnProperty.call(req.body, "phone");
     const hasPhoto = Object.prototype.hasOwnProperty.call(req.body, "photo_url");
-
-    if (identityLocked && (hasName || hasPhone || hasPhoto)) {
-      return fail(res, 403, "user_identity_locked",
-        "This person has joined the app. Their name, phone and photo can only be changed by them.");
-    }
 
     const newName = hasName ? String(req.body.name ?? "").trim() || null : null;
     const newPhone = hasPhone ? normalizePhone(req.body.phone) : null;
@@ -1804,67 +2026,89 @@ const updateStaff = async (req, res) => {
 
     const { rows: beforeRows } = await client.query(
       `SELECT s.id, s.account_id, s.user_id, s.role, s.monthly_salary, s.status,
-              u.name, u.phone, u.photo_url
-         FROM staff s JOIN users u ON u.id = s.user_id
+              s.name, s.phone, s.photo_url
+         FROM staff s
         WHERE s.id = $1`,
       [id]);
     const beforeSnapshot = beforeRows[0] ?? null;
 
-    if (!identityLocked && (hasName || hasPhone || hasPhoto)) {
-      if (hasPhone) {
-        const { rows: conflict } = await client.query(
-          `SELECT id FROM users WHERE phone=$1 AND id <> $2 LIMIT 1`,
-          [`91${newPhone}`, targetUserId]);
-        let conflictRows = conflict;
-        if (!conflictRows.length) {
-          const { rows: alt } = await client.query(
-            `SELECT id FROM users WHERE phone=$1 AND id <> $2 LIMIT 1`,
-            [newPhone, targetUserId]);
-          conflictRows = alt;
-        }
-        if (conflictRows.length) {
+    if (hasPhone || hasName) {
+      const effectivePhone = hasPhone ? newPhone : beforeSnapshot?.phone;
+      const effectiveName = hasName ? newName : beforeSnapshot?.name;
+      if (effectivePhone) {
+        const existingEntry = await findExistingDirectoryEntry(
+          client, accountId, effectivePhone, id,
+        );
+        if (
+          existingEntry &&
+          existingEntry.name &&
+          existingEntry.name.trim().toLowerCase() !==
+            String(effectiveName || "").trim().toLowerCase()
+        ) {
           await client.query("ROLLBACK");
-          return fail(res, 409, "phone_in_use", "This phone number already belongs to another user.");
+          return fail(
+            res,
+            409,
+            "phone_name_mismatch",
+            `${effectivePhone} is already in this property as "${existingEntry.name}" (${existingEntry.kind}). Use that name, or edit the existing entry.`,
+          );
         }
       }
-
-      const setParts = [];
-      const values = [];
-      if (hasName) { values.push(newName); setParts.push(`name = $${values.length}`); }
-      if (hasPhone) { values.push(`91${newPhone}`); setParts.push(`phone = $${values.length}`); }
-      if (hasPhoto) { values.push(newPhoto); setParts.push(`photo_url = $${values.length}`); }
-      values.push(targetUserId);
-
-      await client.query(
-        `UPDATE users SET ${setParts.join(", ")}, updated_at = NOW()
-          WHERE id = $${values.length}`,
-        values);
     }
 
-    if (Object.keys(updates).length > 0) {
-      const keys = Object.keys(updates);
-      const values = keys.map((k) => updates[k]);
-      const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
+    const setParts = [];
+    const values = [];
+    const push = (col, val) => {
+      values.push(val);
+      setParts.push(`${col} = $${values.length}`);
+    };
+
+    for (const key of Object.keys(updates)) push(key, updates[key]);
+    if (hasName) push("name", newName);
+    if (hasPhone) push("phone", newPhone);
+    if (hasPhoto) push("photo_url", newPhoto);
+
+    if (hasPhone) {
+      const linkedUserId = await findUserIdByPhone(client, newPhone);
+      push("user_id", linkedUserId);
+    }
+
+    if (setParts.length > 0) {
+      values.push(id);
+      values.push(accountId);
       await client.query(
-        `UPDATE staff SET ${setClause}, updated_at = NOW()
-          WHERE id = $${keys.length + 1} AND account_id = $${keys.length + 2}`,
-        [...values, id, accountId]);
-    } else if (!identityLocked && (hasName || hasPhone || hasPhoto)) {
-      await client.query(
-        `UPDATE staff SET updated_at = NOW() WHERE id = $1 AND account_id = $2`,
-        [id, accountId]);
+        `UPDATE staff SET ${setParts.join(", ")}, updated_at = NOW()
+          WHERE id = $${values.length - 1} AND account_id = $${values.length}`,
+        values,
+      );
     }
 
     const { rows: joined } = await client.query(
       `SELECT s.id, s.account_id, s.user_id, s.role,
               s.monthly_salary, s.status, s.created_by,
               s.created_at, s.updated_at,
-              u.name, u.phone, u.photo_url,
-              EXISTS (SELECT 1 FROM account_members am
-                       WHERE am.account_id = s.account_id
-                         AND am.user_id = s.user_id
-                         AND am.status = 'active') AS has_access
-         FROM staff s JOIN users u ON u.id = s.user_id
+              COALESCE(joined.name,      s.name)      AS name,
+              COALESCE(joined.phone,     s.phone)     AS phone,
+              COALESCE(joined.photo_url, s.photo_url) AS photo_url,
+              (joined.user_id IS NOT NULL) AS has_access
+         FROM staff s
+         LEFT JOIN LATERAL (
+           SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+             FROM account_members am
+             JOIN users u ON u.id = am.user_id
+            WHERE am.account_id = s.account_id
+              AND am.status     = 'active'
+              AND (
+                (s.user_id IS NOT NULL AND am.user_id = s.user_id)
+                OR (
+                  s.user_id IS NULL
+                  AND s.phone IS NOT NULL
+                  AND RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),'\\D','','g'),10)
+                    = RIGHT(REGEXP_REPLACE(COALESCE(s.phone,''),'\\D','','g'),10)
+                )
+              )
+            LIMIT 1
+         ) joined ON TRUE
         WHERE s.id = $1`,
       [id]);
 
@@ -1872,7 +2116,7 @@ const updateStaff = async (req, res) => {
       accountId,
       actorUserId: userId,
       actorRole: role,
-      targetUserId,
+      targetUserId: joined[0].user_id,
       entityType: "staff",
       entityId: id,
       action: "update",
@@ -1908,12 +2152,10 @@ const deleteStaff = async (req, res) => {
     await client.query("BEGIN");
 
     const { rows: existing } = await client.query(
-      `SELECT s.user_id, u.name
+      `SELECT s.user_id, s.name
          FROM staff s
-         LEFT JOIN users u ON u.id = s.user_id
         WHERE s.id = $1 AND s.account_id = $2 AND s.status = 'active'`,
-      [id, accountId],
-    );
+      [id, accountId]);
 
     if (!existing.length) {
       await client.query("ROLLBACK");
@@ -1926,8 +2168,7 @@ const deleteStaff = async (req, res) => {
     const updated = await client.query(
       `UPDATE staff SET status='inactive', updated_at=NOW()
         WHERE id=$1 AND account_id=$2 AND status='active'`,
-      [id, accountId],
-    );
+      [id, accountId]);
 
     if (updated.rowCount === 0) {
       await client.query("ROLLBACK");
@@ -2682,8 +2923,7 @@ const checkVehicleConflict = async (req, res) => {
          FROM vehicles
         WHERE account_id = $1 AND vehicle_number = $2 AND status = 'active'
         LIMIT 1`,
-      [accountId, number],
-    );
+      [accountId, number]);
 
     if (veh.length > 0) {
       const ownerName = veh[0].owner_name || "a resident";
@@ -2718,8 +2958,7 @@ const checkVehicleConflict = async (req, res) => {
           AND ($3::uuid IS NULL OR id <> $3::uuid)
         ORDER BY valid_until DESC
         LIMIT 1`,
-      [accountId, number, excludeType === "authorization" ? excludeId : null],
-    );
+      [accountId, number, excludeType === "authorization" ? excludeId : null]);
 
     if (auth.length > 0) {
       const a = auth[0];
@@ -2753,8 +2992,7 @@ const checkVehicleConflict = async (req, res) => {
           AND ($3::uuid IS NULL OR id <> $3::uuid)
         ORDER BY valid_until DESC
         LIMIT 1`,
-      [accountId, number, excludeType === "invite" ? excludeId : null],
-    );
+      [accountId, number, excludeType === "invite" ? excludeId : null]);
 
     if (inv.length > 0) {
       const i = inv[0];
@@ -2791,8 +3029,7 @@ const registerVehicle = async (req, res) => {
 
     const body = req.body || {};
     const number = normalizeVehicleNumber(
-      body.vehicleNumber ?? body.vehicle_number ?? body.number ?? "",
-    );
+      body.vehicleNumber ?? body.vehicle_number ?? body.number ?? "");
     const name = String(body.name ?? "").trim();
     const flatNumber = String(body.flatNumber ?? body.flat_number ?? "").trim();
     const wing = body.wing ? String(body.wing).trim() : null;
@@ -2812,8 +3049,7 @@ const registerVehicle = async (req, res) => {
     const { rows: existing } = await client.query(
       `SELECT id, status FROM vehicles
         WHERE account_id = $1 AND vehicle_number = $2`,
-      [accountId, number],
-    );
+      [accountId, number]);
 
     let vehicleId;
     if (existing.length > 0) {
@@ -2829,8 +3065,7 @@ const registerVehicle = async (req, res) => {
            status = 'active',
            updated_at = NOW()
          WHERE id = $6`,
-        [name, flatNumber, wing, phone, type, vehicleId],
-      );
+        [name, flatNumber, wing, phone, type, vehicleId]);
     } else {
       const { rows } = await client.query(
         `INSERT INTO vehicles
@@ -2839,27 +3074,24 @@ const registerVehicle = async (req, res) => {
             registered_by_guard, status, created_by)
          VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, TRUE, 'active', $8)
          RETURNING id`,
-        [accountId, number, name, flatNumber, wing, phone, type, userId],
-      );
+        [accountId, number, name, flatNumber, wing, phone, type, userId]);
       vehicleId = rows[0].id;
     }
 
     const { rows: memberMatch } = await client.query(
-      `SELECT m.id, m.user_id
-         FROM members m JOIN users u ON u.id = m.user_id
-        WHERE m.account_id = $1
-          AND m.flat_number = $2
-          AND m.status = 'active'
-          AND (u.phone LIKE $3 OR u.phone LIKE $4)
+      `SELECT id, user_id FROM members
+        WHERE account_id = $1
+          AND flat_number = $2
+          AND status = 'active'
+          AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3
         LIMIT 1`,
-      [accountId, flatNumber, `%${phone}`, `91${phone}`],
-    );
+      [accountId, flatNumber, phone]);
+
     if (memberMatch.length > 0) {
       await client.query(
         `UPDATE vehicles SET member_id = $1, user_id = $2, updated_at = NOW()
           WHERE id = $3`,
-        [memberMatch[0].id, memberMatch[0].user_id, vehicleId],
-      );
+        [memberMatch[0].id, memberMatch[0].user_id, vehicleId]);
     }
 
     await writeAudit(client, {
@@ -2974,8 +3206,7 @@ const createGateEntry = async (req, res) => {
     }
 
     const number = normalizeVehicleNumber(
-      body.vehicleNumber ?? body.vehicle_number ?? body.number ?? "",
-    );
+      body.vehicleNumber ?? body.vehicle_number ?? body.number ?? "");
     const directionRaw = String(body.direction ?? "in").toLowerCase().trim();
     const direction = directionRaw === "out" ? "out" : "in";
 
@@ -2994,8 +3225,7 @@ const createGateEntry = async (req, res) => {
         : null;
 
     const visitorPhone = normalizePhone(
-      body.visitorPhone ?? body.visitor_phone,
-    );
+      body.visitorPhone ?? body.visitor_phone);
 
     const purpose = body.purpose ? String(body.purpose).trim().toLowerCase() : null;
 
@@ -3050,8 +3280,7 @@ const createGateEntry = async (req, res) => {
            FROM vehicles
           WHERE account_id = $1 AND vehicle_number = $2 AND status = 'active'
           LIMIT 1`,
-        [accountId, primaryVehicle],
-      );
+        [accountId, primaryVehicle]);
       if (rows.length > 0) {
         vehicleId = rows[0].id;
         memberId = rows[0].member_id;
@@ -3070,8 +3299,7 @@ const createGateEntry = async (req, res) => {
             AND ($3::text IS NULL OR m.wing = $3)
             AND m.status = 'active'
           LIMIT 1`,
-        [accountId, flatNumber, body.wing ?? body.wing_number ?? null],
-      );
+        [accountId, flatNumber, body.wing ?? body.wing_number ?? null]);
       if (mm.length > 0) {
         memberId = mm[0].id;
         memberUserId = mm[0].user_id;
@@ -3079,8 +3307,7 @@ const createGateEntry = async (req, res) => {
     } else if (memberId) {
       const { rows: m } = await pool.query(
         `SELECT user_id FROM members WHERE id = $1 LIMIT 1`,
-        [memberId],
-      );
+        [memberId]);
       if (m.length > 0) memberUserId = m[0].user_id;
     }
 
@@ -3122,8 +3349,7 @@ const createGateEntry = async (req, res) => {
         status,
         JSON.stringify(guestsIn),
         JSON.stringify(vehiclesIn),
-      ],
-    );
+      ]);
 
     const entryId = rows[0].id;
 
@@ -3173,8 +3399,7 @@ const createGateEntry = async (req, res) => {
         });
         await client.query(
           `UPDATE gate_entries SET notified = TRUE WHERE id = $1`,
-          [entryId],
-        );
+          [entryId]);
       } catch (e) {
         console.warn("[gate] notify failed:", e.message);
       }
@@ -3252,8 +3477,7 @@ const listGateEntries = async (req, res) => {
              ELSE
                (scanned_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
            END
-         ) = $${params.length}::date`,
-      );
+         ) = $${params.length}::date`);
     } else if (!useStatus) {
       conditions.push(
         `(
@@ -3263,8 +3487,7 @@ const listGateEntries = async (req, res) => {
              ELSE
                (scanned_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
            END
-         ) = (NOW() AT TIME ZONE 'Asia/Kolkata')::date`,
-      );
+         ) = (NOW() AT TIME ZONE 'Asia/Kolkata')::date`);
     }
 
     if (flatRaw) {
@@ -3292,8 +3515,7 @@ const listGateEntries = async (req, res) => {
         WHERE ${conditions.join(" AND ")}
         ORDER BY scanned_at DESC
         LIMIT $${limitIdx}`,
-      params,
-    );
+      params);
 
     return res.json(rows);
   } catch (err) {
@@ -3323,8 +3545,7 @@ const updateGateEntry = async (req, res) => {
               scanned_by, scanned_at, visitor_name, member_id
          FROM gate_entries
         WHERE id = $1 AND account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
     if (!entryRows.length) return fail(res, 404, "not_found", "Entry not found");
 
     const entry = entryRows[0];
@@ -3360,8 +3581,7 @@ const updateGateEntry = async (req, res) => {
                 approved_at = NOW(),
                 responded_at = NOW()
           WHERE id = $4 AND account_id = $5`,
-        [nextStatus, nextStatus === "rejected", userId, id, accountId],
-      );
+        [nextStatus, nextStatus === "rejected", userId, id, accountId]);
 
       await writeAudit(client, {
         accountId,
@@ -3435,8 +3655,7 @@ const updateGateEntry = async (req, res) => {
     let newDirection;
     if (hasDirection) {
       newDirection = String(body.direction ?? "in").toLowerCase() === "out"
-        ? "out"
-        : "in";
+        ? "out" : "in";
     }
 
     let newPurpose;
@@ -3523,8 +3742,7 @@ const updateGateEntry = async (req, res) => {
              FROM vehicles
             WHERE account_id = $1 AND vehicle_number = $2 AND status = 'active'
             LIMIT 1`,
-          [accountId, primaryVehicle],
-        );
+          [accountId, primaryVehicle]);
         if (vrows.length) {
           vehicleId = vrows[0].id;
           memberId = vrows[0].member_id;
@@ -3544,8 +3762,7 @@ const updateGateEntry = async (req, res) => {
               AND ($3::text IS NULL OR wing = $3)
               AND status = 'active'
             LIMIT 1`,
-          [accountId, flatForLookup, wingForLookup],
-        );
+          [accountId, flatForLookup, wingForLookup]);
         if (mm.length) memberId = mm[0].id;
       }
 
@@ -3574,8 +3791,7 @@ const updateGateEntry = async (req, res) => {
           SET ${sets.join(", ")}
         WHERE id = $${values.length - 1} AND account_id = $${values.length}
         RETURNING *`,
-      values,
-    );
+      values);
 
     await writeAudit(client, {
       accountId,
@@ -3620,8 +3836,7 @@ const approveGateEntry = async (req, res) => {
          FROM gate_entries ge
          LEFT JOIN members m ON m.id = ge.member_id
         WHERE ge.id = $1 AND ge.account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
     if (!entryRows.length) return fail(res, 404, "not_found", "Entry not found");
 
     const entry = entryRows[0];
@@ -3645,8 +3860,7 @@ const approveGateEntry = async (req, res) => {
               approved_at = NOW(),
               responded_at = NOW()
         WHERE id = $2 AND account_id = $3`,
-      [userId, id, accountId],
-    );
+      [userId, id, accountId]);
 
     await writeAudit(client, {
       accountId,
@@ -3705,8 +3919,7 @@ const rejectGateEntry = async (req, res) => {
          FROM gate_entries ge
          LEFT JOIN members m ON m.id = ge.member_id
         WHERE ge.id = $1 AND ge.account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
     if (!entryRows.length) return fail(res, 404, "not_found", "Entry not found");
 
     const entry = entryRows[0];
@@ -3731,8 +3944,7 @@ const rejectGateEntry = async (req, res) => {
               approved_at = NOW(),
               responded_at = NOW()
         WHERE id = $2 AND account_id = $3`,
-      [userId, id, accountId],
-    );
+      [userId, id, accountId]);
 
     await writeAudit(client, {
       accountId,
@@ -3787,8 +3999,7 @@ const overrideGateEntry = async (req, res) => {
     const { rows: entryRows } = await client.query(
       `SELECT id, status, scanned_by, visitor_name FROM gate_entries
         WHERE id = $1 AND account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
     if (!entryRows.length) return fail(res, 404, "not_found", "Entry not found");
     if (entryRows[0].status !== "pending_approval") {
       return fail(res, 409, "invalid_state",
@@ -3804,8 +4015,7 @@ const overrideGateEntry = async (req, res) => {
               approved_at = NOW(),
               responded_at = NOW()
         WHERE id = $2 AND account_id = $3`,
-      [userId, id, accountId],
-    );
+      [userId, id, accountId]);
 
     await writeAudit(client, {
       accountId,
@@ -3843,8 +4053,7 @@ const getGateEntryStatus = async (req, res) => {
       `SELECT id, status, approved_at, responded_at
          FROM gate_entries
         WHERE id = $1 AND account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
     if (!rows.length) return fail(res, 404, "not_found", "Entry not found");
 
     return res.json(rows[0]);
@@ -3855,7 +4064,7 @@ const getGateEntryStatus = async (req, res) => {
 };
 
 // ===========================================================================
-// GATE FLATS (searchable dropdown source)
+// GATE FLATS
 // ===========================================================================
 
 const listGateFlats = async (req, res) => {
@@ -3873,19 +4082,35 @@ const listGateFlats = async (req, res) => {
       `SELECT m.id::text AS member_id,
               m.wing,
               m.flat_number,
-              u.name  AS resident_name,
-              u.phone AS resident_phone
+              COALESCE(u.name,  m.name)  AS resident_name,
+              COALESCE(u.phone, m.phone) AS resident_phone
          FROM members m
-         JOIN users u ON u.id = m.user_id
+         LEFT JOIN LATERAL (
+           SELECT uu.name, uu.phone
+             FROM account_members am
+             JOIN users uu ON uu.id = am.user_id
+            WHERE am.account_id = m.account_id
+              AND am.status     = 'active'
+              AND (
+                (m.user_id IS NOT NULL AND am.user_id = m.user_id)
+                OR (
+                  m.user_id IS NULL
+                  AND m.phone IS NOT NULL
+                  AND RIGHT(REGEXP_REPLACE(COALESCE(uu.phone,''),'\\D','','g'),10)
+                    = RIGHT(REGEXP_REPLACE(COALESCE(m.phone,''),'\\D','','g'),10)
+                )
+              )
+            LIMIT 1
+         ) u ON TRUE
         WHERE m.account_id = $1
           AND m.status = 'active'
           AND ($2::text IS NULL
+               OR m.name ILIKE $2
                OR u.name ILIKE $2
                OR m.flat_number ILIKE $2
                OR m.wing ILIKE $2)
-        ORDER BY m.wing NULLS FIRST, m.flat_number, u.name`,
-      [accountId, pattern],
-    );
+        ORDER BY m.wing NULLS FIRST, m.flat_number, COALESCE(u.name, m.name)`,
+      [accountId, pattern]);
 
     return res.json(rows);
   } catch (err) {
@@ -3895,7 +4120,7 @@ const listGateFlats = async (req, res) => {
 };
 
 // ===========================================================================
-// GATE PASSES (search by flat / resident name / phone)
+// GATE PASSES search
 // ===========================================================================
 
 const searchGatePasses = async (req, res) => {
@@ -3923,10 +4148,6 @@ const searchGatePasses = async (req, res) => {
     const digits = (q || "").replace(/\D/g, "");
     const phonePattern = digits.length >= 3 ? `%${digits}%` : pattern;
 
-    // ── Active gate_authorizations (open/named passes) ──
-    // NOTE: gate_authorizations has NO `code` column. Also, the wing filter
-    // is lenient — it accepts exact matches, NULL/empty wings, and any wing
-    // that starts with the picked value (e.g. "A" also matches "A ·,").
     const { rows: authRows } = await pool.query(
       `SELECT ga.id::text AS id,
               'authorization'::text AS kind,
@@ -3945,8 +4166,8 @@ const searchGatePasses = async (req, res) => {
               NULL::text AS code,
               ga.created_at,
               COALESCE(m.user_id, m2.user_id) AS member_user_id,
-              COALESCE(u.name, u2.name)       AS member_name,
-              COALESCE(u.phone, u2.phone)     AS member_phone,
+              COALESCE(m.name, m2.name)       AS member_name,
+              COALESCE(m.phone, m2.phone)     AS member_phone,
               (SELECT COUNT(*)::int FROM gate_entries ge
                  WHERE ge.account_id = ga.account_id
                    AND ge.authorization_id = ga.id
@@ -3954,20 +4175,18 @@ const searchGatePasses = async (req, res) => {
                    AND ge.status <> 'pending_approval') AS used_count
          FROM gate_authorizations ga
          LEFT JOIN members m ON m.id = ga.member_id
-         LEFT JOIN users   u ON u.id = m.user_id
          LEFT JOIN members m2
                 ON ga.member_id IS NULL
                AND m2.account_id = ga.account_id
                AND m2.flat_number = ga.flat_number
                AND (ga.wing IS NULL OR m2.wing = ga.wing OR m2.wing IS NULL)
                AND m2.status = 'active'
-         LEFT JOIN users u2 ON u2.id = m2.user_id
         WHERE ga.account_id = $1
           AND ga.status IN ('active', 'used', 'approved')
           AND ga.valid_until >= NOW()
           AND (
-                COALESCE(u.name, u2.name) ILIKE $2
-             OR COALESCE(u.phone, u2.phone) ILIKE $3
+                COALESCE(m.name, m2.name) ILIKE $2
+             OR COALESCE(m.phone, m2.phone) ILIKE $3
              OR ga.flat_number ILIKE $2
              OR ga.visitor_name ILIKE $2
           )
@@ -3981,10 +4200,8 @@ const searchGatePasses = async (req, res) => {
           )
         ORDER BY ga.valid_until ASC
         LIMIT 30`,
-      [accountId, pattern, phonePattern, flatNumberParam, wingParam],
-    );
+      [accountId, pattern, phonePattern, flatNumberParam, wingParam]);
 
-    // ── Active gate_invites (QR passes) ──
     const { rows: invRows } = await pool.query(
       `SELECT gi.id::text AS id,
               'invite'::text AS kind,
@@ -4003,8 +4220,8 @@ const searchGatePasses = async (req, res) => {
               gi.code,
               gi.created_at,
               COALESCE(m.user_id, m2.user_id) AS member_user_id,
-              COALESCE(u.name, u2.name)       AS member_name,
-              COALESCE(u.phone, u2.phone)     AS member_phone,
+              COALESCE(m.name, m2.name)       AS member_name,
+              COALESCE(m.phone, m2.phone)     AS member_phone,
               (SELECT COUNT(*)::int FROM gate_entries ge
                  WHERE ge.account_id = gi.account_id
                    AND ge.invite_id = gi.id
@@ -4012,20 +4229,18 @@ const searchGatePasses = async (req, res) => {
                    AND ge.status <> 'pending_approval') AS used_count
          FROM gate_invites gi
          LEFT JOIN members m ON m.id = gi.member_id
-         LEFT JOIN users   u ON u.id = m.user_id
          LEFT JOIN members m2
                 ON gi.member_id IS NULL
                AND m2.account_id = gi.account_id
                AND m2.flat_number = gi.flat_number
                AND (gi.wing IS NULL OR m2.wing = gi.wing OR m2.wing IS NULL)
                AND m2.status = 'active'
-         LEFT JOIN users u2 ON u2.id = m2.user_id
         WHERE gi.account_id = $1
           AND gi.status IN ('active', 'used', 'approved')
           AND gi.valid_until >= NOW()
           AND (
-                COALESCE(u.name, u2.name) ILIKE $2
-             OR COALESCE(u.phone, u2.phone) ILIKE $3
+                COALESCE(m.name, m2.name) ILIKE $2
+             OR COALESCE(m.phone, m2.phone) ILIKE $3
              OR gi.flat_number ILIKE $2
              OR gi.guest_name ILIKE $2
           )
@@ -4039,8 +4254,7 @@ const searchGatePasses = async (req, res) => {
           )
         ORDER BY gi.valid_until ASC
         LIMIT 30`,
-      [accountId, pattern, phonePattern, flatNumberParam, wingParam],
-    );
+      [accountId, pattern, phonePattern, flatNumberParam, wingParam]);
 
     const all = [...authRows, ...invRows].sort((a, b) => {
       const at = new Date(a.valid_until).getTime();
@@ -4081,8 +4295,7 @@ const getPassHistory = async (req, res) => {
         WHERE account_id = $1 AND ${col} = $2
         ORDER BY scanned_at DESC
         LIMIT 200`,
-      [accountId, id],
-    );
+      [accountId, id]);
     return res.json(rows);
   } catch (err) {
     console.error("getPassHistory error:", err);
@@ -4122,8 +4335,7 @@ const logPassAction = async (req, res) => {
     for (const t of order) {
       const { rows } = await client.query(
         `SELECT * FROM ${t} WHERE id = $1 AND account_id = $2 LIMIT 1`,
-        [passId, accountId],
-      );
+        [passId, accountId]);
       if (rows.length) {
         pass = rows[0];
         foundTable = t;
@@ -4136,8 +4348,7 @@ const logPassAction = async (req, res) => {
         res,
         404,
         "not_found",
-        `Pass not found (kind=${kindRaw || "unknown"}, id=${passId})`,
-      );
+        `Pass not found (kind=${kindRaw || "unknown"}, id=${passId})`);
     }
 
     if (pass.status === "cancelled") {
@@ -4169,8 +4380,7 @@ const logPassAction = async (req, res) => {
             AND ($3::text IS NULL OR wing = $3)
             AND status = 'active'
           LIMIT 1`,
-        [accountId, pass.flat_number, pass.wing ?? null],
-      );
+        [accountId, pass.flat_number, pass.wing ?? null]);
       if (mm.length) memberId = mm[0].id;
     }
 
@@ -4180,8 +4390,7 @@ const logPassAction = async (req, res) => {
         `SELECT id FROM vehicles
           WHERE account_id = $1 AND vehicle_number = $2 AND status = 'active'
           LIMIT 1`,
-        [accountId, primaryVehicle],
-      );
+        [accountId, primaryVehicle]);
       if (v.length) vehicleId = v[0].id;
     }
 
@@ -4239,8 +4448,7 @@ const logPassAction = async (req, res) => {
         JSON.stringify(guestsJson),
         JSON.stringify(vehiclesArr),
         userId,
-      ],
-    );
+      ]);
 
     await writeAudit(client, {
       accountId,
@@ -4319,8 +4527,7 @@ const createAuthorization = async (req, res) => {
 
     if (vehiclesIn.length === 0) {
       const legacy = normalizeVehicleNumber(
-        body.vehicleNumber ?? body.vehicle_number ?? "",
-      );
+        body.vehicleNumber ?? body.vehicle_number ?? "");
       if (legacy && legacy.length >= 5 && legacy.length <= 15) {
         vehiclesIn = [{ number: legacy, type: "car" }];
       }
@@ -4370,8 +4577,7 @@ const createAuthorization = async (req, res) => {
         guestCount,
         validFrom.toISOString(),
         validUntil.toISOString(),
-      ],
-    );
+      ]);
 
     await writeAudit(client, {
       accountId,
@@ -4456,8 +4662,7 @@ const deleteAuthorization = async (req, res) => {
     const { rows: existing } = await client.query(
       `SELECT id, created_by FROM gate_authorizations
         WHERE id = $1 AND account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
     if (!existing.length) return fail(res, 404, "not_found", "Pass not found");
 
     const isOwner = role === "owner" || role === "admin";
@@ -4471,8 +4676,7 @@ const deleteAuthorization = async (req, res) => {
       `UPDATE gate_authorizations
           SET status = 'cancelled', updated_at = NOW()
         WHERE id = $1 AND account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
 
     await writeAudit(client, {
       accountId,
@@ -4509,8 +4713,7 @@ const updateAuthorization = async (req, res) => {
     const { rows: existing } = await client.query(
       `SELECT id, created_by, pass_mode FROM gate_authorizations
         WHERE id = $1 AND account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
     if (!existing.length) return fail(res, 404, "not_found", "Pass not found");
 
     const isOwner = role === "owner" || role === "admin";
@@ -4543,8 +4746,7 @@ const updateAuthorization = async (req, res) => {
       vehiclesIn = normalizeVehiclesPayloadInput(body.vehicles);
       if (vehiclesIn.length === 0) {
         const legacy = normalizeVehicleNumber(
-          body.vehicleNumber ?? body.vehicle_number ?? "",
-        );
+          body.vehicleNumber ?? body.vehicle_number ?? "");
         if (legacy && legacy.length >= 5 && legacy.length <= 15) {
           vehiclesIn = [{ number: legacy, type: "car" }];
         }
@@ -4613,8 +4815,7 @@ const updateAuthorization = async (req, res) => {
           SET ${sets.join(", ")}
         WHERE id = $${values.length - 1} AND account_id = $${values.length}
         RETURNING *`,
-      values,
-    );
+      values);
 
     await writeAudit(client, {
       accountId,
@@ -4685,8 +4886,7 @@ const matchAuthorization = async (req, res) => {
           CASE WHEN pass_mode = 'named' THEN 0 ELSE 1 END,
           valid_until ASC
         LIMIT 5`,
-      [accountId, flatNumber, wing, category, visitorName, vehicleNumber],
-    );
+      [accountId, flatNumber, wing, category, visitorName, vehicleNumber]);
 
     if (rows.length === 0) {
       return res.json({ matched: false });
@@ -4746,8 +4946,7 @@ const createInvite = async (req, res) => {
 
     if (vehiclesIn.length === 0) {
       const legacy = normalizeVehicleNumber(
-        body.vehicleNumber ?? body.vehicle_number ?? "",
-      );
+        body.vehicleNumber ?? body.vehicle_number ?? "");
       if (legacy && legacy.length >= 5 && legacy.length <= 15) {
         vehiclesIn = [{ number: legacy, type: "car" }];
       }
@@ -4795,8 +4994,7 @@ const createInvite = async (req, res) => {
         validFrom.toISOString(),
         validUntil.toISOString(),
         code,
-      ],
-    );
+      ]);
 
     await writeAudit(client, {
       accountId,
@@ -4873,8 +5071,7 @@ const getInvite = async (req, res) => {
 
     const { rows } = await pool.query(
       `SELECT * FROM gate_invites WHERE id = $1 AND account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
     if (!rows.length) return fail(res, 404, "not_found", "Invite not found");
 
     const invite = rows[0];
@@ -4904,8 +5101,7 @@ const lookupInviteByCode = async (req, res) => {
 
     const { rows } = await pool.query(
       `SELECT * FROM gate_invites WHERE code = $1 AND account_id = $2 LIMIT 1`,
-      [cleanCode, accountId],
-    );
+      [cleanCode, accountId]);
 
     if (!rows.length) {
       return fail(res, 404, "not_found", "This QR doesn't match any invite");
@@ -4951,8 +5147,7 @@ const deleteInvite = async (req, res) => {
     const { rows: existing } = await client.query(
       `SELECT id, created_by FROM gate_invites
         WHERE id = $1 AND account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
     if (!existing.length) return fail(res, 404, "not_found", "Invite not found");
 
     const isOwner = role === "owner" || role === "admin";
@@ -4966,8 +5161,7 @@ const deleteInvite = async (req, res) => {
       `UPDATE gate_invites
           SET status = 'cancelled', updated_at = NOW()
         WHERE id = $1 AND account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
 
     await writeAudit(client, {
       accountId,
@@ -5004,8 +5198,7 @@ const updateInvite = async (req, res) => {
     const { rows: existing } = await client.query(
       `SELECT id, created_by FROM gate_invites
         WHERE id = $1 AND account_id = $2`,
-      [id, accountId],
-    );
+      [id, accountId]);
     if (!existing.length) return fail(res, 404, "not_found", "Invite not found");
 
     const isOwner = role === "owner" || role === "admin";
@@ -5048,8 +5241,7 @@ const updateInvite = async (req, res) => {
       vehiclesIn = normalizeVehiclesPayloadInput(body.vehicles);
       if (vehiclesIn.length === 0) {
         const legacy = normalizeVehicleNumber(
-          body.vehicleNumber ?? body.vehicle_number ?? "",
-        );
+          body.vehicleNumber ?? body.vehicle_number ?? "");
         if (legacy && legacy.length >= 5 && legacy.length <= 15) {
           vehiclesIn = [{ number: legacy, type: "car" }];
         }
@@ -5122,8 +5314,7 @@ const updateInvite = async (req, res) => {
           SET ${sets.join(", ")}
         WHERE id = $${values.length - 1} AND account_id = $${values.length}
         RETURNING *`,
-      values,
-    );
+      values);
 
     await writeAudit(client, {
       accountId,

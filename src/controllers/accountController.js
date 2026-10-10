@@ -66,6 +66,11 @@ const createAccount = async (req, res) => {
 
 // ===========================================================================
 // listAccounts
+//
+// FIX: previously required an active `members` / `staff` row with matching
+// user_id. That failed for admin-created rows whose user_id had not yet been
+// linked. An active `account_members` row is enough proof that the user
+// joined the property.
 // ===========================================================================
 const listAccounts = async (req, res) => {
   try {
@@ -100,13 +105,7 @@ const listAccounts = async (req, res) => {
         WHERE a.status = 'active'
           AND (
             a.created_by = $1
-            OR (am.role = 'admin')
-            OR (am.role = 'member_visibility' AND EXISTS (
-              SELECT 1 FROM members m
-               WHERE m.account_id = a.id AND m.user_id = $1 AND m.status = 'active'))
-            OR (am.role = 'staff_visibility' AND EXISTS (
-              SELECT 1 FROM staff s
-               WHERE s.account_id = a.id AND s.user_id = $1 AND s.status = 'active'))
+            OR am.role IN ('admin', 'member_visibility', 'staff_visibility')
           )
         ORDER BY a.id, role_priority
       ) sub
@@ -139,7 +138,6 @@ const getAccountPeople = async (req, res) => {
     const { id: accountId } = req.params;
     if (!userId) return fail(res, 401, "unauthenticated");
 
-    // ---- Access check ----
     const { rows: memberRows } = await pool.query(
       `SELECT am.role FROM account_members am
          JOIN accounts a ON a.id = am.account_id
@@ -157,7 +155,6 @@ const getAccountPeople = async (req, res) => {
       return fail(res, 403, "no_account_access");
     }
 
-    // ---- Owner ----
     const { rows: ownerRows } = await pool.query(
       `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM accounts a JOIN users u ON u.id = a.created_by
@@ -176,7 +173,6 @@ const getAccountPeople = async (req, res) => {
         }
       : null;
 
-    // ---- Admins (never dismissible) ----
     const { rows: adminRows } = await pool.query(
       `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM account_members am
@@ -199,15 +195,19 @@ const getAccountPeople = async (req, res) => {
       can_dismiss: false,
     }));
 
-    // ---- Members (People card) ----
-    // INNER JOIN LATERAL + dismissed_at IS NULL: once the owner dismisses
-    // the invitation, the card disappears from the People list.
     const { rows: memberListRows } = await pool.query(
-      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url,
+      `SELECT am.user_id,
+              COALESCE(u.name,      m.name)      AS name,
+              COALESCE(u.phone,     m.phone)     AS phone,
+              COALESCE(u.photo_url, m.photo_url) AS photo_url,
               i.id AS invitation_id
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          JOIN accounts a ON a.id = am.account_id
+         LEFT JOIN members m
+           ON m.account_id = am.account_id
+          AND m.user_id    = am.user_id
+          AND m.status     = 'active'
          INNER JOIN LATERAL (
            SELECT inv.id
              FROM invitations inv
@@ -223,7 +223,7 @@ const getAccountPeople = async (req, res) => {
           AND am.role        = 'member_visibility'
           AND am.status      = 'active'
           AND u.id <> a.created_by
-        ORDER BY COALESCE(u.name, '')`,
+        ORDER BY COALESCE(u.name, m.name, '')`,
       [accountId],
     );
     const members = memberListRows.map((r) => ({
@@ -236,13 +236,19 @@ const getAccountPeople = async (req, res) => {
       can_dismiss: true,
     }));
 
-    // ---- Staff (People card) ----
     const { rows: staffListRows } = await pool.query(
-      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url,
+      `SELECT am.user_id,
+              COALESCE(u.name,      s.name)      AS name,
+              COALESCE(u.phone,     s.phone)     AS phone,
+              COALESCE(u.photo_url, s.photo_url) AS photo_url,
               i.id AS invitation_id
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          JOIN accounts a ON a.id = am.account_id
+         LEFT JOIN staff s
+           ON s.account_id = am.account_id
+          AND s.user_id    = am.user_id
+          AND s.status     = 'active'
          INNER JOIN LATERAL (
            SELECT inv.id
              FROM invitations inv
@@ -258,7 +264,7 @@ const getAccountPeople = async (req, res) => {
           AND am.role        = 'staff_visibility'
           AND am.status      = 'active'
           AND u.id <> a.created_by
-        ORDER BY COALESCE(u.name, '')`,
+        ORDER BY COALESCE(u.name, s.name, '')`,
       [accountId],
     );
     const staff = staffListRows.map((r) => ({
@@ -271,19 +277,23 @@ const getAccountPeople = async (req, res) => {
       can_dismiss: true,
     }));
 
-    // ---- Revoke lists (Revoke Access modal) ----
-    // No dismissed_at filter here — dismiss only affects card visibility.
-    // These lists reflect who actually has active access.
     const { rows: revokeMemberRows } = await pool.query(
-      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+      `SELECT am.user_id,
+              COALESCE(u.name,      m.name)      AS name,
+              COALESCE(u.phone,     m.phone)     AS phone,
+              COALESCE(u.photo_url, m.photo_url) AS photo_url
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          JOIN accounts a ON a.id = am.account_id
+         LEFT JOIN members m
+           ON m.account_id = am.account_id
+          AND m.user_id    = am.user_id
+          AND m.status     = 'active'
         WHERE am.account_id = $1
           AND am.role        = 'member_visibility'
           AND am.status      = 'active'
           AND u.id <> a.created_by
-        ORDER BY COALESCE(u.name, '')`,
+        ORDER BY COALESCE(u.name, m.name, '')`,
       [accountId],
     );
     const revokeMembers = revokeMemberRows.map((r) => ({
@@ -295,15 +305,22 @@ const getAccountPeople = async (req, res) => {
     }));
 
     const { rows: revokeStaffRows } = await pool.query(
-      `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
+      `SELECT am.user_id,
+              COALESCE(u.name,      s.name)      AS name,
+              COALESCE(u.phone,     s.phone)     AS phone,
+              COALESCE(u.photo_url, s.photo_url) AS photo_url
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          JOIN accounts a ON a.id = am.account_id
+         LEFT JOIN staff s
+           ON s.account_id = am.account_id
+          AND s.user_id    = am.user_id
+          AND s.status     = 'active'
         WHERE am.account_id = $1
           AND am.role        = 'staff_visibility'
           AND am.status      = 'active'
           AND u.id <> a.created_by
-        ORDER BY COALESCE(u.name, '')`,
+        ORDER BY COALESCE(u.name, s.name, '')`,
       [accountId],
     );
     const revokeStaff = revokeStaffRows.map((r) => ({
@@ -596,14 +613,6 @@ const setLastAccount = async (req, res) => {
 
 // ===========================================================================
 // getMyRole
-//
-// Returns the caller's current role for a specific account.
-// The highest-priority active role is returned (owner > admin > member > staff).
-// Used by the client to detect role changes without re-fetching the full
-// account list — the tab bar can then react instantly.
-//
-// NOTE: the route is declared as `/:id/my-role` in accountRoutes.js, so we
-// read `req.params.id` (renamed to accountId locally).
 // ===========================================================================
 const getMyRole = async (req, res) => {
   try {
@@ -613,7 +622,6 @@ const getMyRole = async (req, res) => {
     if (!userId) return fail(res, 401, "unauthenticated");
     if (!accountId) return fail(res, 400, "invalid_input");
 
-    // 1. Owner wins.
     const { rows: ownerRows } = await pool.query(
       `SELECT 1 FROM accounts
         WHERE id = $1 AND created_by = $2 AND status = 'active'`,
@@ -623,7 +631,6 @@ const getMyRole = async (req, res) => {
       return res.json({ role: "owner" });
     }
 
-    // 2. Otherwise, highest-priority active role.
     const { rows } = await pool.query(
       `SELECT role FROM account_members
          WHERE account_id = $1 AND user_id = $2 AND status = 'active'

@@ -111,8 +111,23 @@ const toNullableString = (v) => {
 
 const toBoolean = (v) => v === true || v === "true" || v === 1 || v === "1";
 
+// ---------------------------------------------------------------------------
+// Local mergeUsers — used by verifyPhoneChangeOtp when the target phone
+// already belongs to another user and the caller confirmed the merge.
+//
+// After moving FKs from source → survivor, we also sync members.phone /
+// staff.phone so directory entries linked to the survivor carry the
+// survivor's current phone (the phone the user is switching TO).
+// ---------------------------------------------------------------------------
 async function mergeUsers(client, survivorId, sourceId) {
   if (survivorId === sourceId) return;
+
+  // Snapshot survivor's phone before we touch anything.
+  const { rows: survivorRows } = await client.query(
+    `SELECT phone FROM users WHERE id = $1`, [survivorId]);
+  const survivorPhone = survivorRows[0]?.phone
+    ? String(survivorRows[0].phone).replace(/\D/g, "").slice(-10)
+    : null;
 
   await client.query(
     `UPDATE users AS tgt
@@ -151,6 +166,22 @@ async function mergeUsers(client, survivorId, sourceId) {
     [survivorId, sourceId]);
 
   await client.query(`DELETE FROM account_members WHERE user_id = $1`, [sourceId]);
+
+  // Sync directory phone for rows now pointing at the survivor.
+  if (survivorPhone) {
+    await client.query(
+      `UPDATE members SET phone = $1, updated_at = NOW()
+        WHERE user_id = $2 AND status = 'active'
+          AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) <> $1`,
+      [survivorPhone, survivorId]);
+
+    await client.query(
+      `UPDATE staff SET phone = $1, updated_at = NOW()
+        WHERE user_id = $2 AND status = 'active'
+          AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) <> $1`,
+      [survivorPhone, survivorId]);
+  }
+
   await client.query(`DELETE FROM users WHERE id = $1`, [sourceId]);
 }
 
@@ -166,6 +197,9 @@ function mapAccountRow(a) {
   };
 }
 
+// ===========================================================================
+// getAccountProfile
+// ===========================================================================
 const getAccountProfile = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -184,29 +218,36 @@ const getAccountProfile = async (req, res) => {
     if (!rows.length) return fail(res, 404, "not_found", "Account not found");
 
     const account = mapAccountRow(rows[0]);
-    let ownerName = "Owner";
-    let ownerPhone = null;
 
+    // Owner is always a real user. Read the identity from `users`; fall
+    // back to the owner's members row only if users.name is empty.
     const { rows: ownerUser } = await pool.query(
-      `SELECT phone FROM users WHERE id = $1`, [account.ownerId]);
+      `SELECT phone, name FROM users WHERE id = $1`, [account.ownerId]);
 
-    if (ownerUser.length && ownerUser[0].phone) {
-      ownerPhone = normalizePhone(ownerUser[0].phone);
-      if (ownerPhone) {
-        const { rows: memberRows } = await pool.query(
-          `SELECT name FROM members
-            WHERE account_id=$1
-              AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10)=$2 LIMIT 1`,
-          [accountId, ownerPhone]);
-        if (memberRows.length && memberRows[0].name) ownerName = memberRows[0].name;
-      }
+    const ownerPhone = ownerUser.length && ownerUser[0].phone
+      ? normalizePhone(ownerUser[0].phone)
+      : null;
+
+    let ownerName = (ownerUser[0]?.name || "").trim() || null;
+
+    if (!ownerName) {
+      const { rows: ownerMember } = await pool.query(
+        `SELECT name FROM members
+          WHERE account_id=$1 AND user_id=$2 AND status='active'
+          LIMIT 1`,
+        [accountId, account.ownerId]);
+      ownerName = (ownerMember[0]?.name || "").trim() || null;
     }
 
     return res.json({
       account,
       viewerRole: role,
       canEdit: isOwner(role),
-      owner: { id: account.ownerId, name: ownerName, phone: ownerPhone },
+      owner: {
+        id: account.ownerId,
+        name: ownerName || "Owner",
+        phone: ownerPhone,
+      },
     });
   } catch (err) {
     console.error("getAccountProfile error:", err);
@@ -214,6 +255,9 @@ const getAccountProfile = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// updateAccountProfile
+// ===========================================================================
 const updateAccountProfile = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -289,6 +333,9 @@ const updateAccountProfile = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// getPhoneChangePreview
+// ===========================================================================
 const getPhoneChangePreview = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -343,6 +390,9 @@ const getPhoneChangePreview = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// checkPhoneOwner
+// ===========================================================================
 const checkPhoneOwner = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -400,6 +450,9 @@ const checkPhoneOwner = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// requestPhoneChangeOtp
+// ===========================================================================
 const requestPhoneChangeOtp = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -446,6 +499,9 @@ const requestPhoneChangeOtp = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// verifyPhoneChangeOtp
+// ===========================================================================
 const verifyPhoneChangeOtp = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -629,6 +685,9 @@ const verifyPhoneChangeOtp = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// listAdmins
+// ===========================================================================
 const listAdmins = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -645,34 +704,35 @@ const listAdmins = async (req, res) => {
 
     const ownerUserId = accountRows[0].created_by;
     const { rows: ownerUserRows } = await pool.query(
-      `SELECT phone FROM users WHERE id=$1`, [ownerUserId]);
+      `SELECT phone, name FROM users WHERE id=$1`, [ownerUserId]);
 
-    let ownerPhone = null;
-    let ownerName = "Owner";
+    const ownerPhone = ownerUserRows.length
+      ? normalizePhone(ownerUserRows[0].phone)
+      : null;
 
-    if (ownerUserRows.length && ownerUserRows[0].phone) {
-      ownerPhone = normalizePhone(ownerUserRows[0].phone);
-      if (ownerPhone) {
-        const { rows: memberRows } = await pool.query(
-          `SELECT name FROM members
-            WHERE account_id=$1
-              AND RIGHT(REGEXP_REPLACE(phone,'\\D','','g'),10)=$2 LIMIT 1`,
-          [accountId, ownerPhone]);
-        if (memberRows.length && memberRows[0].name) ownerName = memberRows[0].name;
-      }
+    let ownerName = (ownerUserRows[0]?.name || "").trim() || null;
+
+    if (!ownerName) {
+      const { rows: ownerMember } = await pool.query(
+        `SELECT name FROM members
+          WHERE account_id=$1 AND user_id=$2 AND status='active'
+          LIMIT 1`,
+        [accountId, ownerUserId]);
+      ownerName = (ownerMember[0]?.name || "").trim() || null;
     }
 
+    // Admins: prefer users.name (they've joined), fall back to the directory.
     const { rows: adminRows } = await pool.query(
       `SELECT u.id AS user_id, u.phone AS user_phone,
-              COALESCE(m.name, '') AS name
+              COALESCE(NULLIF(u.name, ''), m.name, '') AS name
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          LEFT JOIN members m
            ON m.account_id = am.account_id
-          AND RIGHT(REGEXP_REPLACE(m.phone,'\\D','','g'),10)
-              = RIGHT(REGEXP_REPLACE(u.phone,'\\D','','g'),10)
+          AND m.user_id    = am.user_id
+          AND m.status     = 'active'
         WHERE am.account_id=$1 AND am.status='active' AND am.role='admin'
-        ORDER BY COALESCE(m.name, u.phone)`,
+        ORDER BY COALESCE(NULLIF(u.name, ''), m.name, u.phone)`,
       [accountId]);
 
     const admins = adminRows.map((r) => ({
@@ -684,7 +744,7 @@ const listAdmins = async (req, res) => {
 
     return res.json({
       owner: ownerPhone
-        ? { id: ownerUserId, name: ownerName, phone: ownerPhone, role: "owner" }
+        ? { id: ownerUserId, name: ownerName || "Owner", phone: ownerPhone, role: "owner" }
         : null,
       admins,
     });
