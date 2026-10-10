@@ -55,9 +55,6 @@ const isOwner = (roles) => roles.includes("owner");
 
 // ---------------------------------------------------------------------------
 // linkMemberStaffRows — phone-based fallback.
-// Called after the target_member_id / target_staff_id link, as a belt-and-
-// braces match for rows created before this fix (or when the invite did not
-// carry a target_member_id).
 // ---------------------------------------------------------------------------
 async function linkMemberStaffRows(client, accountId, userId, phone) {
   if (!userId || !phone) return;
@@ -105,8 +102,6 @@ async function linkMemberStaffRows(client, accountId, userId, phone) {
 
 // ---------------------------------------------------------------------------
 // linkExplicitTargetRows — exact-row link using the invitation's target IDs.
-// Runs first in acceptInvitation. Works even when members.phone is empty
-// because the invitation tells us precisely which row(s) it belongs to.
 // ---------------------------------------------------------------------------
 async function linkExplicitTargetRows(client, accountId, userId, inv) {
   if (inv?.target_member_id) {
@@ -883,10 +878,16 @@ const listMyInvitations = async (req, res) => {
 // ===========================================================================
 // ACCEPT
 //
-// Fix part 2 lives here: when the invite carries target_member_id or
-// target_staff_id, we link those exact rows FIRST. This works even if
-// members.phone is empty (e.g. the admin-created row was never backfilled).
-// The phone-based linkMemberStaffRows still runs afterwards.
+// Two fixes vs. previous version:
+//
+//   1. Explicit target-row linking (linkExplicitTargetRows) runs first, so
+//      the exact member/staff row the invitation was created for gets
+//      linked even when its phone is NULL.
+//
+//   2. On accept, we now write the user's own name BACK into
+//      invitations.invited_name — replacing the admin's typed label.
+//      Previously we did the reverse (pushed the admin's label into
+//      users.name), which is why the invitation kept showing "AB".
 // ===========================================================================
 const acceptInvitation = async (req, res) => {
   const client = await pool.connect();
@@ -991,7 +992,16 @@ const acceptInvitation = async (req, res) => {
         [inv.account_id, myPhone, id],
       );
 
-      // Link explicit target rows first, then phone fallback.
+      // ── FIX 1: overwrite the admin's typed label with the user's real name
+      const realOwnerName = String(userRows[0].name ?? "").trim();
+      if (realOwnerName) {
+        await client.query(
+          `UPDATE invitations SET invited_name = $1 WHERE id = $2`,
+          [realOwnerName, id],
+        );
+      }
+
+      // ── FIX 2: link explicit target rows, then phone fallback
       await linkExplicitTargetRows(client, inv.account_id, newOwnerId, inv);
       if (myPhone) {
         await linkMemberStaffRows(client, inv.account_id, newOwnerId, myPhone);
@@ -1045,8 +1055,16 @@ const acceptInvitation = async (req, res) => {
       visibility: visibilityForAccept(inv.role),
     });
 
-    // Link exact target rows from the invite (works even if phone is NULL
-    // on the directory row), then fall back to phone matching.
+    // ── FIX 1: overwrite the admin's typed label with the user's real name
+    const realName = String(userRows[0].name ?? "").trim();
+    if (realName) {
+      await client.query(
+        `UPDATE invitations SET invited_name = $1 WHERE id = $2`,
+        [realName, id],
+      );
+    }
+
+    // ── FIX 2: link explicit target rows, then phone fallback
     await linkExplicitTargetRows(client, inv.account_id, userId, inv);
     if (myPhone) {
       await linkMemberStaffRows(client, inv.account_id, userId, myPhone);

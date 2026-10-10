@@ -592,13 +592,18 @@ const requestPhoneChange = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// confirmPhoneChange
+//
+// FIXED: no more client.release() calls inside the try block. The finally
+// block is the sole owner of the release.
+// ===========================================================================
 const confirmPhoneChange = async (req, res) => {
   const client = await pool.connect();
 
   try {
     const userId = getUserId(req);
     if (!userId) {
-      client.release();
       return fail(res, 401, "unauthenticated", "Authentication required");
     }
 
@@ -609,11 +614,9 @@ const confirmPhoneChange = async (req, res) => {
 
     const ten = normalizeTenDigit(raw);
     if (!ten) {
-      client.release();
       return fail(res, 400, "invalid_input", "A valid 10-digit phone number is required");
     }
     if (!accessToken) {
-      client.release();
       return fail(res, 400, "invalid_input", "MSG91 access token is required");
     }
 
@@ -621,7 +624,6 @@ const confirmPhoneChange = async (req, res) => {
 
     const verification = await verifyMsg91AccessToken(accessToken, normalized);
     if (!verification.ok) {
-      client.release();
       console.error("confirmPhoneChange: MSG91 verification failed:", verification.reason);
       return fail(res, 401, "verification_failed", "Phone verification failed. Please try again.");
     }
@@ -632,7 +634,6 @@ const confirmPhoneChange = async (req, res) => {
       `SELECT id, phone FROM users WHERE id = $1 FOR UPDATE`, [userId]);
     if (!currentRows.length) {
       await client.query("ROLLBACK");
-      client.release();
       return fail(res, 404, "not_found", "User not found");
     }
 
@@ -641,7 +642,6 @@ const confirmPhoneChange = async (req, res) => {
 
     if (currentTen === ten) {
       await client.query("ROLLBACK");
-      client.release();
       return fail(res, 400, "same_phone", "This is already your current phone number");
     }
 
@@ -656,7 +656,6 @@ const confirmPhoneChange = async (req, res) => {
     if (hasTarget) {
       if (!mergeConfirmed) {
         await client.query("ROLLBACK");
-        client.release();
         return fail(res, 409, "merge_required",
           "This number already belongs to another login. Confirm the merge to continue.");
       }
@@ -725,6 +724,8 @@ const confirmPhoneChange = async (req, res) => {
 // The users row is NEVER hard-deleted because:
 //   accounts.created_by, members.created_by, staff.created_by,
 //   calendar_events.created_by_id are all ON DELETE RESTRICT.
+//
+// FIXED: no more client.release() calls inside the try block.
 // ================================================================
 
 const deleteMe = async (req, res) => {
@@ -733,7 +734,6 @@ const deleteMe = async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) {
-      client.release();
       return fail(res, 401, "unauthenticated", "Authentication required");
     }
 
@@ -744,12 +744,10 @@ const deleteMe = async (req, res) => {
       [userId]);
     if (!userRows.length) {
       await client.query("ROLLBACK");
-      client.release();
       return fail(res, 404, "not_found", "User not found");
     }
     if (!userRows[0].is_active) {
       await client.query("ROLLBACK");
-      client.release();
       return res.json({
         success: true,
         message: "Account already deleted.",
