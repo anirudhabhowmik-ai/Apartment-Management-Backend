@@ -73,11 +73,24 @@ router.post("/:accountId/vehicles", c.registerVehicle);
 router.post("/:accountId/gate-entries", c.createGateEntry);
 router.get("/:accountId/gate-entries", c.listGateEntries);
 
-// Approval flow
+// Guard edit / allow / reject (invited entries) or full edit (manual entries)
+router.patch("/:accountId/gate-entries/:id", c.updateGateEntry);
+
+// Approval flow (resident side)
 router.get("/:accountId/gate-entries/:id/status", c.getGateEntryStatus);
 router.post("/:accountId/gate-entries/:id/approve", c.approveGateEntry);
 router.post("/:accountId/gate-entries/:id/reject", c.rejectGateEntry);
 router.post("/:accountId/gate-entries/:id/override", c.overrideGateEntry);
+
+// ---------------- Gate Flats (searchable dropdown source) ----------------
+router.get("/:accountId/gate-flats", c.listGateFlats);
+
+// ---------------- Gate Passes (search by resident + history + action) ----
+// IMPORTANT: /search and /action must come BEFORE /:kind/:id/history so the
+// literal segments aren't accidentally matched as `kind` params.
+router.get("/:accountId/gate-passes/search", c.searchGatePasses);
+router.post("/:accountId/gate-passes/action", c.logPassAction);
+router.get("/:accountId/gate-passes/:kind/:id/history", c.getPassHistory);
 
 // ---------------- Gate Authorizations ----------------
 // IMPORTANT: /match must come BEFORE /:id.

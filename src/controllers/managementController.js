@@ -82,7 +82,6 @@ function normalizeRole(raw) {
   return s.replace(/\s+/g, " ").replace(/[\u0000-\u001F]/g, "").toLowerCase();
 }
 
-// ─── Vehicle helpers ──────────────────────────────────────────────────────
 const VALID_VEHICLE_TYPES = new Set(["car", "bike", "other"]);
 
 function normalizeVehicleNumber(raw) {
@@ -140,7 +139,6 @@ function normalizeVehiclesInput(raw) {
   return { ok: true, value: out };
 }
 
-// ─── Guest group parsing (gate entries) ──────────────────────────────────
 const MAX_GROUP_SIZE = 20;
 
 function normalizeGuestRow(g) {
@@ -521,6 +519,59 @@ async function syncStaffAccessOnCreate(client, accountId, staffRow) {
     [accountId, staffRow.user_id]);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Flat uniqueness helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Normalize a flat/wing value for comparison. Trims, collapses whitespace,
+ * and treats empty strings as null.
+ */
+function normalizeFlatKeyValue(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim().replace(/\s+/g, " ");
+  return s.length === 0 ? null : s;
+}
+
+/**
+ * Returns the conflicting member row (id, flat_number, wing, name) if the
+ * given flat+wing is already registered to an active member of this account.
+ * Excludes `excludeMemberId` (used by updateMember).
+ *
+ * Passing `client` = null uses the pool directly.
+ */
+async function findFlatConflict(
+  client,
+  accountId,
+  flatNumber,
+  wing,
+  excludeMemberId = null,
+) {
+  const flatKey = normalizeFlatKeyValue(flatNumber);
+  if (!flatKey) return null;
+
+  const wingKey = normalizeFlatKeyValue(wing);
+  const runner = client || pool;
+
+  const { rows } = await runner.query(
+    `SELECT m.id, m.flat_number, m.wing, u.name
+       FROM members m
+       LEFT JOIN users u ON u.id = m.user_id
+      WHERE m.account_id = $1
+        AND m.status = 'active'
+        AND LOWER(TRIM(m.flat_number)) = LOWER($2)
+        AND (
+              ($3::text IS NULL AND (m.wing IS NULL OR TRIM(m.wing) = ''))
+           OR ($3::text IS NOT NULL AND LOWER(TRIM(m.wing)) = LOWER($3))
+        )
+        AND ($4::uuid IS NULL OR m.id <> $4::uuid)
+      LIMIT 1`,
+    [accountId, flatKey, wingKey, excludeMemberId],
+  );
+
+  return rows[0] ?? null;
+}
+
 // ===========================================================================
 // listAccountPeople
 // ===========================================================================
@@ -806,6 +857,32 @@ const createMember = async (req, res) => {
 
     await client.query("BEGIN");
 
+    // ── Flat / Room number uniqueness ────────────────────────────────
+    // A flat number (within the same wing bucket) can only belong to one
+    // active member at a time. Trying to re-register a flat that already
+    // exists returns 409 flat_already_registered.
+    {
+      const flatConflict = await findFlatConflict(
+        client,
+        accountId,
+        flat_number,
+        wing,
+        null,
+      );
+
+      if (flatConflict) {
+        await client.query("ROLLBACK");
+        return fail(
+          res,
+          409,
+          "flat_already_registered",
+          `Flat ${flatConflict.flat_number} is already registered${
+            flatConflict.name ? ` to ${flatConflict.name}` : ""
+          }. Delete the existing record first.`,
+        );
+      }
+    }
+
     let targetUserId = null;
     let targetName = "";
     let targetPhone = "";
@@ -1018,6 +1095,52 @@ const updateMember = async (req, res) => {
       [id]);
     const beforeSnapshot = beforeRows[0] ?? null;
 
+    // ── Flat / Room number uniqueness (only when flat/wing is changing) ──
+    if (
+      Object.prototype.hasOwnProperty.call(req.body, "flat_number") ||
+      Object.prototype.hasOwnProperty.call(req.body, "wing")
+    ) {
+      const nextFlat =
+        updates.flat_number !== undefined
+          ? updates.flat_number
+          : beforeSnapshot?.flat_number ?? null;
+
+      const nextWing =
+        updates.wing !== undefined
+          ? updates.wing
+          : beforeSnapshot?.wing ?? null;
+
+      // Skip the check if nothing actually changed.
+      const flatChanged =
+        normalizeFlatKeyValue(nextFlat) !==
+        normalizeFlatKeyValue(beforeSnapshot?.flat_number);
+      const wingChanged =
+        normalizeFlatKeyValue(nextWing) !==
+        normalizeFlatKeyValue(beforeSnapshot?.wing);
+
+      if (flatChanged || wingChanged) {
+        const flatConflict = await findFlatConflict(
+          client,
+          accountId,
+          nextFlat,
+          nextWing,
+          id,
+        );
+
+        if (flatConflict) {
+          await client.query("ROLLBACK");
+          return fail(
+            res,
+            409,
+            "flat_already_registered",
+            `Flat ${flatConflict.flat_number} is already registered${
+              flatConflict.name ? ` to ${flatConflict.name}` : ""
+            }. Delete the existing record first.`,
+          );
+        }
+      }
+    }
+
     if (!identityLocked && (hasName || hasPhone || hasPhoto)) {
       if (hasPhone) {
         const { rows: conflict } = await client.query(
@@ -1179,7 +1302,7 @@ const deleteMember = async (req, res) => {
     await client.query("BEGIN");
 
     const { rows: existing } = await client.query(
-      `SELECT m.user_id, u.name
+      `SELECT m.user_id, m.flat_number, m.wing, u.name
          FROM members m
          LEFT JOIN users u ON u.id = m.user_id
         WHERE m.id = $1 AND m.account_id = $2 AND m.status = 'active'`,
@@ -1193,6 +1316,8 @@ const deleteMember = async (req, res) => {
 
     const targetUserId = existing[0].user_id ?? null;
     const targetName = existing[0].name ?? null;
+    const flatNumber = existing[0].flat_number ?? null;
+    const wingRaw = existing[0].wing ?? null;
 
     const updated = await client.query(
       `UPDATE members SET status='inactive', updated_at=NOW()
@@ -1210,6 +1335,48 @@ const deleteMember = async (req, res) => {
         WHERE account_id=$1 AND member_id=$2 AND status='active'`,
       [accountId, id],
     );
+
+    // ── Cascade: cancel all gate passes / invites for this flat ───────
+    // When a flat is sold / a tenant leaves, the previous owner's invites
+    // and open passes must not remain visible to the new occupant.
+    if (flatNumber) {
+      const wingKey =
+        wingRaw && String(wingRaw).trim() !== ""
+          ? String(wingRaw).trim()
+          : null;
+
+      const cancelSql = `
+        UPDATE %TABLE%
+           SET status = 'cancelled', updated_at = NOW()
+         WHERE account_id = $1
+           AND status <> 'cancelled'
+           AND (
+                 member_id = $2
+              OR (
+                   LOWER(TRIM(flat_number)) = LOWER(TRIM($3))
+                   AND (
+                         $4::text IS NULL
+                      OR wing IS NULL
+                      OR TRIM(wing) = ''
+                      OR LOWER(TRIM(wing)) = LOWER($4)
+                   )
+                 )
+           )`;
+
+      await client.query(cancelSql.replace("%TABLE%", "gate_invites"), [
+        accountId,
+        id,
+        flatNumber,
+        wingKey,
+      ]);
+
+      await client.query(cancelSql.replace("%TABLE%", "gate_authorizations"), [
+        accountId,
+        id,
+        flatNumber,
+        wingKey,
+      ]);
+    }
 
     if (targetUserId) {
       const { rows: stillMember } = await client.query(
@@ -1240,7 +1407,7 @@ const deleteMember = async (req, res) => {
       entityId: id,
       action: "delete",
       after: { status: "inactive", name: targetName },
-      metadata: { softDelete: true },
+      metadata: { softDelete: true, flat_number: flatNumber, wing: wingRaw },
       visibility: "participants",
     });
 
@@ -2510,7 +2677,6 @@ const checkVehicleConflict = async (req, res) => {
     const excludeId = req.query?.excludeId ? String(req.query.excludeId).trim() : null;
     const excludeType = req.query?.excludeType ? String(req.query.excludeType).trim() : null;
 
-    // ── 1. Check vehicles table ─────────────────────────────────────
     const { rows: veh } = await pool.query(
       `SELECT id, owner_name, flat_number, wing
          FROM vehicles
@@ -2536,7 +2702,6 @@ const checkVehicleConflict = async (req, res) => {
       });
     }
 
-    // ── 2. Check active gate_authorizations (passes) ────────────────
     const { rows: auth } = await pool.query(
       `SELECT id, visitor_name, flat_number, wing, valid_until
          FROM gate_authorizations
@@ -2572,7 +2737,6 @@ const checkVehicleConflict = async (req, res) => {
       });
     }
 
-    // ── 3. Check active gate_invites ────────────────────────────────
     const { rows: inv } = await pool.query(
       `SELECT id, guest_name, flat_number, wing, valid_until
          FROM gate_invites
@@ -2744,17 +2908,6 @@ const registerVehicle = async (req, res) => {
 // GATE ENTRIES
 // ===========================================================================
 
-/**
- * createGateEntry — two modes:
- *
- *   mode: "pass_scan"  → guard scanned a valid QR / entered a valid code.
- *                        No log is written. Returns invite details.
- *
- *   mode: "manual"     → guard manually entered visitor details.
- *                        Creates a gate_entries row.
- *                        autoApprove: true  → status = "auto_approved"
- *                        autoApprove: false → status = "pending_approval"
- */
 const createGateEntry = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -2769,7 +2922,6 @@ const createGateEntry = async (req, res) => {
     const modeRaw = String(body.mode ?? "manual").toLowerCase().trim();
     const isPassScan = modeRaw === "pass_scan";
 
-    // ─── PASS SCAN (no log) ────────────────────────────────────────────
     if (isPassScan) {
       const inviteId = body.inviteId ?? body.invite_id ?? null;
       const code = body.code ? String(body.code).trim() : null;
@@ -2779,7 +2931,6 @@ const createGateEntry = async (req, res) => {
           "inviteId or code is required for pass_scan");
       }
 
-      // Resolve by code first if only code given
       if (code && !inviteId) {
         const { rows: inv } = await pool.query(
           `SELECT id FROM gate_invites WHERE code = $1 AND account_id = $2 LIMIT 1`,
@@ -2822,7 +2973,6 @@ const createGateEntry = async (req, res) => {
       }
     }
 
-    // ─── MANUAL ENTRY (creates a log) ──────────────────────────────────
     const number = normalizeVehicleNumber(
       body.vehicleNumber ?? body.vehicle_number ?? body.number ?? "",
     );
@@ -2887,11 +3037,6 @@ const createGateEntry = async (req, res) => {
     const primaryVehicle = headVehicle?.number || number || "NO-VEHICLE";
     const primaryVehicleType = headVehicle?.type || vehicleType || null;
 
-    if (!primaryVehicle) {
-      return fail(res, 400, "invalid_input", "Vehicle number is required");
-    }
-
-    // Resolve flat/member
     let vehicleId = null;
     let memberId = null;
     let memberUserId = null;
@@ -2949,10 +3094,10 @@ const createGateEntry = async (req, res) => {
           owner_name, flat_number, owner_phone, registered, direction, scanned_by,
           visitor_type, visitor_name, visitor_phone, purpose, vehicle_type,
           invite_id, authorization_id, rejected, notified, status,
-          guests, vehicles)
+          guests, vehicles, scanned_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
                $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-               $21::jsonb, $22::jsonb)
+               $21::jsonb, $22::jsonb, NOW())
        RETURNING id, scanned_at, status`,
       [
         accountId,
@@ -2982,7 +3127,6 @@ const createGateEntry = async (req, res) => {
 
     const entryId = rows[0].id;
 
-    // Notify resident
     if (memberUserId) {
       const total = guestsIn.length;
       const vehicleCount = vehiclesIn.length;
@@ -3058,7 +3202,6 @@ const createGateEntry = async (req, res) => {
   }
 };
 
-// ─── List gate entries ─────────────────────────────────────────────────
 const listGateEntries = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -3102,11 +3245,25 @@ const listGateEntries = async (req, res) => {
     if (useDate) {
       params.push(dateRaw);
       conditions.push(
-        `(scanned_at AT TIME ZONE 'Asia/Kolkata')::date = $${params.length}::date`,
+        `(
+           CASE
+             WHEN pg_typeof(scanned_at) = 'timestamp with time zone'::regtype
+               THEN (scanned_at AT TIME ZONE 'Asia/Kolkata')::date
+             ELSE
+               (scanned_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
+           END
+         ) = $${params.length}::date`,
       );
     } else if (!useStatus) {
       conditions.push(
-        `(scanned_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date`,
+        `(
+           CASE
+             WHEN pg_typeof(scanned_at) = 'timestamp with time zone'::regtype
+               THEN (scanned_at AT TIME ZONE 'Asia/Kolkata')::date
+             ELSE
+               (scanned_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
+           END
+         ) = (NOW() AT TIME ZONE 'Asia/Kolkata')::date`,
       );
     }
 
@@ -3145,7 +3302,307 @@ const listGateEntries = async (req, res) => {
   }
 };
 
-// ─── Approval flow ─────────────────────────────────────────────────────
+const INVITE_EDIT_WINDOW_MS = 5 * 60 * 1000;
+const VALID_PURPOSES = new Set(["guest", "delivery", "cab", "service", "other"]);
+
+const updateGateEntry = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) {
+      return fail(res, 403, "no_account_access",
+        "You no longer have access to this account");
+    }
+
+    const { rows: entryRows } = await client.query(
+      `SELECT id, invite_id, authorization_id, status, rejected,
+              scanned_by, scanned_at, visitor_name, member_id
+         FROM gate_entries
+        WHERE id = $1 AND account_id = $2`,
+      [id, accountId],
+    );
+    if (!entryRows.length) return fail(res, 404, "not_found", "Entry not found");
+
+    const entry = entryRows[0];
+    const isInvited = !!(entry.invite_id || entry.authorization_id);
+    const body = req.body || {};
+
+    if (isInvited) {
+      const nextStatus = String(body.status ?? "").toLowerCase().trim();
+      if (nextStatus !== "approved" && nextStatus !== "rejected") {
+        return fail(res, 400, "invalid_input",
+          "Invited entries can only be approved or rejected");
+      }
+
+      const scannedAt = new Date(entry.scanned_at).getTime();
+      if (!Number.isFinite(scannedAt) ||
+          Date.now() - scannedAt > INVITE_EDIT_WINDOW_MS) {
+        return fail(res, 410, "edit_window_expired",
+          "The 5-minute action window has expired.");
+      }
+
+      if (entry.status !== "pending_approval") {
+        return fail(res, 409, "invalid_state",
+          `This entry is already ${String(entry.status).replace(/_/g, " ")}`);
+      }
+
+      await client.query("BEGIN");
+
+      await client.query(
+        `UPDATE gate_entries
+            SET status = $1,
+                rejected = $2,
+                approved_by = $3,
+                approved_at = NOW(),
+                responded_at = NOW()
+          WHERE id = $4 AND account_id = $5`,
+        [nextStatus, nextStatus === "rejected", userId, id, accountId],
+      );
+
+      await writeAudit(client, {
+        accountId,
+        actorUserId: userId,
+        actorRole: role,
+        entityType: "gate_entry",
+        entityId: id,
+        action: nextStatus === "approved" ? "gate_approved" : "gate_rejected",
+        after: { status: nextStatus },
+        metadata: { via: "guard_edit" },
+        visibility: "participants",
+      });
+
+      await client.query("COMMIT");
+
+      if (entry.scanned_by && entry.scanned_by !== userId) {
+        try {
+          await sendGateNotification([entry.scanned_by], {
+            title: nextStatus === "approved" ? "Entry approved" : "Entry rejected",
+            body: `${entry.visitor_name || "Visitor"} was ${
+              nextStatus === "approved" ? "allowed in" : "denied entry"
+            }.`,
+            data: {
+              type: "gate_status",
+              entryId: id,
+              accountId,
+              status: nextStatus,
+            },
+          });
+        } catch (e) {
+          console.warn("[gate] guard notify failed:", e.message);
+        }
+      }
+
+      return res.json({ success: true, status: nextStatus });
+    }
+
+    const hasDirection = Object.prototype.hasOwnProperty.call(body, "direction");
+    const hasWing = Object.prototype.hasOwnProperty.call(body, "wing");
+    const hasFlat =
+      Object.prototype.hasOwnProperty.call(body, "flatNumber") ||
+      Object.prototype.hasOwnProperty.call(body, "flat_number");
+    const hasPurpose = Object.prototype.hasOwnProperty.call(body, "purpose");
+    const hasGuests = Object.prototype.hasOwnProperty.call(body, "guests");
+    const hasVisitorName =
+      Object.prototype.hasOwnProperty.call(body, "visitor_name") ||
+      Object.prototype.hasOwnProperty.call(body, "visitorName");
+    const hasVisitorPhone =
+      Object.prototype.hasOwnProperty.call(body, "visitor_phone") ||
+      Object.prototype.hasOwnProperty.call(body, "visitorPhone");
+
+    if (!hasDirection && !hasWing && !hasFlat && !hasPurpose &&
+        !hasGuests && !hasVisitorName && !hasVisitorPhone) {
+      return fail(res, 400, "invalid_input", "No editable fields provided");
+    }
+
+    let newFlat;
+    if (hasFlat) {
+      newFlat = String(body.flatNumber ?? body.flat_number ?? "").trim();
+      if (!newFlat) {
+        return fail(res, 400, "invalid_input", "Flat number cannot be empty");
+      }
+    }
+
+    let newWing;
+    if (hasWing) {
+      const w = body.wing;
+      newWing = w == null || String(w).trim() === "" ? null : String(w).trim();
+    }
+
+    let newDirection;
+    if (hasDirection) {
+      newDirection = String(body.direction ?? "in").toLowerCase() === "out"
+        ? "out"
+        : "in";
+    }
+
+    let newPurpose;
+    if (hasPurpose) {
+      if (body.purpose == null || String(body.purpose).trim() === "") {
+        newPurpose = null;
+      } else {
+        const p = String(body.purpose).trim().toLowerCase();
+        if (!VALID_PURPOSES.has(p)) {
+          return fail(res, 400, "invalid_input", "Invalid purpose");
+        }
+        newPurpose = p;
+      }
+    }
+
+    let newVisitorName;
+    if (hasVisitorName) {
+      newVisitorName = String(body.visitor_name ?? body.visitorName ?? "").trim();
+      if (!newVisitorName) {
+        return fail(res, 400, "invalid_input", "Visitor name cannot be empty");
+      }
+      if (newVisitorName.length > 200) {
+        return fail(res, 400, "invalid_input", "Visitor name is too long");
+      }
+    }
+
+    let newVisitorPhone;
+    if (hasVisitorPhone) {
+      const raw = body.visitor_phone ?? body.visitorPhone;
+      newVisitorPhone = raw == null || String(raw).trim() === ""
+        ? null
+        : normalizePhone(raw);
+    }
+
+    let guestsIn = null;
+    if (hasGuests) {
+      guestsIn = normalizeGuestsGroup(body.guests);
+      if (guestsIn.length === 0) {
+        return fail(res, 400, "invalid_input",
+          "At least one guest name is required");
+      }
+    }
+
+    await client.query("BEGIN");
+
+    const sets = [];
+    const values = [];
+    const push = (col, val) => {
+      values.push(val);
+      sets.push(`${col} = $${values.length}`);
+    };
+
+    if (hasDirection) push("direction", newDirection);
+    if (hasPurpose) push("purpose", newPurpose);
+    if (hasWing) push("wing", newWing);
+    if (hasFlat) push("flat_number", newFlat);
+
+    if (hasVisitorName && !guestsIn) {
+      push("visitor_name", newVisitorName);
+      push("owner_name", newVisitorName);
+    }
+    if (hasVisitorPhone && !guestsIn) {
+      push("visitor_phone", newVisitorPhone);
+    }
+
+    if (guestsIn) {
+      const head = guestsIn[0] || null;
+      const vehiclesList = deriveVehicleList(guestsIn);
+
+      const primaryVehicle =
+        head?.vehicle?.number ||
+        (vehiclesList[0]?.number ?? "NO-VEHICLE");
+      const primaryVehicleType =
+        head?.vehicle?.type || vehiclesList[0]?.type || null;
+
+      let vehicleId = null;
+      let memberId = null;
+      let ownerName = head?.name ?? newVisitorName ?? null;
+      let ownerPhone = head?.phone ?? newVisitorPhone ?? null;
+
+      if (primaryVehicle && primaryVehicle !== "NO-VEHICLE") {
+        const { rows: vrows } = await client.query(
+          `SELECT id, member_id, owner_name, flat_number, owner_phone
+             FROM vehicles
+            WHERE account_id = $1 AND vehicle_number = $2 AND status = 'active'
+            LIMIT 1`,
+          [accountId, primaryVehicle],
+        );
+        if (vrows.length) {
+          vehicleId = vrows[0].id;
+          memberId = vrows[0].member_id;
+          ownerName = ownerName || vrows[0].owner_name;
+          ownerPhone = ownerPhone || vrows[0].owner_phone;
+        }
+      }
+
+      const flatForLookup = hasFlat ? newFlat : null;
+      if (!memberId && flatForLookup) {
+        const wingForLookup = hasWing ? newWing : null;
+        const { rows: mm } = await client.query(
+          `SELECT id, user_id
+             FROM members
+            WHERE account_id = $1
+              AND flat_number = $2
+              AND ($3::text IS NULL OR wing = $3)
+              AND status = 'active'
+            LIMIT 1`,
+          [accountId, flatForLookup, wingForLookup],
+        );
+        if (mm.length) memberId = mm[0].id;
+      }
+
+      push("guests", JSON.stringify(guestsIn));
+      push("vehicles", JSON.stringify(vehiclesList));
+      push("visitor_name", head?.name ?? newVisitorName ?? null);
+      push("visitor_phone", head?.phone ?? newVisitorPhone ?? null);
+      push("owner_name", ownerName);
+      push("owner_phone", ownerPhone);
+      push("vehicle_number", primaryVehicle);
+      push("vehicle_type", primaryVehicleType);
+      push("vehicle_id", vehicleId);
+      push("member_id", memberId);
+    }
+
+    if (sets.length === 0) {
+      await client.query("ROLLBACK");
+      return fail(res, 400, "invalid_input", "No editable fields provided");
+    }
+
+    values.push(id);
+    values.push(accountId);
+
+    const { rows: updated } = await client.query(
+      `UPDATE gate_entries
+          SET ${sets.join(", ")}
+        WHERE id = $${values.length - 1} AND account_id = $${values.length}
+        RETURNING *`,
+      values,
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_entry",
+      entityId: id,
+      action: "update",
+      after: updated[0],
+      metadata: {
+        via: "guard_edit",
+        fields: sets.map((s) => s.split(" ")[0]),
+      },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+    return res.json(updated[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("updateGateEntry error:", err);
+    return fail(res, 500, "server_error", "Failed to update gate entry");
+  } finally {
+    client.release();
+  }
+};
+
 const approveGateEntry = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -3398,6 +3855,426 @@ const getGateEntryStatus = async (req, res) => {
 };
 
 // ===========================================================================
+// GATE FLATS (searchable dropdown source)
+// ===========================================================================
+
+const listGateFlats = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const q = String(req.query?.q ?? "").trim();
+    const pattern = q ? `%${q}%` : null;
+
+    const { rows } = await pool.query(
+      `SELECT m.id::text AS member_id,
+              m.wing,
+              m.flat_number,
+              u.name  AS resident_name,
+              u.phone AS resident_phone
+         FROM members m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.account_id = $1
+          AND m.status = 'active'
+          AND ($2::text IS NULL
+               OR u.name ILIKE $2
+               OR m.flat_number ILIKE $2
+               OR m.wing ILIKE $2)
+        ORDER BY m.wing NULLS FIRST, m.flat_number, u.name`,
+      [accountId, pattern],
+    );
+
+    return res.json(rows);
+  } catch (err) {
+    console.error("listGateFlats error:", err);
+    return fail(res, 500, "server_error", "Failed to load flats");
+  }
+};
+
+// ===========================================================================
+// GATE PASSES (search by flat / resident name / phone)
+// ===========================================================================
+
+const searchGatePasses = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const q = String(req.query?.q ?? "").trim();
+    const flatNumberParam = req.query?.flatNumber
+      ? String(req.query.flatNumber).trim()
+      : null;
+    const wingParam = req.query?.wing
+      ? String(req.query.wing).trim()
+      : null;
+
+    if (!flatNumberParam && q.length < 2) {
+      return fail(res, 400, "invalid_input", "Enter at least 2 characters");
+    }
+
+    const pattern = `%${q || ""}%`;
+    const digits = (q || "").replace(/\D/g, "");
+    const phonePattern = digits.length >= 3 ? `%${digits}%` : pattern;
+
+    // ── Active gate_authorizations (open/named passes) ──
+    // NOTE: gate_authorizations has NO `code` column. Also, the wing filter
+    // is lenient — it accepts exact matches, NULL/empty wings, and any wing
+    // that starts with the picked value (e.g. "A" also matches "A ·,").
+    const { rows: authRows } = await pool.query(
+      `SELECT ga.id::text AS id,
+              'authorization'::text AS kind,
+              ga.category AS purpose,
+              ga.pass_mode,
+              ga.visitor_name,
+              ga.visitor_phone,
+              ga.vehicle_number,
+              ga.vehicles,
+              ga.guest_count,
+              ga.wing,
+              ga.flat_number,
+              ga.valid_from,
+              ga.valid_until,
+              ga.status,
+              NULL::text AS code,
+              ga.created_at,
+              COALESCE(m.user_id, m2.user_id) AS member_user_id,
+              COALESCE(u.name, u2.name)       AS member_name,
+              COALESCE(u.phone, u2.phone)     AS member_phone,
+              (SELECT COUNT(*)::int FROM gate_entries ge
+                 WHERE ge.account_id = ga.account_id
+                   AND ge.authorization_id = ga.id
+                   AND ge.status <> 'rejected'
+                   AND ge.status <> 'pending_approval') AS used_count
+         FROM gate_authorizations ga
+         LEFT JOIN members m ON m.id = ga.member_id
+         LEFT JOIN users   u ON u.id = m.user_id
+         LEFT JOIN members m2
+                ON ga.member_id IS NULL
+               AND m2.account_id = ga.account_id
+               AND m2.flat_number = ga.flat_number
+               AND (ga.wing IS NULL OR m2.wing = ga.wing OR m2.wing IS NULL)
+               AND m2.status = 'active'
+         LEFT JOIN users u2 ON u2.id = m2.user_id
+        WHERE ga.account_id = $1
+          AND ga.status IN ('active', 'used', 'approved')
+          AND ga.valid_until >= NOW()
+          AND (
+                COALESCE(u.name, u2.name) ILIKE $2
+             OR COALESCE(u.phone, u2.phone) ILIKE $3
+             OR ga.flat_number ILIKE $2
+             OR ga.visitor_name ILIKE $2
+          )
+          AND ($4::text IS NULL OR ga.flat_number = $4)
+          AND (
+                $5::text IS NULL
+             OR ga.wing = $5
+             OR ga.wing IS NULL
+             OR TRIM(ga.wing) = ''
+             OR ga.wing ILIKE $5 || '%'
+          )
+        ORDER BY ga.valid_until ASC
+        LIMIT 30`,
+      [accountId, pattern, phonePattern, flatNumberParam, wingParam],
+    );
+
+    // ── Active gate_invites (QR passes) ──
+    const { rows: invRows } = await pool.query(
+      `SELECT gi.id::text AS id,
+              'invite'::text AS kind,
+              gi.purpose,
+              NULL::text AS pass_mode,
+              gi.guest_name   AS visitor_name,
+              gi.guest_phone  AS visitor_phone,
+              gi.vehicle_number,
+              gi.vehicles,
+              gi.guest_count,
+              gi.wing,
+              gi.flat_number,
+              gi.valid_from,
+              gi.valid_until,
+              gi.status,
+              gi.code,
+              gi.created_at,
+              COALESCE(m.user_id, m2.user_id) AS member_user_id,
+              COALESCE(u.name, u2.name)       AS member_name,
+              COALESCE(u.phone, u2.phone)     AS member_phone,
+              (SELECT COUNT(*)::int FROM gate_entries ge
+                 WHERE ge.account_id = gi.account_id
+                   AND ge.invite_id = gi.id
+                   AND ge.status <> 'rejected'
+                   AND ge.status <> 'pending_approval') AS used_count
+         FROM gate_invites gi
+         LEFT JOIN members m ON m.id = gi.member_id
+         LEFT JOIN users   u ON u.id = m.user_id
+         LEFT JOIN members m2
+                ON gi.member_id IS NULL
+               AND m2.account_id = gi.account_id
+               AND m2.flat_number = gi.flat_number
+               AND (gi.wing IS NULL OR m2.wing = gi.wing OR m2.wing IS NULL)
+               AND m2.status = 'active'
+         LEFT JOIN users u2 ON u2.id = m2.user_id
+        WHERE gi.account_id = $1
+          AND gi.status IN ('active', 'used', 'approved')
+          AND gi.valid_until >= NOW()
+          AND (
+                COALESCE(u.name, u2.name) ILIKE $2
+             OR COALESCE(u.phone, u2.phone) ILIKE $3
+             OR gi.flat_number ILIKE $2
+             OR gi.guest_name ILIKE $2
+          )
+          AND ($4::text IS NULL OR gi.flat_number = $4)
+          AND (
+                $5::text IS NULL
+             OR gi.wing = $5
+             OR gi.wing IS NULL
+             OR TRIM(gi.wing) = ''
+             OR gi.wing ILIKE $5 || '%'
+          )
+        ORDER BY gi.valid_until ASC
+        LIMIT 30`,
+      [accountId, pattern, phonePattern, flatNumberParam, wingParam],
+    );
+
+    const all = [...authRows, ...invRows].sort((a, b) => {
+      const at = new Date(a.valid_until).getTime();
+      const bt = new Date(b.valid_until).getTime();
+      return at - bt;
+    });
+
+    return res.json(all);
+  } catch (err) {
+    console.error("searchGatePasses error:", err);
+    return fail(
+      res,
+      500,
+      "server_error",
+      `Failed to search passes: ${err.message || err.toString()}`,
+    );
+  }
+};
+
+const getPassHistory = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { accountId, kind, id } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    if (kind !== "invite" && kind !== "authorization") {
+      return fail(res, 400, "invalid_input", "kind must be invite or authorization");
+    }
+
+    const col = kind === "invite" ? "invite_id" : "authorization_id";
+    const { rows } = await pool.query(
+      `SELECT id, visitor_name, visitor_phone, vehicle_number, direction,
+              status, rejected, scanned_at, guests, vehicles, purpose
+         FROM gate_entries
+        WHERE account_id = $1 AND ${col} = $2
+        ORDER BY scanned_at DESC
+        LIMIT 200`,
+      [accountId, id],
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error("getPassHistory error:", err);
+    return fail(res, 500, "server_error", "Failed to load history");
+  }
+};
+
+const logPassAction = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = getUserId(req);
+    const { accountId } = req.params;
+
+    if (!userId) return fail(res, 401, "unauthenticated", "Authentication required");
+    const role = await getRoleForAccount(userId, accountId);
+    if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
+
+    const body = req.body || {};
+    const kindRaw = String(body.kind ?? "").toLowerCase().trim();
+    const passId = String(body.passId ?? "").trim();
+    const action = String(body.action ?? "").toLowerCase().trim();
+
+    if (!passId) return fail(res, 400, "invalid_input", "passId is required");
+    if (action !== "in" && action !== "reject") {
+      return fail(res, 400, "invalid_input", "action must be in or reject");
+    }
+
+    const order =
+      kindRaw === "invite"
+        ? ["gate_invites", "gate_authorizations"]
+        : kindRaw === "authorization"
+          ? ["gate_authorizations", "gate_invites"]
+          : ["gate_invites", "gate_authorizations"];
+
+    let pass = null;
+    let foundTable = null;
+    for (const t of order) {
+      const { rows } = await client.query(
+        `SELECT * FROM ${t} WHERE id = $1 AND account_id = $2 LIMIT 1`,
+        [passId, accountId],
+      );
+      if (rows.length) {
+        pass = rows[0];
+        foundTable = t;
+        break;
+      }
+    }
+
+    if (!pass) {
+      return fail(
+        res,
+        404,
+        "not_found",
+        `Pass not found (kind=${kindRaw || "unknown"}, id=${passId})`,
+      );
+    }
+
+    if (pass.status === "cancelled") {
+      return fail(res, 410, "pass_cancelled", "This pass has been cancelled");
+    }
+
+    const isInvite = foundTable === "gate_invites";
+    const visitorName = isInvite ? pass.guest_name : pass.visitor_name;
+    const visitorPhone = isInvite ? pass.guest_phone : pass.visitor_phone;
+    const purpose = isInvite ? pass.purpose : pass.category;
+
+    const vehiclesArr =
+      Array.isArray(pass.vehicles) && pass.vehicles.length
+        ? pass.vehicles
+        : pass.vehicle_number
+          ? [{ number: pass.vehicle_number, type: "car" }]
+          : [];
+
+    const primaryVehicle =
+      vehiclesArr[0]?.number || pass.vehicle_number || "NO-VEHICLE";
+    const primaryType = vehiclesArr[0]?.type || null;
+
+    let memberId = pass.member_id || null;
+    if (!memberId && pass.flat_number) {
+      const { rows: mm } = await client.query(
+        `SELECT id FROM members
+          WHERE account_id = $1
+            AND flat_number = $2
+            AND ($3::text IS NULL OR wing = $3)
+            AND status = 'active'
+          LIMIT 1`,
+        [accountId, pass.flat_number, pass.wing ?? null],
+      );
+      if (mm.length) memberId = mm[0].id;
+    }
+
+    let vehicleId = null;
+    if (primaryVehicle && primaryVehicle !== "NO-VEHICLE") {
+      const { rows: v } = await client.query(
+        `SELECT id FROM vehicles
+          WHERE account_id = $1 AND vehicle_number = $2 AND status = 'active'
+          LIMIT 1`,
+        [accountId, primaryVehicle],
+      );
+      if (v.length) vehicleId = v[0].id;
+    }
+
+    const rejected = action === "reject";
+    const status = rejected ? "rejected" : "invite_approved";
+
+    const guestsJson = [
+      {
+        name: visitorName || "Guest",
+        phone: visitorPhone || null,
+        vehicle: vehiclesArr[0]
+          ? { number: vehiclesArr[0].number, type: vehiclesArr[0].type || "car" }
+          : null,
+      },
+    ];
+
+    await client.query("BEGIN");
+
+    const { rows: inserted } = await client.query(
+      `INSERT INTO gate_entries
+         (account_id, vehicle_number, vehicle_id, member_id,
+          owner_name, flat_number, owner_phone, registered, direction, scanned_by,
+          visitor_type, visitor_name, visitor_phone, purpose, vehicle_type,
+          invite_id, authorization_id, rejected, notified, status,
+          guests, vehicles, scanned_at,
+          approved_by, approved_at, responded_at)
+       VALUES ($1,$2,$3,$4,
+               $5,$6,$7,$8,$9,$10,
+               $11,$12,$13,$14,$15,
+               $16,$17,$18,$19,$20,
+               $21::jsonb, $22::jsonb, NOW(),
+               $23, NOW(), NOW())
+       RETURNING id, scanned_at, status`,
+      [
+        accountId,
+        primaryVehicle,
+        vehicleId,
+        memberId,
+        visitorName,
+        pass.flat_number || null,
+        visitorPhone || null,
+        false,
+        "in",
+        userId,
+        isInvite ? "invited_guest" : "visitor",
+        visitorName || null,
+        visitorPhone || null,
+        purpose || null,
+        primaryType,
+        isInvite ? passId : null,
+        isInvite ? null : passId,
+        rejected,
+        false,
+        status,
+        JSON.stringify(guestsJson),
+        JSON.stringify(vehiclesArr),
+        userId,
+      ],
+    );
+
+    await writeAudit(client, {
+      accountId,
+      actorUserId: userId,
+      actorRole: role,
+      entityType: "gate_entry",
+      entityId: inserted[0].id,
+      action: rejected ? "gate_rejected" : "gate_approved",
+      after: { status },
+      metadata: {
+        via: "guard_pass_search",
+        kind: isInvite ? "invite" : "authorization",
+        passId,
+      },
+      visibility: "participants",
+    });
+
+    await client.query("COMMIT");
+
+    return res.status(201).json({
+      success: true,
+      entry_id: inserted[0].id,
+      status: inserted[0].status,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("logPassAction error:", err);
+    return fail(res, 500, "server_error", "Failed to log pass action");
+  } finally {
+    client.release();
+  }
+};
+
+// ===========================================================================
 // GATE AUTHORIZATIONS
 // ===========================================================================
 
@@ -3438,10 +4315,8 @@ const createAuthorization = async (req, res) => {
 
     const visitorPhone = normalizePhone(body.visitorPhone);
 
-    // Multi-vehicle parsing
     let vehiclesIn = normalizeVehiclesPayloadInput(body.vehicles);
 
-    // Fallback to singular vehicleNumber for old clients
     if (vehiclesIn.length === 0) {
       const legacy = normalizeVehicleNumber(
         body.vehicleNumber ?? body.vehicle_number ?? "",
@@ -3451,7 +4326,6 @@ const createAuthorization = async (req, res) => {
       }
     }
 
-    // Primary vehicle = first (for the legacy `vehicle_number` column)
     const primaryVehicle = vehiclesIn[0]?.number ?? null;
 
     const validFromRaw = body.validFrom ?? body.valid_from ?? null;
@@ -3622,9 +4496,6 @@ const deleteAuthorization = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// UPDATE AUTHORIZATION (edit pass)
-// ===========================================================================
 const updateAuthorization = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -3649,7 +4520,6 @@ const updateAuthorization = async (req, res) => {
 
     const body = req.body || {};
 
-    // Editable fields
     let visitorName = null;
     if (Object.prototype.hasOwnProperty.call(body, "visitorName")) {
       const v = body.visitorName;
@@ -4121,9 +4991,6 @@ const deleteInvite = async (req, res) => {
   }
 };
 
-// ===========================================================================
-// UPDATE INVITE (edit QR)
-// ===========================================================================
 const updateInvite = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -4148,7 +5015,6 @@ const updateInvite = async (req, res) => {
 
     const body = req.body || {};
 
-    // ── Purpose (category) ────────────────────────────────────────
     let purpose;
     if (Object.prototype.hasOwnProperty.call(body, "purpose")) {
       const purposeRaw = String(body.purpose ?? "").toLowerCase().trim();
@@ -4159,7 +5025,6 @@ const updateInvite = async (req, res) => {
       purpose = purposeRaw;
     }
 
-    // ── Guest name ────────────────────────────────────────────────
     let guestName = null;
     if (Object.prototype.hasOwnProperty.call(body, "guestName")) {
       const v = body.guestName;
@@ -4169,7 +5034,6 @@ const updateInvite = async (req, res) => {
       }
     }
 
-    // ── Guest phone ───────────────────────────────────────────────
     let guestPhone;
     if (Object.prototype.hasOwnProperty.call(body, "guestPhone")) {
       const raw = body.guestPhone;
@@ -4178,7 +5042,6 @@ const updateInvite = async (req, res) => {
         : normalizePhone(raw);
     }
 
-    // ── Vehicles ──────────────────────────────────────────────────
     let vehiclesIn;
     let primaryVehicle;
     if (Object.prototype.hasOwnProperty.call(body, "vehicles")) {
@@ -4194,7 +5057,6 @@ const updateInvite = async (req, res) => {
       primaryVehicle = vehiclesIn[0]?.number ?? null;
     }
 
-    // ── Validity window ───────────────────────────────────────────
     let validFrom = null;
     if (Object.prototype.hasOwnProperty.call(body, "validFrom")) {
       const d = new Date(body.validFrom);
@@ -4213,7 +5075,6 @@ const updateInvite = async (req, res) => {
       validUntil = d;
     }
 
-    // ── Guest count ───────────────────────────────────────────────
     let guestCount;
     if (Object.prototype.hasOwnProperty.call(body, "guestCount")) {
       const n = Number(body.guestCount);
@@ -4300,10 +5161,15 @@ module.exports = {
   registerVehicle,
   createGateEntry,
   listGateEntries,
+  updateGateEntry,
   approveGateEntry,
   rejectGateEntry,
   overrideGateEntry,
   getGateEntryStatus,
+  listGateFlats,
+  searchGatePasses,
+  getPassHistory,
+  logPassAction,
   createAuthorization,
   listAuthorizations,
   updateAuthorization,
