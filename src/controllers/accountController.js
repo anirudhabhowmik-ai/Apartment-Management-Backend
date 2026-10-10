@@ -131,6 +131,19 @@ const listAccounts = async (req, res) => {
 
 // ===========================================================================
 // getAccountPeople
+//
+// FIX: a single user can have MULTIPLE active rows in `staff` (e.g. one for
+// "Sweeper" and one for "Security") or in `members` (e.g. two flats), but the
+// Revoke Access modal and the "People With Access" list must show them ONCE.
+//
+// The previous version used plain LEFT JOINs on members/staff, which fanned
+// out one `account_members` row into N output rows (N = number of directory
+// entries). This is the bug behind duplicate "Anirudha · Staff" cards.
+//
+// The fix wraps each directory lookup in a LEFT JOIN LATERAL subquery with
+// LIMIT 1, so the outer query stays strictly one-row-per-person. A stable
+// ORDER BY created_at ASC picks the earliest directory entry as the
+// canonical name / phone / photo for display.
 // ===========================================================================
 const getAccountPeople = async (req, res) => {
   try {
@@ -155,6 +168,7 @@ const getAccountPeople = async (req, res) => {
       return fail(res, 403, "no_account_access");
     }
 
+    // ---- Owner -------------------------------------------------------------
     const { rows: ownerRows } = await pool.query(
       `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM accounts a JOIN users u ON u.id = a.created_by
@@ -173,6 +187,9 @@ const getAccountPeople = async (req, res) => {
         }
       : null;
 
+    // ---- Admins ------------------------------------------------------------
+    // Admins are joined directly on users (no directory table involved),
+    // so they are already one row per person.
     const { rows: adminRows } = await pool.query(
       `SELECT u.id AS user_id, u.name, u.phone, u.photo_url
          FROM account_members am
@@ -195,6 +212,8 @@ const getAccountPeople = async (req, res) => {
       can_dismiss: false,
     }));
 
+    // ---- Members (accepted invitations) -----------------------------------
+    // LATERAL subquery collapses a multi-flat member into one row.
     const { rows: memberListRows } = await pool.query(
       `SELECT am.user_id,
               COALESCE(u.name,      m.name)      AS name,
@@ -204,10 +223,15 @@ const getAccountPeople = async (req, res) => {
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          JOIN accounts a ON a.id = am.account_id
-         LEFT JOIN members m
-           ON m.account_id = am.account_id
-          AND m.user_id    = am.user_id
-          AND m.status     = 'active'
+         LEFT JOIN LATERAL (
+           SELECT m2.name, m2.phone, m2.photo_url
+             FROM members m2
+            WHERE m2.account_id = am.account_id
+              AND m2.user_id    = am.user_id
+              AND m2.status     = 'active'
+            ORDER BY m2.created_at ASC
+            LIMIT 1
+         ) m ON TRUE
          INNER JOIN LATERAL (
            SELECT inv.id
              FROM invitations inv
@@ -236,6 +260,8 @@ const getAccountPeople = async (req, res) => {
       can_dismiss: true,
     }));
 
+    // ---- Staff (accepted invitations) -------------------------------------
+    // LATERAL subquery collapses a multi-role staff member into one row.
     const { rows: staffListRows } = await pool.query(
       `SELECT am.user_id,
               COALESCE(u.name,      s.name)      AS name,
@@ -245,10 +271,15 @@ const getAccountPeople = async (req, res) => {
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          JOIN accounts a ON a.id = am.account_id
-         LEFT JOIN staff s
-           ON s.account_id = am.account_id
-          AND s.user_id    = am.user_id
-          AND s.status     = 'active'
+         LEFT JOIN LATERAL (
+           SELECT s2.name, s2.phone, s2.photo_url
+             FROM staff s2
+            WHERE s2.account_id = am.account_id
+              AND s2.user_id    = am.user_id
+              AND s2.status     = 'active'
+            ORDER BY s2.created_at ASC
+            LIMIT 1
+         ) s ON TRUE
          INNER JOIN LATERAL (
            SELECT inv.id
              FROM invitations inv
@@ -277,6 +308,7 @@ const getAccountPeople = async (req, res) => {
       can_dismiss: true,
     }));
 
+    // ---- Revoke members (independent of accepted invitations) -------------
     const { rows: revokeMemberRows } = await pool.query(
       `SELECT am.user_id,
               COALESCE(u.name,      m.name)      AS name,
@@ -285,10 +317,15 @@ const getAccountPeople = async (req, res) => {
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          JOIN accounts a ON a.id = am.account_id
-         LEFT JOIN members m
-           ON m.account_id = am.account_id
-          AND m.user_id    = am.user_id
-          AND m.status     = 'active'
+         LEFT JOIN LATERAL (
+           SELECT m2.name, m2.phone, m2.photo_url
+             FROM members m2
+            WHERE m2.account_id = am.account_id
+              AND m2.user_id    = am.user_id
+              AND m2.status     = 'active'
+            ORDER BY m2.created_at ASC
+            LIMIT 1
+         ) m ON TRUE
         WHERE am.account_id = $1
           AND am.role        = 'member_visibility'
           AND am.status      = 'active'
@@ -304,6 +341,9 @@ const getAccountPeople = async (req, res) => {
       kind: "member",
     }));
 
+    // ---- Revoke staff (independent of accepted invitations) ---------------
+    // This is the exact query that was producing two "Anirudha · Staff" rows
+    // when the same user had both a Sweeper row and a Security row in `staff`.
     const { rows: revokeStaffRows } = await pool.query(
       `SELECT am.user_id,
               COALESCE(u.name,      s.name)      AS name,
@@ -312,10 +352,15 @@ const getAccountPeople = async (req, res) => {
          FROM account_members am
          JOIN users u ON u.id = am.user_id
          JOIN accounts a ON a.id = am.account_id
-         LEFT JOIN staff s
-           ON s.account_id = am.account_id
-          AND s.user_id    = am.user_id
-          AND s.status     = 'active'
+         LEFT JOIN LATERAL (
+           SELECT s2.name, s2.phone, s2.photo_url
+             FROM staff s2
+            WHERE s2.account_id = am.account_id
+              AND s2.user_id    = am.user_id
+              AND s2.status     = 'active'
+            ORDER BY s2.created_at ASC
+            LIMIT 1
+         ) s ON TRUE
         WHERE am.account_id = $1
           AND am.role        = 'staff_visibility'
           AND am.status      = 'active'
