@@ -757,10 +757,6 @@ const listAccountPeople = async (req, res) => {
 
 // ===========================================================================
 // MEMBERS
-//
-// The LATERAL subquery now falls back to phone matching when the directory
-// row still has user_id = NULL. This is the fix that makes an admin-created
-// "AB" row display as "Anirudha" the moment the real user joins the property.
 // ===========================================================================
 const listMembers = async (req, res) => {
   try {
@@ -772,6 +768,8 @@ const listMembers = async (req, res) => {
     if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const month = normalizeMonth(req.query?.month);
+    const includeInactive =
+      String(req.query?.includeInactive ?? "").toLowerCase() === "true";
 
     const { rows } = await pool.query(
       `SELECT m.id, m.account_id, m.user_id, m.role,
@@ -800,7 +798,11 @@ const listMembers = async (req, res) => {
               )
             LIMIT 1
          ) joined ON TRUE
-        WHERE m.account_id=$1 AND m.status='active'
+        WHERE m.account_id=$1 AND ${
+          includeInactive
+            ? "m.status IN ('active','inactive')"
+            : "m.status = 'active'"
+        }
         ORDER BY m.flat_number, COALESCE(joined.name, m.name)`,
       [accountId]);
 
@@ -998,6 +1000,8 @@ const createMember = async (req, res) => {
 
     await client.query("BEGIN");
 
+    // Block ONLY when this flat+wing is already taken by another active member.
+    // Same phone on a different flat is allowed.
     {
       const flatConflict = await findFlatConflict(
         client, accountId, flat_number, wing, null,
@@ -1055,9 +1059,35 @@ const createMember = async (req, res) => {
       targetUserId = await findUserIdByPhone(client, phone);
     }
 
-    if (targetPhone) {
+    // Archive only INACTIVE member rows for this phone. Active sibling
+    // rows (same person on another flat) are untouched.
+    const archiveResult = await client.query(
+      `UPDATE members
+          SET phone = NULL,
+              user_id = NULL,
+              updated_at = NOW()
+        WHERE account_id = $1
+          AND status     = 'inactive'
+          AND (
+            ($2::uuid IS NOT NULL AND user_id = $2::uuid)
+            OR (
+              $3::text IS NOT NULL
+              AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3
+            )
+          )`,
+      [accountId, targetUserId, targetPhone || null],
+    );
+
+    if (archiveResult.rowCount > 0) {
+      console.log(
+        `[createMember] archived ${archiveResult.rowCount} prior inactive member row(s) for phone=${targetPhone} account=${accountId}`,
+      );
+    }
+
+    // Phone / name check — NEW MODE ONLY, members table only.
+    if (mode === "new" && targetPhone) {
       const existingEntry = await findExistingDirectoryEntry(
-        client, accountId, targetPhone, null,
+        client, accountId, targetPhone, null, { only: "member" },
       );
       if (
         existingEntry &&
@@ -1094,10 +1124,7 @@ const createMember = async (req, res) => {
     if (parking_available && incomingVehicles.length > 0) {
       try {
         await replaceMemberVehicles(
-          client,
-          accountId,
-          memberId,
-          incomingVehicles,
+          client, accountId, memberId, incomingVehicles,
           {
             name: targetName,
             flatNumber: flat_number,
@@ -1177,6 +1204,14 @@ const createMember = async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("createMember error:", err);
+    if (err?.code === "23505") {
+      console.error(
+        "[createMember] unique violation:",
+        err?.constraint,
+        "| detail:",
+        err?.detail,
+      );
+    }
     return fail(res, 500, "server_error", "Failed to create member");
   } finally {
     client.release();
@@ -1299,7 +1334,7 @@ const updateMember = async (req, res) => {
       const effectiveName = hasName ? newName : beforeSnapshot?.name;
       if (effectivePhone) {
         const existingEntry = await findExistingDirectoryEntry(
-          client, accountId, effectivePhone, id,
+          client, accountId, effectivePhone, id, { only: "member" },
         );
         if (
           existingEntry &&
@@ -1714,6 +1749,8 @@ const listStaff = async (req, res) => {
     if (!role) return fail(res, 403, "no_account_access", "You no longer have access to this account");
 
     const month = normalizeMonth(req.query?.month);
+    const includeInactive =
+      String(req.query?.includeInactive ?? "").toLowerCase() === "true";
 
     const { rows } = await pool.query(
       `SELECT s.id, s.account_id, s.user_id, s.role,
@@ -1741,7 +1778,11 @@ const listStaff = async (req, res) => {
               )
             LIMIT 1
          ) joined ON TRUE
-        WHERE s.account_id=$1 AND s.status='active'
+        WHERE s.account_id=$1 AND ${
+          includeInactive
+            ? "s.status IN ('active','inactive')"
+            : "s.status = 'active'"
+        }
         ORDER BY COALESCE(joined.name, s.name)`,
       [accountId]);
 
@@ -1820,6 +1861,17 @@ const getStaff = async (req, res) => {
   }
 };
 
+// ===========================================================================
+// createStaff
+//
+// Prior-row handling: if a soft-deleted (status='inactive') staff row
+// exists for this phone / user_id, we ARCHIVE every such row (phone = NULL,
+// user_id = NULL) so a BRAND NEW active row can be inserted.
+//
+// ─── FIX ─── The phone_name_mismatch pre-check now only scans the
+// `staff` table (`{ only: "staff" }`). Cross-table collisions with a
+// member row of the same phone no longer block creating a staff member.
+// ===========================================================================
 const createStaff = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1883,9 +1935,70 @@ const createStaff = async (req, res) => {
       targetUserId = await findUserIdByPhone(client, phone);
     }
 
-    if (targetPhone) {
+    // ── 1. Duplicate check: same person + SAME ROLE only ─────────────
+    // A person may hold multiple staff roles (Sweeper, Security, ...).
+    // Only block when the same role is already active for this person.
+    const { rows: activeRows } = await client.query(
+      `SELECT 1 FROM staff
+        WHERE account_id = $1
+          AND status     = 'active'
+          AND LOWER(TRIM(role)) = LOWER($4)
+          AND (
+            ($2::uuid IS NOT NULL AND user_id = $2::uuid)
+            OR (
+              $3::text IS NOT NULL
+              AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3
+            )
+          )
+        LIMIT 1`,
+      [accountId, targetUserId, targetPhone || null, staffRole],
+    );
+
+    if (activeRows.length > 0) {
+      await client.query("ROLLBACK");
+      return fail(
+        res,
+        409,
+        "duplicate",
+        `This person already has the "${staffRole}" role on this account.`,
+      );
+    }
+
+    // ── 2. Archive every INACTIVE staff row for this phone / user ────
+    // This only affects deleted rows, so active sibling roles for the
+    // same person are untouched. Keeps the DB clean when a role was
+    // removed and is now being re-added.
+    const archiveResult = await client.query(
+      `UPDATE staff
+          SET phone = NULL,
+              user_id = NULL,
+              updated_at = NOW()
+        WHERE account_id = $1
+          AND status     = 'inactive'
+          AND (
+            ($2::uuid IS NOT NULL AND user_id = $2::uuid)
+            OR (
+              $3::text IS NOT NULL
+              AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3
+            )
+          )`,
+      [accountId, targetUserId, targetPhone || null],
+    );
+
+    if (archiveResult.rowCount > 0) {
+      console.log(
+        `[createStaff] archived ${archiveResult.rowCount} prior inactive staff row(s) for phone=${targetPhone} account=${accountId}`,
+      );
+    }
+
+    // ── 3. Phone / name mismatch pre-check — NEW MODE ONLY ───────────
+    // Only checks the staff table. Members with the same phone don't
+    // block a staff row, and vice versa. Not run in "existing" mode
+    // because the caller picked a directory entry, so there's no typed
+    // name to compare against.
+    if (mode === "new" && targetPhone) {
       const existingEntry = await findExistingDirectoryEntry(
-        client, accountId, targetPhone, null,
+        client, accountId, targetPhone, null, { only: "staff" },
       );
       if (
         existingEntry &&
@@ -1903,6 +2016,7 @@ const createStaff = async (req, res) => {
       }
     }
 
+    // ── 4. Insert fresh active row ───────────────────────────────────
     const { rows } = await client.query(
       `INSERT INTO staff
          (account_id, user_id, role, monthly_salary,
@@ -1966,6 +2080,19 @@ const createStaff = async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("createStaff error:", err);
+    if (err?.code === "23505") {
+      console.error(
+        "[createStaff] unique violation:",
+        err?.constraint,
+        "| detail:",
+        err?.detail,
+      );
+      return res.status(500).json({
+        code: "server_error",
+        message: `Unique constraint failed: ${err.constraint}`,
+        _debug: { detail: err.detail },
+      });
+    }
     return fail(res, 500, "server_error", "Failed to create staff");
   } finally {
     client.release();
@@ -2037,7 +2164,7 @@ const updateStaff = async (req, res) => {
       const effectiveName = hasName ? newName : beforeSnapshot?.name;
       if (effectivePhone) {
         const existingEntry = await findExistingDirectoryEntry(
-          client, accountId, effectivePhone, id,
+          client, accountId, effectivePhone, id, { only: "staff" },
         );
         if (
           existingEntry &&
