@@ -295,6 +295,42 @@ const createInvitation = async (req, res) => {
 
     await client.query("BEGIN");
 
+    // ── Resolve the admin's own label for this person. ──────────────────
+    // If the admin is inviting a specific directory row (targetMemberId /
+    // targetStaffId), use THAT row's stored name — it is the label the
+    // admin typed when they added the member / staff record.
+    //
+    // This prevents a user who has already signed in (users row exists) from
+    // leaking their own users.name into the invitation before they
+    // officially join. On accept, acceptInvitation overwrites invited_name
+    // with the user's real name, so the "override on join" behaviour still
+    // holds.
+    // ────────────────────────────────────────────────────────────────────
+    let effectiveInvitedName =
+      name && String(name).trim() ? String(name).trim() : null;
+
+    if (targetMemberId) {
+      const { rows: mRows } = await client.query(
+        `SELECT name FROM members
+          WHERE id = $1 AND account_id = $2 AND status = 'active'
+          LIMIT 1`,
+        [targetMemberId, accountId],
+      );
+      if (mRows.length && mRows[0].name && String(mRows[0].name).trim()) {
+        effectiveInvitedName = String(mRows[0].name).trim();
+      }
+    } else if (targetStaffId) {
+      const { rows: sRows } = await client.query(
+        `SELECT name FROM staff
+          WHERE id = $1 AND account_id = $2 AND status = 'active'
+          LIMIT 1`,
+        [targetStaffId, accountId],
+      );
+      if (sRows.length && sRows[0].name && String(sRows[0].name).trim()) {
+        effectiveInvitedName = String(sRows[0].name).trim();
+      }
+    }
+
     if (role === "ownership_transfer") {
       const { rows: otherPending } = await client.query(
         `SELECT id, invited_phone, invited_by, accepted_by, status
@@ -373,7 +409,7 @@ const createInvitation = async (req, res) => {
            VALUES ($1,$2,$3,$4,$5,$6,$7)
            RETURNING id, account_id, invited_phone, invited_name, role,
                      status, created_at`,
-          [accountId, userId, phone, name || null, role,
+          [accountId, userId, phone, effectiveInvitedName, role,
            targetMemberId || null, targetStaffId || null],
         );
 
@@ -385,7 +421,7 @@ const createInvitation = async (req, res) => {
           entityType: "invitation",
           entityId: rows[0].id,
           action: "create",
-          after: { role, phone, name: name ?? null },
+          after: { role, phone, name: effectiveInvitedName },
           metadata: { invitationId: rows[0].id, role },
           visibility: visibilityForCreate(role),
         });
@@ -428,7 +464,7 @@ const createInvitation = async (req, res) => {
            VALUES ($1,$2,$3,$4,$5,$6,$7)
            RETURNING id, account_id, invited_phone, invited_name, role,
                      status, created_at`,
-          [accountId, userId, phone, name || null, role,
+          [accountId, userId, phone, effectiveInvitedName, role,
            targetMemberId || null, targetStaffId || null],
         );
         const newInvitation = rows[0];
@@ -447,7 +483,7 @@ const createInvitation = async (req, res) => {
           entityType: "invitation",
           entityId: newInvitation.id,
           action: "create",
-          after: { role, phone, name: name ?? null, exclusive: true },
+          after: { role, phone, name: effectiveInvitedName, exclusive: true },
           metadata: { invitationId: newInvitation.id, role },
           visibility: visibilityForCreate(role),
         });
@@ -589,8 +625,21 @@ const listInvitations = async (req, res) => {
               u.phone AS invited_by_phone,
               a.name AS account_name, a.photo_url AS account_photo_url,
               au.name AS accepted_user_name, au.photo_url AS accepted_user_photo_url,
-              COALESCE(iu.name, tm.name, ts.name)           AS invitee_user_name,
-              COALESCE(iu.photo_url, tm.photo_url, ts.photo_url) AS invitee_user_photo_url,
+
+              -- ── FIX ──────────────────────────────────────────────────
+              -- For PENDING / non-accepted invitations, show the label the
+              -- admin typed (i.invited_name). Only fall back to the target
+              -- member / staff row, then to the signed-in user, if the
+              -- admin's label is missing.
+              -- Previously we did COALESCE(iu.name, tm.name, ts.name) which
+              -- let a signed-in user's users.name override the admin's label
+              -- before they had even accepted anything.
+              COALESCE(i.invited_name, tm.name, ts.name, iu.name)
+                AS invitee_user_name,
+              COALESCE(tm.photo_url, ts.photo_url, iu.photo_url)
+                AS invitee_user_photo_url,
+              -- ────────────────────────────────────────────────────────
+
               FALSE AS can_dismiss
          FROM invitations i
          LEFT JOIN users u ON u.id = i.invited_by

@@ -343,6 +343,110 @@ async function replaceMemberVehicles(
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Identity propagation
+//
+// Admin-owned fields (name, phone) live in members / staff / invitations /
+// vehicles. When the admin edits a directory row, every other admin-owned
+// row for the same phone must follow. The users table is deliberately
+// excluded — it is self-owned and only the user can edit it.
+//
+// These ALWAYS run, even after a users row exists. "Signed in" is not
+// the same as "joined": the display layer keeps reading members.name /
+// staff.name until an active account_members row exists. In that window
+// the two directory tables must stay in sync.
+// ─────────────────────────────────────────────────────────────────────────
+const tenDigits = (raw) => {
+  const d = String(raw ?? "").replace(/\D/g, "");
+  const ten = d.length > 10 ? d.slice(-10) : d;
+  return ten.length === 10 ? ten : null;
+};
+
+async function propagateNameChange(client, accountId, originalPhone, newName) {
+  const phone = tenDigits(originalPhone);
+  if (!phone || !newName) return;
+
+  // members — catches other active member rows for the same person
+  // (multi-flat).
+  await client.query(
+    `UPDATE members SET name = $1, updated_at = NOW()
+      WHERE account_id = $2
+        AND status     = 'active'
+        AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3
+        AND name IS DISTINCT FROM $1`,
+    [newName, accountId, phone]);
+
+  // staff — same person may hold one or more staff roles.
+  await client.query(
+    `UPDATE staff SET name = $1, updated_at = NOW()
+      WHERE account_id = $2
+        AND status     = 'active'
+        AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3
+        AND name IS DISTINCT FROM $1`,
+    [newName, accountId, phone]);
+
+  // pending invitations — the label the invitee will see before accepting.
+  await client.query(
+    `UPDATE invitations SET invited_name = $1
+      WHERE account_id = $2
+        AND status     = 'pending'
+        AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $3`,
+    [newName, accountId, phone]);
+
+  // vehicles — registered-member label shown on the guard screen.
+  await client.query(
+    `UPDATE vehicles SET owner_name = $1, updated_at = NOW()
+      WHERE account_id = $2
+        AND status     = 'active'
+        AND RIGHT(REGEXP_REPLACE(COALESCE(owner_phone,''),'\\D','','g'),10) = $3
+        AND owner_name IS DISTINCT FROM $1`,
+    [newName, accountId, phone]);
+}
+
+async function propagatePhoneChange(client, accountId, originalPhone, newPhone) {
+  const oldP = tenDigits(originalPhone);
+  const newP = tenDigits(newPhone);
+  if (!oldP || !newP || oldP === newP) return;
+
+  const linkedUserId = await findUserIdByPhone(client, newP);
+
+  await client.query(
+    `UPDATE members
+        SET phone   = $1,
+            user_id = COALESCE($2, user_id),
+            updated_at = NOW()
+      WHERE account_id = $3
+        AND status     = 'active'
+        AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $4`,
+    [newP, linkedUserId, accountId, oldP]);
+
+  await client.query(
+    `UPDATE staff
+        SET phone   = $1,
+            user_id = COALESCE($2, user_id),
+            updated_at = NOW()
+      WHERE account_id = $3
+        AND status     = 'active'
+        AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $4`,
+    [newP, linkedUserId, accountId, oldP]);
+
+  await client.query(
+    `UPDATE invitations SET invited_phone = $1
+      WHERE account_id = $2
+        AND status     = 'pending'
+        AND RIGHT(REGEXP_REPLACE(invited_phone,'\\D','','g'),10) = $3`,
+    [newP, accountId, oldP]);
+
+  await client.query(
+    `UPDATE vehicles
+        SET owner_phone = $1, updated_at = NOW()
+      WHERE account_id = $2
+        AND status     = 'active'
+        AND RIGHT(REGEXP_REPLACE(COALESCE(owner_phone,''),'\\D','','g'),10) = $3`,
+    [newP, accountId, oldP]);
+}
+// ─────────────────────────────────────────────────────────────────────────
+
 const fail = (res, status, code, message) =>
   res.status(status).json({ code, message });
 
@@ -563,6 +667,11 @@ async function findFlatConflict(
 
 // ---------------------------------------------------------------------------
 // Resolve an "existing" selection coming from the picker.
+//
+// The picker at /management/:id/people returns directory PEOPLE (members /
+// staff), never raw users rows. So the admin's stored label must win. We
+// look for a matching active directory row in this account FIRST, and only
+// fall back to users.name when no directory row exists yet.
 // ---------------------------------------------------------------------------
 async function resolveExistingSelection(client, accountId, rawUserId) {
   if (!rawUserId || typeof rawUserId !== "string") {
@@ -571,6 +680,7 @@ async function resolveExistingSelection(client, accountId, rawUserId) {
     throw err;
   }
 
+  // ── pending:member:<id> / pending:staff:<id> ──────────────────────────
   if (rawUserId.startsWith("pending:")) {
     const parts = rawUserId.split(":");
     const sourceKind = parts[1];
@@ -612,6 +722,35 @@ async function resolveExistingSelection(client, accountId, rawUserId) {
     };
   }
 
+  // ── Real user_id: prefer this account's own directory rows ────────────
+  // members is checked first, then staff — matching the picker's own
+  // dedup order.
+  for (const table of ["members", "staff"]) {
+    const { rows } = await client.query(
+      `SELECT user_id, name, phone, photo_url
+         FROM ${table}
+        WHERE account_id = $1
+          AND user_id    = $2
+          AND status     = 'active'
+        ORDER BY created_at ASC
+        LIMIT 1`,
+      [accountId, rawUserId],
+    );
+    if (rows.length > 0) {
+      const row = rows[0];
+      return {
+        userId: row.user_id ?? rawUserId,
+        name: row.name ?? "",
+        phone: (row.phone ?? "").replace(/\D/g, "").slice(-10),
+        photoUrl: row.photo_url ?? null,
+      };
+    }
+  }
+
+  // ── Fallback: no directory row in this account ────────────────────────
+  // Only reached when the caller passes a user_id that is not linked to any
+  // active member/staff row in this account (e.g. orphan user_id, or the
+  // account owner themselves).
   const { rows: u } = await client.query(
     `SELECT id, name, phone, photo_url FROM users WHERE id=$1 LIMIT 1`,
     [rawUserId],
@@ -1329,17 +1468,28 @@ const updateMember = async (req, res) => {
       }
     }
 
+    // ── Same-table duplicate check ────────────────────────────────────────
+    // Only scan the members table. The same phone legitimately exists on the
+    // staff side for the same person and will be synced by the propagation
+    // helpers below. A different member row with the same phone + different
+    // name is a real conflict.
     if (hasPhone || hasName) {
       const effectivePhone = hasPhone ? newPhone : beforeSnapshot?.phone;
       const effectiveName = hasName ? newName : beforeSnapshot?.name;
       if (effectivePhone) {
-        const existingEntry = await findExistingDirectoryEntry(
-          client, accountId, effectivePhone, id, { only: "member" },
+        const { rows: dupRows } = await client.query(
+          `SELECT id, name FROM members
+            WHERE account_id = $1
+              AND status     = 'active'
+              AND id        <> $2
+              AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3
+            LIMIT 1`,
+          [accountId, id, effectivePhone],
         );
         if (
-          existingEntry &&
-          existingEntry.name &&
-          existingEntry.name.trim().toLowerCase() !==
+          dupRows.length &&
+          dupRows[0].name &&
+          dupRows[0].name.trim().toLowerCase() !==
             String(effectiveName || "").trim().toLowerCase()
         ) {
           await client.query("ROLLBACK");
@@ -1347,7 +1497,7 @@ const updateMember = async (req, res) => {
             res,
             409,
             "phone_name_mismatch",
-            `${effectivePhone} is already in this property as "${existingEntry.name}" (${existingEntry.kind}). Use that name, or edit the existing entry.`,
+            `${effectivePhone} is already registered to another member as "${dupRows[0].name}". Use that name, or edit the existing entry.`,
           );
         }
       }
@@ -1378,6 +1528,19 @@ const updateMember = async (req, res) => {
           WHERE id = $${values.length - 1} AND account_id = $${values.length}`,
         values,
       );
+    }
+
+    // ── Propagate identity edits across every admin-owned table ──────────
+    // Always run — "signed in" (a users row exists) is not the same as
+    // "joined" (an active account_members row exists). In that window the
+    // display still reads members.name / staff.name, so both tables must
+    // follow the admin's label.
+    const originalPhone = tenDigits(beforeSnapshot?.phone);
+    if (hasName && newName) {
+      await propagateNameChange(client, accountId, originalPhone, newName);
+    }
+    if (hasPhone && newPhone) {
+      await propagatePhoneChange(client, accountId, originalPhone, newPhone);
     }
 
     if (hasVehiclesField) {
@@ -1472,6 +1635,9 @@ const updateMember = async (req, res) => {
           hasPhoto && "photo_url",
         ].filter(Boolean),
         vehiclesChanged: hasVehiclesField,
+        propagatedTo: (hasName || hasPhone)
+          ? ["members", "staff", "invitations", "vehicles"]
+          : [],
       },
       visibility: "participants",
     });
@@ -2159,17 +2325,26 @@ const updateStaff = async (req, res) => {
       [id]);
     const beforeSnapshot = beforeRows[0] ?? null;
 
+    // ── Same-table duplicate check ────────────────────────────────────────
+    // Only scan the staff table. A member row with the same phone belongs to
+    // the same person and will be renamed by the propagation helper below.
     if (hasPhone || hasName) {
       const effectivePhone = hasPhone ? newPhone : beforeSnapshot?.phone;
       const effectiveName = hasName ? newName : beforeSnapshot?.name;
       if (effectivePhone) {
-        const existingEntry = await findExistingDirectoryEntry(
-          client, accountId, effectivePhone, id, { only: "staff" },
+        const { rows: dupRows } = await client.query(
+          `SELECT id, name FROM staff
+            WHERE account_id = $1
+              AND status     = 'active'
+              AND id        <> $2
+              AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'\\D','','g'),10) = $3
+            LIMIT 1`,
+          [accountId, id, effectivePhone],
         );
         if (
-          existingEntry &&
-          existingEntry.name &&
-          existingEntry.name.trim().toLowerCase() !==
+          dupRows.length &&
+          dupRows[0].name &&
+          dupRows[0].name.trim().toLowerCase() !==
             String(effectiveName || "").trim().toLowerCase()
         ) {
           await client.query("ROLLBACK");
@@ -2177,7 +2352,7 @@ const updateStaff = async (req, res) => {
             res,
             409,
             "phone_name_mismatch",
-            `${effectivePhone} is already in this property as "${existingEntry.name}" (${existingEntry.kind}). Use that name, or edit the existing entry.`,
+            `${effectivePhone} is already registered to another staff member as "${dupRows[0].name}". Use that name, or edit the existing entry.`,
           );
         }
       }
@@ -2208,6 +2383,16 @@ const updateStaff = async (req, res) => {
           WHERE id = $${values.length - 1} AND account_id = $${values.length}`,
         values,
       );
+    }
+
+    // ── Propagate identity edits across every admin-owned table ──────────
+    // Always run — "signed in" is not "joined".
+    const originalPhone = tenDigits(beforeSnapshot?.phone);
+    if (hasName && newName) {
+      await propagateNameChange(client, accountId, originalPhone, newName);
+    }
+    if (hasPhone && newPhone) {
+      await propagatePhoneChange(client, accountId, originalPhone, newPhone);
     }
 
     const { rows: joined } = await client.query(
@@ -2249,7 +2434,12 @@ const updateStaff = async (req, res) => {
       action: "update",
       before: beforeSnapshot,
       after: joined[0],
-      metadata: { fields: Object.keys(updates) },
+      metadata: {
+        fields: Object.keys(updates),
+        propagatedTo: (hasName || hasPhone)
+          ? ["members", "staff", "invitations", "vehicles"]
+          : [],
+      },
       visibility: "participants",
     });
 
