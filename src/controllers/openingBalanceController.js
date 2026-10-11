@@ -225,74 +225,61 @@ const updateOpeningBalance = async (req, res) => {
 };
 
 // ---------------------------------------------------------------------------
-// Schema-aware column detection
+// Schema-aware column detection for the `expenses` table only.
+// The member / staff payments live in their own tables now, so we no
+// longer need to detect JSONB columns for those.
 // ---------------------------------------------------------------------------
 
-async function detectColumns() {
-  const columns = {
-    members: {
-      maintenance_amount: false,
-      monthly_payments: false,
-    },
-    staff: {
-      monthly_salary: false,
-      monthly_payments: false,
-    },
-    expenses: {
-      role: false,
-      category: false,
-      paid_date: false,
-      due_date: false,
-      expense_date: false,
-      transaction_type: false,
-    },
+async function detectExpenseColumns() {
+  const cols = {
+    role: false,
+    category: false,
+    paid_date: false,
+    due_date: false,
+    expense_date: false,
+    transaction_type: false,
   };
 
   try {
-    const { rows: memberCols } = await pool.query(
-      `SELECT column_name FROM information_schema.columns
-         WHERE table_name = 'members'`
-    );
-    const memberSet = new Set(memberCols.map((r) => r.column_name));
-    columns.members.maintenance_amount = memberSet.has("maintenance_amount");
-    columns.members.monthly_payments = memberSet.has("monthly_payments");
-  } catch (e) {
-    console.warn("[carried-forward] members column detect failed:", e.message);
-  }
-
-  try {
-    const { rows: staffCols } = await pool.query(
-      `SELECT column_name FROM information_schema.columns
-         WHERE table_name = 'staff'`
-    );
-    const staffSet = new Set(staffCols.map((r) => r.column_name));
-    columns.staff.monthly_salary = staffSet.has("monthly_salary");
-    columns.staff.monthly_payments = staffSet.has("monthly_payments");
-  } catch (e) {
-    console.warn("[carried-forward] staff column detect failed:", e.message);
-  }
-
-  try {
-    const { rows: expCols } = await pool.query(
+    const { rows } = await pool.query(
       `SELECT column_name FROM information_schema.columns
          WHERE table_name = 'expenses'`
     );
-    const expSet = new Set(expCols.map((r) => r.column_name));
-    columns.expenses.role = expSet.has("role");
-    columns.expenses.category = expSet.has("category");
-    columns.expenses.paid_date = expSet.has("paid_date");
-    columns.expenses.due_date = expSet.has("due_date");
-    columns.expenses.expense_date = expSet.has("expense_date");
-    columns.expenses.transaction_type = expSet.has("transaction_type");
+    const set = new Set(rows.map((r) => r.column_name));
+    cols.role = set.has("role");
+    cols.category = set.has("category");
+    cols.paid_date = set.has("paid_date");
+    cols.due_date = set.has("due_date");
+    cols.expense_date = set.has("expense_date");
+    cols.transaction_type = set.has("transaction_type");
   } catch (e) {
     console.warn("[carried-forward] expenses column detect failed:", e.message);
   }
 
-  return columns;
+  return cols;
 }
 
 // ---------------------------------------------------------------------------
 // GET /opening-balance/:accountId/carried-forward?month=YYYY-MM
+//
+// Returns:
+//   carried_forward = opening_balance + sum(net of every month < selected)
+//
+// This is the running balance entering the selected month.
+//
+// For the first month ever (e.g. October when the property was created
+// that month), the sum is empty so carried_forward = opening_balance.
+// For every later month, carried_forward = previous month's Net Balance.
+//
+// ── FIX ──────────────────────────────────────────────────────────────────
+// Previous version read from JSONB columns `members.monthly_payments` and
+// `staff.monthly_payments`, which don't exist. Payments are stored in the
+// `member_monthly_payments` and `staff_monthly_payments` tables (see
+// managementController.js). The queries now use those tables and key on
+// the BILLING MONTH (`mmp.month` / `smp.month`) so an advance payment
+// made for a future month is attributed to the month it's for, not the
+// month it was recorded.
+// ─────────────────────────────────────────────────────────────────────────
 // ---------------------------------------------------------------------------
 
 const getCarriedForward = async (req, res) => {
@@ -325,126 +312,71 @@ const getCarriedForward = async (req, res) => {
       console.warn("[carried-forward] opening balance load failed:", e.message);
     }
 
-    const cols = await detectColumns();
-
-    // -------- Maintenance income (JSON) --------
+    // -------- Maintenance income (member_monthly_payments table) --------
+    // Sum every PAID maintenance row whose BILLING MONTH is strictly
+    // before the selected month.
     let maintenanceIncome = 0;
-    if (cols.members.monthly_payments) {
-      try {
-        const maintenanceExpr = cols.members.maintenance_amount
-          ? "COALESCE(m.maintenance_amount, 0)"
-          : "0";
-        const q = `
-          SELECT
-            COALESCE(SUM(
-              CASE
-                WHEN (mp.value->>'status') = 'paid'
-                 AND (
-                   CASE
-                     WHEN NULLIF((mp.value->>'paidDate')::text, '') IS NOT NULL
-                       THEN ((mp.value->>'paidDate')::text)::date
-                     WHEN (mp.key ~ '^\\d{4}-\\d{2}$')
-                       THEN ((mp.key || '-01')::date)
-                     ELSE NULL
-                   END
-                 ) IS NOT NULL
-                 AND (
-                   CASE
-                     WHEN NULLIF((mp.value->>'paidDate')::text, '') IS NOT NULL
-                       THEN ((mp.value->>'paidDate')::text)::date
-                     WHEN (mp.key ~ '^\\d{4}-\\d{2}$')
-                       THEN ((mp.key || '-01')::date)
-                     ELSE NULL
-                   END
-                 ) < $2::date
-                THEN COALESCE(
-                  NULLIF((mp.value->>'netAmount')::numeric, NULL),
-                  ${maintenanceExpr}
-                    + COALESCE((mp.value->>'additionalAmount')::numeric, 0)
-                    - COALESCE((mp.value->>'deductionAmount')::numeric, 0)
-                )
-                ELSE 0
-              END
-            ), 0) AS total
-          FROM members m
-          CROSS JOIN LATERAL jsonb_each(
-            COALESCE(m.monthly_payments, '{}'::jsonb)
-          ) AS mp(key, value)
-          WHERE m.account_id = $1
-        `;
-        const { rows } = await pool.query(q, [accountId, monthStart]);
-        maintenanceIncome = Number(rows[0]?.total) || 0;
-      } catch (e) {
-        console.warn("[carried-forward] maintenance query failed:", e.message);
-      }
+    try {
+      const q = `
+        SELECT COALESCE(SUM(
+          COALESCE(
+            mmp.net_amount,
+            COALESCE(m.maintenance_amount, 0)
+              + COALESCE(mmp.additional_amount, 0)
+              - COALESCE(mmp.deduction_amount, 0)
+          )
+        ), 0) AS total
+        FROM member_monthly_payments mmp
+        JOIN members m ON m.id = mmp.member_id
+        WHERE m.account_id = $1
+          AND mmp.status = 'paid'
+          AND mmp.month < $2
+      `;
+      const { rows } = await pool.query(q, [accountId, month]);
+      maintenanceIncome = Number(rows[0]?.total) || 0;
+    } catch (e) {
+      console.warn("[carried-forward] maintenance query failed:", e.message);
     }
 
-    // -------- Salary expense (JSON) --------
+    // -------- Salary expense (staff_monthly_payments table) --------
     let salaryExpense = 0;
-    if (cols.staff.monthly_payments) {
-      try {
-        const salaryExpr = cols.staff.monthly_salary
-          ? "COALESCE(s.monthly_salary, 0)"
-          : "0";
-        const q = `
-          SELECT
-            COALESCE(SUM(
-              CASE
-                WHEN (mp.value->>'status') = 'paid'
-                 AND (
-                   CASE
-                     WHEN NULLIF((mp.value->>'paidDate')::text, '') IS NOT NULL
-                       THEN ((mp.value->>'paidDate')::text)::date
-                     WHEN (mp.key ~ '^\\d{4}-\\d{2}$')
-                       THEN ((mp.key || '-01')::date)
-                     ELSE NULL
-                   END
-                 ) IS NOT NULL
-                 AND (
-                   CASE
-                     WHEN NULLIF((mp.value->>'paidDate')::text, '') IS NOT NULL
-                       THEN ((mp.value->>'paidDate')::text)::date
-                     WHEN (mp.key ~ '^\\d{4}-\\d{2}$')
-                       THEN ((mp.key || '-01')::date)
-                     ELSE NULL
-                   END
-                 ) < $2::date
-                THEN COALESCE(
-                  NULLIF((mp.value->>'netAmount')::numeric, NULL),
-                  ${salaryExpr}
-                    + COALESCE((mp.value->>'additionalAmount')::numeric, 0)
-                    - COALESCE((mp.value->>'deductionAmount')::numeric, 0)
-                )
-                ELSE 0
-              END
-            ), 0) AS total
-          FROM staff s
-          CROSS JOIN LATERAL jsonb_each(
-            COALESCE(s.monthly_payments, '{}'::jsonb)
-          ) AS mp(key, value)
-          WHERE s.account_id = $1
-        `;
-        const { rows } = await pool.query(q, [accountId, monthStart]);
-        salaryExpense = Number(rows[0]?.total) || 0;
-      } catch (e) {
-        console.warn("[carried-forward] staff salary query failed:", e.message);
-      }
+    try {
+      const q = `
+        SELECT COALESCE(SUM(
+          COALESCE(
+            smp.net_amount,
+            COALESCE(s.monthly_salary, 0)
+              + COALESCE(smp.additional_amount, 0)
+              - COALESCE(smp.deduction_amount, 0)
+          )
+        ), 0) AS total
+        FROM staff_monthly_payments smp
+        JOIN staff s ON s.id = smp.staff_id
+        WHERE s.account_id = $1
+          AND smp.status = 'paid'
+          AND smp.month < $2
+      `;
+      const { rows } = await pool.query(q, [accountId, month]);
+      salaryExpense = Number(rows[0]?.total) || 0;
+    } catch (e) {
+      console.warn("[carried-forward] staff salary query failed:", e.message);
     }
 
     // -------- Expenses table (non-JSON) --------
     let txIncome = 0;
     let txExpense = 0;
     try {
+      const cols = await detectExpenseColumns();
       const anchorParts = [];
-      if (cols.expenses.paid_date) anchorParts.push("paid_date");
-      if (cols.expenses.due_date) anchorParts.push("due_date");
-      if (cols.expenses.expense_date) anchorParts.push("expense_date");
+      if (cols.paid_date) anchorParts.push("paid_date");
+      if (cols.due_date) anchorParts.push("due_date");
+      if (cols.expense_date) anchorParts.push("expense_date");
       const anchorExpr =
         anchorParts.length > 0
           ? `COALESCE(${anchorParts.join(", ")})`
           : "NULL::date";
 
-      const typeExpr = cols.expenses.transaction_type
+      const typeExpr = cols.transaction_type
         ? "COALESCE(transaction_type, 'expense')"
         : "'expense'";
 

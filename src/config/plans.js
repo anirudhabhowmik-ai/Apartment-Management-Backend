@@ -49,7 +49,7 @@ const PLANS = {
 // 30 days is the maximum allowed single-phase trial on Google Play.
 // (Previously 90 — changed for Play Store compliance.)
 const TRIAL_DAYS = 30;
-const TRIAL_PLAN_ID = "pro";
+const TRIAL_PLAN_ID = "business";
 
 function planPrice(planId, period) {
   const p = PLANS[planId];
