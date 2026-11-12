@@ -8,13 +8,20 @@ const cookieParser = require('cookie-parser');
 require('dotenv').config();
 
 // --- FIREBASE ADMIN INITIALIZATION ---
-const admin = require('firebase-admin');
+const { initializeApp, cert } = require('firebase-admin/app');
+
 try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
+    let serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    
+    // Crucial fix: Replace literal \n with actual line breaks for the private key
+    if (serviceAccount.private_key) {
+        serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+    }
+    
+    initializeApp({
+        credential: cert(serviceAccount)
     });
-    console.log("✅ Firebase Admin initialized");
+    console.log("✅ Firebase Admin initialized successfully");
 } catch (error) {
     console.error("❌ Firebase Admin init error:", error.message);
 }
@@ -57,6 +64,9 @@ app.use(
 
 /* -----------------------------------------------------------
    CORS
+   - Mobile apps (no Origin header) are ALWAYS allowed.
+   - Web browsers are only allowed if their Origin matches FRONTEND_URL.
+   - In development, all origins are allowed for convenience.
 ----------------------------------------------------------- */
 const allowedOrigins = process.env.FRONTEND_URL
     ? process.env.FRONTEND_URL
@@ -110,6 +120,8 @@ app.get('/health', (req, res) => {
 
 /* -----------------------------------------------------------
    PUBLIC PAGES (landing, privacy, terms, refund)
+   For Razorpay verification + Google Play privacy URL
+   NOTE: Mounted at '/' BEFORE any API routes so it takes precedence.
 ----------------------------------------------------------- */
 app.use('/', publicPagesRoutes);
 
@@ -117,7 +129,7 @@ app.use('/', publicPagesRoutes);
    API ROUTES
 ----------------------------------------------------------- */
 app.use('/api/auth', authRoutes);
-app.use('/api/auth', firebaseAuthRoutes); // NEW FIREBASE ROUTE MOUNTED HERE
+app.use('/api/auth', firebaseAuthRoutes); // NEW FIREBASE ROUTE
 app.use('/api', invitationRoutes);
 app.use('/api', manageAccountProfileRoutes);
 app.use('/api/accounts', accountRoutes);
@@ -133,6 +145,7 @@ app.use('/api/webhooks', revenueCatWebhookRoutes);
 
 /* -----------------------------------------------------------
    404 HANDLER
+   IMPORTANT: must come AFTER public pages, so /privacy etc. work.
 ----------------------------------------------------------- */
 app.use((req, res) => {
     res.status(404).json({ success: false, message: 'Route not found' });

@@ -1,9 +1,9 @@
 // routes/firebaseAuthRoutes.js
 const express = require('express');
 const router = express.Router();
-const admin = require('firebase-admin');
-const { pool } = require('../config/database'); // Adjust path if needed
-const jwt = require('jsonwebtoken'); // Assuming you use jsonwebtoken
+const { getAuth } = require('firebase-admin/auth');
+const { pool } = require('../config/database'); // Ensure this path is correct
+const jwt = require('jsonwebtoken');
 
 router.post('/firebase-login', async (req, res) => {
     const { idToken } = req.body;
@@ -14,9 +14,9 @@ router.post('/firebase-login', async (req, res) => {
 
     try {
         // 1. Verify the token securely with Google
-        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        const decodedToken = await getAuth().verifyIdToken(idToken);
         
-        // 2. Extract the verified phone number (e.g., "+919999999999")
+        // 2. Extract the verified phone number
         const phone = decodedToken.phone_number; 
 
         if (!phone) {
@@ -24,7 +24,7 @@ router.post('/firebase-login', async (req, res) => {
         }
 
         // 3. Check your Neon database
-        // NOTE: Change 'users' to your actual table name if it's different!
+        // Note: If your users table has a different name, update 'users' here
         let userResult = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
         let user;
 
@@ -40,10 +40,10 @@ router.post('/firebase-login', async (req, res) => {
         }
 
         // 4. Generate your app's JWT token
-        // Replace 'process.env.JWT_SECRET' if your secret is named differently
+        // Make sure JWT_SECRET is in your Render environment variables
         const token = jwt.sign(
             { id: user.id }, 
-            process.env.JWT_SECRET || 'fallback_secret', 
+            process.env.JWT_SECRET || 'fallback_secret_change_me', 
             { expiresIn: '7d' }
         );
 
