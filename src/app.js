@@ -63,10 +63,7 @@ app.use(
 );
 
 /* -----------------------------------------------------------
-   CORS
-   - Mobile apps (no Origin header) are ALWAYS allowed.
-   - Web browsers are only allowed if their Origin matches FRONTEND_URL.
-   - In development, all origins are allowed for convenience.
+   CORS CONFIGURATION
 ----------------------------------------------------------- */
 const allowedOrigins = process.env.FRONTEND_URL
     ? process.env.FRONTEND_URL
@@ -75,21 +72,35 @@ const allowedOrigins = process.env.FRONTEND_URL
           .filter(Boolean)
     : [];
 
-app.use(
-    cors({
-        origin: function (origin, callback) {
-            if (!origin) return callback(null, true);
-            if (isDevelopment) return callback(null, true);
-            if (allowedOrigins.includes(origin)) return callback(null, true);
-            console.log('Blocked origin:', origin);
-            return callback(new Error('Not allowed by CORS'));
-        },
-        credentials: true,
-        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-app-platform'],
-        exposedHeaders: ['Set-Cookie'],
-    })
-);
+const corsOptions = {
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps, curl, or server-to-server)
+        if (!origin) return callback(null, true);
+        
+        // Allow all in development
+        if (isDevelopment) return callback(null, true);
+        
+        // Check against allowed list
+        if (allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            console.log('🚫 Blocked origin by CORS:', origin);
+            // Do not throw an error, just return false. This prevents the server from crashing
+            // and sends a proper CORS rejection header to the browser.
+            callback(null, false); 
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-app-platform', 'Accept', 'Origin', 'X-Requested-With'],
+    exposedHeaders: ['Set-Cookie'],
+    optionsSuccessStatus: 200 
+};
+
+app.use(cors(corsOptions));
+
+// Explicitly handle preflight requests for all routes (Crucial for POST requests)
+app.options('*', cors(corsOptions));
 
 /* -----------------------------------------------------------
    BODY PARSING
@@ -120,8 +131,6 @@ app.get('/health', (req, res) => {
 
 /* -----------------------------------------------------------
    PUBLIC PAGES (landing, privacy, terms, refund)
-   For Razorpay verification + Google Play privacy URL
-   NOTE: Mounted at '/' BEFORE any API routes so it takes precedence.
 ----------------------------------------------------------- */
 app.use('/', publicPagesRoutes);
 
@@ -145,7 +154,6 @@ app.use('/api/webhooks', revenueCatWebhookRoutes);
 
 /* -----------------------------------------------------------
    404 HANDLER
-   IMPORTANT: must come AFTER public pages, so /privacy etc. work.
 ----------------------------------------------------------- */
 app.use((req, res) => {
     res.status(404).json({ success: false, message: 'Route not found' });
@@ -156,10 +164,6 @@ app.use((req, res) => {
 ----------------------------------------------------------- */
 app.use((err, req, res, next) => {
     console.error('Error:', err.stack);
-
-    if (err.message === 'Not allowed by CORS') {
-        return res.status(403).json({ success: false, message: 'CORS blocked' });
-    }
 
     res.status(err.status || 500).json({
         success: false,
