@@ -7,7 +7,21 @@ const compression = require('compression');
 const cookieParser = require('cookie-parser');
 require('dotenv').config();
 
+// --- FIREBASE ADMIN INITIALIZATION ---
+const admin = require('firebase-admin');
+try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+    console.log("✅ Firebase Admin initialized");
+} catch (error) {
+    console.error("❌ Firebase Admin init error:", error.message);
+}
+// -------------------------------------
+
 const authRoutes = require('./routes/authRoutes');
+const firebaseAuthRoutes = require('./routes/firebaseAuthRoutes'); // NEW ROUTE
 const invitationRoutes = require("./routes/invitationRoutes");
 const accountRoutes = require("./routes/accountRoutes");
 const managementRoutes = require("./routes/managementRoutes");
@@ -43,9 +57,6 @@ app.use(
 
 /* -----------------------------------------------------------
    CORS
-   - Mobile apps (no Origin header) are ALWAYS allowed.
-   - Web browsers are only allowed if their Origin matches FRONTEND_URL.
-   - In development, all origins are allowed for convenience.
 ----------------------------------------------------------- */
 const allowedOrigins = process.env.FRONTEND_URL
     ? process.env.FRONTEND_URL
@@ -99,8 +110,6 @@ app.get('/health', (req, res) => {
 
 /* -----------------------------------------------------------
    PUBLIC PAGES (landing, privacy, terms, refund)
-   For Razorpay verification + Google Play privacy URL
-   NOTE: Mounted at '/' BEFORE any API routes so it takes precedence.
 ----------------------------------------------------------- */
 app.use('/', publicPagesRoutes);
 
@@ -108,6 +117,7 @@ app.use('/', publicPagesRoutes);
    API ROUTES
 ----------------------------------------------------------- */
 app.use('/api/auth', authRoutes);
+app.use('/api/auth', firebaseAuthRoutes); // NEW FIREBASE ROUTE MOUNTED HERE
 app.use('/api', invitationRoutes);
 app.use('/api', manageAccountProfileRoutes);
 app.use('/api/accounts', accountRoutes);
@@ -123,7 +133,6 @@ app.use('/api/webhooks', revenueCatWebhookRoutes);
 
 /* -----------------------------------------------------------
    404 HANDLER
-   IMPORTANT: must come AFTER public pages, so /privacy etc. work.
 ----------------------------------------------------------- */
 app.use((req, res) => {
     res.status(404).json({ success: false, message: 'Route not found' });
